@@ -73,7 +73,6 @@ tree_entry_t* centree_lookup(centree t, void* key, compare_func compare);
 tree_entry_t* centree_traverse_useq(centree t, int seq);
 centree_node centree_insert(centree t, void* key, tree_entry_t* value,
                             compare_func compare);
-// TODO do we need?
 // void centree_delete(centree t, void* key, compare_func compare);
 
 void centree_print(centree t);

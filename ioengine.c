@@ -1,33 +1,5 @@
 #include "headers.h"
 
-/*
- * Asynchronous IO engine.
- *
- * Two operations: read a page and write a page.
- * Both operations work closely with the page cache.
- *
- * Reading a page will first look if the page is cached. If it is, then it calls
- * the callback synchronously. If the page is not cached, a page will be
- * allocated in the page cache and the callback will be called asynchronously.
- * The data is in callback->lru_entry->page.
- * e.g. read_page_async(fd, page_num, my_callback)
- *      my_callback(cb) {
- *          cb->lru_entry // the page cache metadata of the page where the data
- * has been loaded cb->lru_entry->page // the page that contains the data
- *      }
- *
- * Writing a page consists in flushing the content of the page cache to disk.
- * It means the page must be in memory, it is not possible to write a non cached
- * page. This could be easilly changed if need be.
- *
- * ASSUMPTIONS:
- *   The page cache is big enough to hold as many pages as concurrent buffered
- * IOs.
- */
-
-/*
- * Non asynchronous calls to ease some things
- */
 int cache_hit = 0;
 
 static __thread char *disk_data;

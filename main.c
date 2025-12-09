@@ -141,8 +141,6 @@ int main(int argc, char **argv) {
   stop_timer("Init found %lu elements", get_database_size());
 
 
-  /* Add missing items if any */
-  //system("cat /proc/vmstat | grep psw");
   repopulate_db(&w);
   load = 0;
 
@@ -151,13 +149,8 @@ int main(int argc, char **argv) {
   }
   stop_timer("Remaining batch loading");
 
-  // flush_batched_load();
-
   print = 1;
   cache_hit = 0;
-
-  //system("cat /proc/vmstat | grep psw");
-  //tnt_rebalancing();
 
   //if (w.api == &BGWORK) {
   //  start_timer {
@@ -196,7 +189,7 @@ int main(int argc, char **argv) {
     cache_hit = 0;
   }
 
-  tnt_print();
+  //tnt_print();
 
 #if DEBUG
   print_slow_payloads();

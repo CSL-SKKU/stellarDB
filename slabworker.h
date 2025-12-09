@@ -18,8 +18,6 @@ void kv_add_async_no_lookup(struct slab_callback *callback, struct slab *s,
                             size_t slab_idx);
 
 typedef struct index_scan tree_scan_res_t;
-// TODO SCAN
-// tree_scan_res_t kv_init_scan(void *item, size_t scan_size);
 void kv_read_async_no_lookup(struct slab_callback *callback, struct slab *s,
                              size_t slab_idx, uint64_t count);
 

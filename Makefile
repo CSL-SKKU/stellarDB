@@ -3,7 +3,7 @@ CC=clang  #If you use GCC, add -fno-strict-aliasing to the CFLAGS because the Go
 CFLAGS=-O2 -ggdb3 -Wall -I.
 
 CXX=clang++
-CXXFLAGS= ${CFLAGS} -I/usr/local/include/cuckoofilter -I/usr/include/c++/11 -I/usr/include/x86_64-linux-gnu/c++/11
+CXXFLAGS= ${CFLAGS} -I/usr/include/c++/11 -I/usr/include/x86_64-linux-gnu/c++/11
 
 # 기본값 설정
 BENCH ?= ycsb_c_zipfian

@@ -117,19 +117,13 @@ static void *fsst_worker(void *pdata) {
                           &cb->slab_idx, &e);
 	    cb->slab = tree->slab;
 
-            //kv_update_async(cb);
-            remove_and_add_item_async(cb);
-	    //free(cb->item);
-	    //free(cb);
-	    updated++;
+              remove_and_add_item_async(cb);
+              updated++;
           }
 
           // (라) 처리한 비트를 워드에서 지운다.
           word &= ~(1ULL << bit_pos);
         }
-	//if (updated >= 512) {
-	//  sleep(1);
-	//  updated = 0;
 	//}
       }
       atomic_store_explicit(&s->queued, 0, memory_order_relaxed);
@@ -155,12 +149,10 @@ void check_and_remove_tree(struct slab_callback *cb, void *item) {
 
   W_LOCK(&s->tree_lock);
   if (s->nb_items || (s->max == 0 && s->min == -1)) {
-    // printf("fsst %lu %lu %lu\n", s->nb_items, s->min, s->max);
     W_UNLOCK(&s->tree_lock);
     return;
   }
 
-  // TODO::JS Remove file
   printf("free %lu %lu %lu %lu\n", s->min, s->max, s->seq, s->nb_items);
   s->min = -1;
   s->max = 0;
@@ -183,11 +175,7 @@ void check_and_remove_tree(struct slab_callback *cb, void *item) {
     if ((len = readlink(path, spath, 512)) < 0) die("READLINK\n");
     spath[len] = 0;
     close(s->fd);
-    /*strncpy(path, spath, len);*/
-    /*snprintf(path + len, 128 - len, "-%lu", s->key);*/
     truncate(spath, 0);
-    /*rename(spath, path);*/
-    //unlink(spath);
     printf("REMOVED FILE\n");
   }
 
@@ -230,7 +218,6 @@ if (!bgq_is_empty(FSST)) {
     for (size_t i = 0; i < NODE_BATCH; i++) {
       tree_entry_t *victim = (tree_entry_t *)bgq_dequeue(FSST);
       if (!victim) goto fsst_sleep;
-      printf("FSST %lu\n", i);
       pread(victim->slab->fd, vict_file_fsst, victim->slab->size_on_disk, 0);
 
       R_LOCK(&victim->slab->tree_lock);

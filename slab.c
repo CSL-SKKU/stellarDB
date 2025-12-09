@@ -11,22 +11,6 @@ extern int print;
 extern int load;
 extern uint64_t nb_totals;
 
-/*
- * A slab is a file containing 1 or more items of a given size.
- * The size of items is in slab->item_size.
- *
- * Format is [ [size_t rdt1, size_t key_size1, size_t
- * value_size1][key1][value1][maybe some empty space]     [rdt2, key_size2,
- * value_size2][key2]etc. ]
- *
- * When an idem is deleted its key_size becomes -1. value_size is then equal to
- * a next free idx in the slab. That way, when we reuse an empty spot, we know
- * where the next one is.
- *
- *
- * This whole file assumes that when a file is newly created, then all the data
- * is equal to 0. This should be true on Linux.
- */
 
 static int create_sequence = 0;
 
@@ -100,7 +84,6 @@ struct slab *create_slab(struct slab_context *ctx, uint64_t level,
 
   size_t nb_items_per_page = PAGE_SIZE / cfg.kv_size;
   s->nb_max_items = s->size_on_disk / PAGE_SIZE * nb_items_per_page;
-  // TODO::JS::구조체 수정
   s->item_size = cfg.kv_size;
 
   s->min = -1;
@@ -235,17 +218,12 @@ struct slab *close_and_create_slab(struct slab *s) {
   uint64_t new_key;
   uint64_t new_level;
 
-  // TODO::JS:: add_in_tree 쪽으로 옮겨야함
   R_LOCK(&s->tree_lock);
-  //new_key = (s->min + s->max) / 2;
   new_key = s->min + (s->max - s->min) / 2;
   new_level = tnt_get_centree_level(s->centree_node)+1;
   R_UNLOCK(&s->tree_lock);
 
-  // if(s->key != new_key)
   tnt_subtree_update_key(s->key, new_key);
-  /*printf("NNN: %lu, %lu // %lu-%lu\n", (uint64_t)s->key, (uint64_t)new_key,*/
-  /*       s->min, s->max);*/
 
   W_LOCK(&s->tree_lock);
   s->key = new_key;
@@ -271,11 +249,9 @@ struct slab *close_and_create_slab(struct slab *s) {
                   NULL, new_key - 1);
   tnt_subtree_add(create_slab(NULL, new_level, new_key + 1, 0, NULL), tnt_subtree_create(),
                   NULL, new_key + 1);
-  //__sync_fetch_and_add(&t->nb_elements, 2);
 #endif
   wakeup_subtree_get(s->centree_node);
 
-  //tnt_print();
   return s;
 }
 
@@ -312,21 +288,12 @@ void read_item_async_cb(struct slab_callback *callback) {
     int len;
     sprintf(path, "/proc/self/fd/%d", s->fd);
     if ((len = readlink(path, spath, 512)) < 0) {
-	    // 아마 sub 하고 R_LOCK 기다리는 동안
-	    // check and remove 쪽에서 W_LOCK 잡고
-	    // read_ref == 0 테스트 통과해서
-	    // 지우는 듯
 	    printf("already removed\n");
 	    goto skip;
     }
     spath[len] = 0;
     close(s->fd);
-    /*strncpy(path, spath, len);*/
-    /*snprintf(path + len, 128 - len, "-%lu", s->key);*/
     truncate(spath, 0);
-    /*rename(spath, path);*/
-    //unlink(spath);
-    // printf("REMOVED FILE\n");
   }
 skip:
   R_UNLOCK(&s->tree_lock);
@@ -348,7 +315,6 @@ void read_item_async(struct slab_callback *callback) {
 
 void scan_item_async(struct slab_callback *callback) {
   callback->io_cb = read_item_async_cb;
-  // read_file_async(callback);
 }
 
 /*
@@ -441,7 +407,6 @@ void add_item_async_cb1(struct slab_callback *callback) {
 
   R_LOCK(&s->tree_lock);
   if (lru_entry == NULL) {  // no free page, append
-    // TODO::JS::일단 아이템 사이즈 고정시킴
     if (callback->slab_idx + 1 == s->nb_max_items &&
         callback->slab_idx != callback->fsst_idx) {
       assert(atomic_load_explicit(&s->full, memory_order_acquire) == 1);
@@ -477,7 +442,6 @@ void add_item_async_cb1(struct slab_callback *callback) {
 
         kv_add_async_no_lookup(cb, cb->slab, cb->slab_idx);
       }
-      /*printf("FLUSH BATCh: %lu\n", s->seq);*/
     } else {
       W_UNLOCK(&s->tree_lock);
     }
@@ -513,60 +477,6 @@ void add_in_tree_for_update(struct slab_callback *cb, void *item) {
   uint64_t cur;
   index_entry_t *e = NULL;
 
-  // 앞에서 걸러져서 in-place는 애초에 여기 안온다
-  //if (old_s == s) {
-  //  goto skip;
-  //}
-
-  //while(!removed) {
-
-  //  R_LOCK(&old_s->tree_lock);
-  //  if (old_s == s) {
-  //    R_UNLOCK(&old_s->tree_lock);
-  //    // 이미 최신게 들어있으므로 업데이트 안함
-  //    // 두 케이스 다 원래 두 자리 잡아놨는데 하나만 유효하므로 하나 뺌
-  //    if (old_idx > cb->slab_idx) {
-  //      __sync_fetch_and_sub(&s->nb_items, 1);
-  //      //printf("UPCASE: 1\n");
-  //      goto skip;
-  //    } else if (old_idx == cb->slab_idx) {
-  //      goto skip;
-  //    }
-  //    // s에 delete 후 add
-  //    //printf("UPCASE: 2\n");
-  //    break;
-  //  } else if (old_s->seq > s->seq) {
-  //    R_UNLOCK(&old_s->tree_lock);
-  //    // 이미 최신게 들어있으므로 업데이트 안함
-  //    //printf("UPCASE: 3\n");
-  //    __sync_fetch_and_sub(&s->nb_items, 1);
-  //    goto skip;
-  //  }
-  //
-  //  if (old_s->min != -1)
-  //    removed = tnt_index_invalid_utree(old_s->subtree, cb->item);
-  //  R_UNLOCK(&old_s->tree_lock);
-
-  //  if (!removed) {
-  //    do {
-  //      e = tnt_index_lookup(cb->item);
-  //    } while(e->slab == old_s);
-
-  //    old_s = e->slab;
-  //    old_idx = e->slab_idx;
-  //    // 동시에 수정하는 누군가가 자기가 지워야 하는 것을 이미 지운 것.
-  //    //  그 친구가 새로 추가한 것을 지워야함
-  //    //removed = tnt_index_invalid(cb->item);
-  //    //if (!removed)
-  //    //  printf("UPDATE NULL %lu seq/idx %lu/%lu fsst %lu/%lu\n", key,
-  //    //         cb->slab->seq, cb->slab_idx, cb->fsst_slab->seq, cb->fsst_idx);
-  //    //printf("UPCASE: RETRY\n");
-  //  } else {
-  //    //printf("UPCASE: 5\n");
-  //    __sync_fetch_and_sub(&old_s->nb_items, 1);
-  //  }
-  //}
-
   add_time_in_payload(cb, 6);
   W_LOCK(&s->tree_lock);
     // CASE 2에서 여러 쓰레드가 여기 도달 가능.
@@ -576,12 +486,9 @@ void add_in_tree_for_update(struct slab_callback *cb, void *item) {
   if (e) {
     if (e->slab_idx > cb->slab_idx) {
       __sync_fetch_and_sub(&s->nb_items, 1);
-      // printf("UPCASE: Edge 1\n");
-      //printf("UPCASE: Final Skip\n");
       W_UNLOCK(&s->tree_lock);
       goto skip;
     } 
-    // printf("UPCASE: Edge 2\n");
     alrdy = tnt_index_delete(s->subtree, item);
   }
 
@@ -589,7 +496,6 @@ void add_in_tree_for_update(struct slab_callback *cb, void *item) {
 
   if (!alrdy) {
     __sync_fetch_and_add(&nb_totals, 1);
-    // s->nb_items++;
 #if WITH_FILTER
     if (filter_add((filter_t *)s->filter, (unsigned char *)&key) == 0) {
       printf("Fail adding to filter %p %lu seq/idx %lu/%lu fsst %lu/%lu\n",
@@ -626,7 +532,6 @@ void add_in_tree_for_update(struct slab_callback *cb, void *item) {
 
 
   if (!removed) {
-      // printf("UPCASE: Edge 3\n");
       printf("UPCASE: Edge\n");
   }
 
@@ -646,12 +551,7 @@ skip:
     if ((len = readlink(path, spath, 512)) < 0) die("READLINK\n");
     spath[len] = 0;
     close(s->fd);
-    /*strncpy(path, spath, len);*/
-    /*snprintf(path + len, 128 - len, "-%lu", s->key);*/
     truncate(spath, 0);
-    /*rename(spath, path);*/
-    //unlink(spath);
-    //printf("REMOVED FILE\n");
   }
   R_UNLOCK(&s->tree_lock);
 

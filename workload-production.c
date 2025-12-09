@@ -32,7 +32,7 @@ static void launch_prod(struct workload *w, bench_t b) {
       kv_update_async(cb);
     } else if (random < 98) {
       kv_read_async(cb);
-    }  // TODO SCAN
+    }
     /*else {
      tree_scan_res_t scan_res = kv_init_scan(cb->item, uniform_next()%99+1);
      free(cb->item);

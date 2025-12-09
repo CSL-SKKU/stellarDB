@@ -313,6 +313,7 @@ int main(int argc, char *argv[]) {
   RANGE_SIZE = strtoull(argv[2], NULL, 10);
   WORKLOAD = toupper((unsigned char)argv[3][0]);
   int num_threads = atoi(argv[4]);
+  init_default_config(&cfg);
 
   if (num_threads <= 0) {
     fprintf(stderr, "Invalid number of threads: %d\n", num_threads);

@@ -79,7 +79,7 @@
 
 #define KV_SIZE 1024
 #define MAX_FILE_SIZE 16384 * PAGE_SIZE
-//#define REALKEY_FILE_PATH "/home/jongseok/research/tnt/figure/4/4.3/analysis/keydist/osm"
+//#define REALKEY_FILE_PATH "/home/"
 
 
 #endif

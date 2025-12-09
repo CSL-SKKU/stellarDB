@@ -341,13 +341,8 @@ again:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
         if (!e) {
-          // callback->slab = NULL;
-          // callback->slab_idx = -1;
-          // callback->cb(callback, NULL);
           __sync_add_and_fetch(&try_fsst, 1);
-	  callback->slab = tree->slab;
-          //callback->slab =
-          //  get_slab(ctx, callback->item, &callback->slab_idx, e);
+          callback->slab = tree->slab;
           add_time_in_payload(callback, 4);
           add_item_async(callback);
           // read_item_async_from_fsst(callback);
@@ -367,22 +362,7 @@ again:
         break;
       case FSST_NO_LOOKUP:
         break;
-      //case ADD_OR_UPDATE:
-      //  if (!e) {
-      //    callback->action = ADD;
-      //    callback->slab =
-      //        get_slab(ctx, callback->item, &callback->slab_idx, e);
-      //    add_item_async(callback);
-      //  } else {
-      //    callback->action = UPDATE;
-      //    callback->slab = e->slab;
-      //    callback->slab_idx = GET_SIDX(e->slab_idx);
-      //    assert(
-      //        get_item_size(callback->item) <=
-      //        e->slab
-      //            ->item_size);  // Item grew, this is not supported currently!
-      //    update_item_async(callback);
-      //  }
+
       case DELETE:
         break;
       default:
@@ -407,23 +387,6 @@ again:
 }
 
 static uint64_t io_wait = 0;
-
-/*
-static void check_and_handle_tnt(uint64_t real_start, uint64_t dist_time) {
-  uint64_t now, dist_util;
-
-  if (io_wait <= 5)
-    return;
-
-  rdtscll(now);
-  uint64_t elapsed = now - real_start;
-  dist_util = (dist_time * 100LU / elapsed);
-
-  if (dist_util > 50) {
-    tnt_rebalancing();
-  }
-}
-*/
 
 static void *worker_slab_init(void *pdata) {
   struct slab_context *ctx = pdata;
@@ -563,7 +526,6 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
     }
   }
   cb->slab_idx = idx;
-  /*if (idx > s->last_item) s->last_item = idx;*/
 
   __sync_add_and_fetch(&nb_totals, 1);
   tnt_index_add(cb, item);
@@ -875,8 +837,6 @@ static void *worker_rebuild_init(void *pdata) {
 
   return NULL;
 }
-  // db_populate 안하도록 바꾼다.
-  // 다 하면
 
 void slab_workers_init(int _nb_disks, int nb_workers_per_disk,
                        int nb_distributors_per_disk) {
@@ -929,19 +889,6 @@ void slab_workers_init(int _nb_disks, int nb_workers_per_disk,
 }
 
 size_t get_database_size(void) {
-  // TODO::JS
-  /*
-  size_t nb_slabs = sizeof(slab_sizes)/sizeof(*slab_sizes);
-
-  size_t nb_workers = get_nb_workers();
-  for(size_t w = 0; w < nb_workers; w++) {
-     struct slab_context *ctx = &slab_contexts[w];
-     for(size_t i = 0; i < nb_slabs; i++) {
-        size += ctx->slabs[i]->nb_items;
-     }
-  }
-  */
-
   return nb_totals;
 }
 
@@ -961,9 +908,6 @@ void flush_batched_load(void) {
       for (int i=0; i < s->nb_batched; i++) {
         struct slab_callback *cb = s->batched_callbacks[i];
         kv_add_async_no_lookup(cb, cb->slab, cb->slab_idx);
-        // printf("FLUSH: %d\n", s->nb_batched);
-        /*kv_add_async(s->batched_callbacks[i]);*/
-        // update_item_async(s->batched_callbacks[i]);
         s->batched_callbacks[i] = NULL;
       }
       s->nb_batched = 0;

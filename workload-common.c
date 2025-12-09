@@ -68,7 +68,6 @@ void add_in_tree(struct slab_callback *cb, void *item) {
   // s->imm = 1;
 
   cur = __sync_fetch_and_add(&s->read_ref, 0);
-  //희박하지만 초기에 get_slab으로 꽉 차자마자 GC 대상이 되었을 수 있다
   if (s->min == -1 && 
     !__sync_fetch_and_or(&s->update_ref, 0)
     && cur == 0) {
@@ -78,12 +77,7 @@ void add_in_tree(struct slab_callback *cb, void *item) {
     if ((len = readlink(path, spath, 512)) < 0) die("READLINK\n");
     spath[len] = 0;
     close(s->fd);
-    /*strncpy(path, spath, len);*/
-    /*snprintf(path + len, 128 - len, "-%lu", s->key);*/
     truncate(spath, 0);
-    /*rename(spath, path);*/
-    //unlink(spath);
-    //printf("REMOVED FILE\n");
   }
 
   W_UNLOCK(&s->tree_lock);
