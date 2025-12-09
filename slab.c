@@ -330,6 +330,13 @@ void read_item_async_cb(struct slab_callback *callback) {
   }
 skip:
   R_UNLOCK(&s->tree_lock);
+  
+  struct item_metadata *meta = (struct item_metadata *)callback->item;
+  char *item_key = &callback->item[sizeof(*meta)];
+  uint64_t key = *(uint64_t *)item_key;
+
+  //if (load == 0)
+  //  printf("A,%lu,%lu,%lu\n", key, s->seq, callback->slab_idx/4096);
 
   if (callback->cb) callback->cb(callback, &disk_page[in_page_offset]);
 }
@@ -371,6 +378,9 @@ void update_item_async_cb2(struct slab_callback *callback) {
   if(callback->cb != add_in_tree_for_update 
     && callback->cb != add_in_tree)
     __sync_fetch_and_sub(&callback->slab->update_ref, 1);
+
+  //if (load == 0)
+  //  printf("A,%lu,%lu,%lu\n", key, callback->slab->seq, callback->slab_idx/4096);
 
   if (callback->cb) callback->cb(callback, &disk_page[in_page_offset]);
   if (cbcb) callback->cb_cb(callback, &disk_page[in_page_offset]);

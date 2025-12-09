@@ -26,6 +26,10 @@ typedef enum available_bench {
   dbbench_all_dist,
   dbbench_prefix_random,
   dbbench_prefix_dist,
+  locality_random,
+  locality_temporal,
+  locality_keyspace,
+  locality_both,
   bgwork_reinsertion,
 } bench_t;
 
@@ -43,6 +47,7 @@ struct workload_api {
 extern struct workload_api YCSB;
 extern struct workload_api BGWORK;
 extern struct workload_api DBBENCH;
+extern struct workload_api LOCALITY;
 extern struct workload_api PRODUCTION;
 
 struct workload {

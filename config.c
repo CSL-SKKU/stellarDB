@@ -19,6 +19,10 @@ static const struct { const char *name; bench_t b; } bench_table[] = {
     {"dbbench_all_dist",    dbbench_all_dist},
     {"dbbench_prefix_random", dbbench_prefix_random},
     {"dbbench_prefix_dist", dbbench_prefix_dist},
+    {"locality_random", locality_random},
+    {"locality_temporal", locality_temporal},
+    {"locality_keyspace", locality_keyspace},
+    {"locality_both", locality_both},
     {"bgwork_reinsertion",  bgwork_reinsertion},
     {NULL, 0}
 };
@@ -54,6 +58,7 @@ struct workload_api *parse_api(const char *s) {
     if (strcasecmp(s, "ycsb") == 0)      return &YCSB;
     if (strcasecmp(s, "dbbench") == 0)   return &DBBENCH;
     if (strcasecmp(s, "bgwork") == 0)    return &BGWORK;
+    if (strcasecmp(s, "locality") == 0)    return &LOCALITY;
     fprintf(stderr, "Unknown api '%s', using default YCSB\n", s);
     return &YCSB;
 }

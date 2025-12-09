@@ -15,7 +15,7 @@ CFLAGS += -DSELECTED_BENCH=$(BENCH) -DSELECTED_PAGE_CACHE_SIZE=$(PAGE_CACHE_SIZE
 LDLIBS=-lm -lpthread -lstdc++ -L/usr/lib/gcc/x86_64-linux-gnu/11/
 
 INDEXES_OBJ=indexes/rbtree.o indexes/btree.o indexes/filter.o indexes/tnt_centree.o indexes/tnt_subtree.o indexes/tnt_balance.o
-OTHERS_OBJ=config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o workload-bgwork.o workload-production.o utils.o in-memory-index-tnt.o fsst.o db_bench.o ${INDEXES_OBJ}
+OTHERS_OBJ=config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o workload-bgwork.o workload-production.o workload-locality.o utils.o in-memory-index-tnt.o fsst.o db_bench.o ${INDEXES_OBJ}
 MAIN_OBJ=main.o ${OTHERS_OBJ} 
 
 .PHONY: all clean

@@ -451,7 +451,9 @@ void run_workload(struct workload *w, bench_t b) {
         "trying to run a production benchmark on a database configured for "
         "YCSB?)");
   if (b == dbbench_all_random || b == dbbench_all_dist ||
-      b == dbbench_prefix_random || b == dbbench_prefix_dist)
+      b == dbbench_prefix_random || b == dbbench_prefix_dist
+      || b == locality_random || b == locality_temporal ||
+         b == locality_keyspace || b == locality_both)
     w->api->init(w, b);
 
   declare_timer;

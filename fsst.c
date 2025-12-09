@@ -85,6 +85,19 @@ static void *fsst_worker(void *pdata) {
 	      &gc_buf[offset + kv_i * s->item_size],
               s->item_size
             );
+
+	    index_entry_t *c = tnt_index_lookup_utree(s->subtree, cb->item);
+	    if (c) {
+		    unsigned char v;
+		    const uint32_t p = c->slab_idx;
+		    asm("btl %2, %1; setc %0" : "=qm"(v) : "m"(p), "Ir"(31));
+		    if (v == 1) {
+			    free(cb->item);
+			    free(cb);
+			    continue;
+		    }
+	    }
+	    
             struct item_metadata *meta = (struct item_metadata *)cb->item;
             size_t size = sizeof(*meta) + meta->key_size + meta->value_size;
             char *item_key = &cb->item[sizeof(*meta)];

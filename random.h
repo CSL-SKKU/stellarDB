@@ -22,6 +22,7 @@ uint64_t get_real_key(size_t position);
 #endif
 
 void cp_old_keys(size_t *prev, uint64_t nb_items_in_db);
+void cp_old_keys_reverse(size_t *prev, uint64_t nb_items_in_db);
 void init_old_keys(uint64_t nb_items_in_db);
 uint64_t get_old_key(size_t position);
 

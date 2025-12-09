@@ -79,6 +79,22 @@ uint64_t get_real_key(size_t position) {
 static uint64_t *old_keys = NULL;
 static uint64_t oldkey_size = 0;
 
+void cp_old_keys_reverse(uint64_t *prev, uint64_t nb_items_in_db) {
+    oldkey_size = nb_items_in_db;
+    old_keys = malloc(oldkey_size * sizeof(uint64_t));
+    if (!old_keys) {
+        perror("malloc");
+        return;
+    }
+
+    // 역순 복사
+    for (uint64_t i = 0; i < oldkey_size; i++) {
+        old_keys[i] = prev[oldkey_size - 1 - i];
+    }
+
+    printf("old cpy: %lu\n", oldkey_size);
+}
+
 void cp_old_keys(size_t *prev, uint64_t nb_items_in_db) {
   oldkey_size = nb_items_in_db;
   old_keys = malloc(oldkey_size * sizeof(uint64_t));
