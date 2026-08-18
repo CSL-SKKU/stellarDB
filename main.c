@@ -5,6 +5,7 @@
 int print = 0;
 int load = 1;
 extern int cache_hit;
+extern int merged;
 extern int try_fsst;
 
 static void print_help(char *n) {
@@ -12,7 +13,7 @@ static void print_help(char *n) {
   puts("Options:");
   puts("  -P, --page-cache-size <bytes>   set page cache size");
   puts("  -b, --bench <bench_name>        select workload (e.g. ycsb_c_zipfian)");
-  puts("  -a, --api <api_name>            select API (ycsb, dbbench, bgwork, production)");
+  puts("  -a, --api <api_name>            select API (ycsb, dbbench, bgwork, locality, latprobe)");
   puts("  -k, --kv-size <bytes>           set KV_SIZE");
   puts("  -m, --max-file-size <bytes>     set MAX_FILE_SIZE");
   puts("  -i, --insert-mode <ascend|descend|random>");
@@ -85,7 +86,7 @@ int main(int argc, char **argv) {
     struct workload w;
     w.api            = cfg.api;
     w.nb_items_in_db = cfg.nb_items_in_db;
-    w.nb_load_injectors = 4;  // 고정이 필요하다면 옵션화 가능
+    w.nb_load_injectors = cfg.api == &LATPROBE ? 1 : 4;
     if (cfg.nb_requests)
         w.nb_requests = cfg.nb_requests;
 
@@ -151,6 +152,7 @@ int main(int argc, char **argv) {
 
   print = 1;
   cache_hit = 0;
+  merged = 0;
 
   //if (w.api == &BGWORK) {
   //  start_timer {
@@ -185,8 +187,10 @@ int main(int argc, char **argv) {
     }
     run_workload(&w, workload);
     printf("lookup hit: %d\n", cache_hit);
+    printf("merged: %d\n", merged);
     printf("try_fsst: %d\n", try_fsst);
     cache_hit = 0;
+    merged = 0;
   }
 
   //tnt_print();

@@ -97,6 +97,22 @@ make test
 ./test/test_main <total_requests> <shuffle_range> <workload_type (A|B|C)> <num_threads>
 ```
 
+## Latency Probe
+
+Build with detailed timing enabled, then select the `latprobe` API and
+benchmark. The workload keeps exactly one request in flight and writes one CSV
+row per completed request to standard output.
+
+```bash
+make clean
+make STELLAR_DEBUG=1
+./main -n 1000000 -q 10000 -a latprobe -b latprobe 1 48 12 \
+  > latency.csv
+```
+
+Without `STELLAR_DEBUG=1`, end-to-end latency is still reported but the individual
+stage columns are zero.
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

@@ -31,6 +31,7 @@ typedef enum available_bench {
   locality_keyspace,
   locality_both,
   bgwork_reinsertion,
+  latprobe,
 } bench_t;
 
 struct workload_api {
@@ -48,6 +49,7 @@ extern struct workload_api YCSB;
 extern struct workload_api BGWORK;
 extern struct workload_api DBBENCH;
 extern struct workload_api LOCALITY;
+extern struct workload_api LATPROBE;
 extern struct workload_api PRODUCTION;
 
 struct workload {
@@ -76,6 +78,10 @@ struct slab_callback *bench_cb(void);
 
 struct workload_api *get_api(bench_t b);
 void add_in_tree(struct slab_callback *cb, void *item);
+
+void add_cached_in_lat_ctx(struct slab_callback *cb, uint32_t cached);
+void add_upward_in_lat_ctx(struct slab_callback *cb, uint32_t upward);
+void add_scount_in_lat_ctx(struct slab_callback *cb, uint32_t count);
 
 #if DEBUG
 void print_slow_payloads(void);

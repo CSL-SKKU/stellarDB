@@ -298,13 +298,7 @@ void read_item_async_cb(struct slab_callback *callback) {
 skip:
   R_UNLOCK(&s->tree_lock);
   
-  struct item_metadata *meta = (struct item_metadata *)callback->item;
-  char *item_key = &callback->item[sizeof(*meta)];
-  uint64_t key = *(uint64_t *)item_key;
-
-  //if (load == 0)
-  //  printf("A,%lu,%lu,%lu\n", key, s->seq, callback->slab_idx/4096);
-
+  add_time_in_payload(callback, 6);
   if (callback->cb) callback->cb(callback, &disk_page[in_page_offset]);
 }
 

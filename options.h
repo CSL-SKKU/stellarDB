@@ -1,7 +1,9 @@
 #ifndef OPTIONS_H
 #define OPTIONS_H
 
+#ifndef DEBUG
 #define DEBUG 0
+#endif
 #define PINNING 1
 #define PATH "/scratch%lu/kvell/slab-%lu-%lu-%lu"
 

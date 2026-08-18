@@ -689,6 +689,7 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   centree_node n;
   index_entry_t *e = NULL, *tmp = NULL;
   int tmp_try = 0, upward_len = 1;
+  int count = 0;
 
   // Leaf node까지 내려가는 과정
   //R_LOCK(&centree_root_lock);
@@ -717,6 +718,7 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
       if (filter_contain(s->filter, (unsigned char *)&key)) {
 #endif
 	    if (key <= s->max && key >= s->min) {
+	      count++;
           tmp = subtree_worker_lookup_utree(s->subtree, item);
 	    }
         if (tmp) {
@@ -746,6 +748,8 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   // printf("%d", try);
   
   if (e){
+    add_upward_in_lat_ctx(cb, upward_len);
+    add_scount_in_lat_ctx(cb, count);
     if (cfg.with_reins)
       e->slab->upward_maxlen = upward_len;
     return e;

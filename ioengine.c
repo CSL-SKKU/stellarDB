@@ -1,6 +1,7 @@
 #include "headers.h"
 
 int cache_hit = 0;
+int merged = 0;
 
 static __thread char *disk_data;
 void *safe_pread(int fd, off_t offset) {
@@ -153,6 +154,7 @@ char *no_read_page_async(struct slab_callback *callback) {
   if (alread_used) {  // Somebody else is already prefetching the same page!
     struct linked_callbacks *linked_cb = malloc(sizeof(*linked_cb));
     __sync_add_and_fetch(&cache_hit, 1);
+    add_cached_in_lat_ctx(callback, 1);
     linked_cb->callback = callback;
     linked_cb->next = ctx->linked_callbacks;
     ctx->linked_callbacks = linked_cb;  // link our callback
@@ -178,13 +180,14 @@ char *read_page_async(struct slab_callback *callback) {
   callback->lru_entry = lru_entry;
   if (lru_entry->contains_data) {  // content is cached already
     __sync_add_and_fetch(&cache_hit, 1);
+    add_cached_in_lat_ctx(callback, 1);
     callback->io_cb(callback);  // call the callback directly
     return disk_page;
   }
 
   if (alread_used) {  // Somebody else is already prefetching the same page!
     struct linked_callbacks *linked_cb = malloc(sizeof(*linked_cb));
-    __sync_add_and_fetch(&cache_hit, 1);
+    __sync_add_and_fetch(&merged, 1);
     linked_cb->callback = callback;
     linked_cb->next = ctx->linked_callbacks;
     ctx->linked_callbacks = linked_cb;  // link our callback
