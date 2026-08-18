@@ -3,18 +3,18 @@ CC=clang  #If you use GCC, add -fno-strict-aliasing to the CFLAGS because the Go
 CFLAGS=-O2 -ggdb3 -Wall -I.
 
 CXX=clang++
-CXXFLAGS= ${CFLAGS} -I/usr/include/c++/11 -I/usr/include/x86_64-linux-gnu/c++/11
+CXXFLAGS=${CFLAGS}
 
 # 기본값 설정
 BENCH ?= ycsb_c_zipfian
-PAGE_CACHE_SIZE ?= "(PAGE_SIZE * 2097152)" # 기본 3GB 설정
+PAGE_CACHE_SIZE ?= "(PAGE_SIZE * 2097152)" # Default 8 GiB
 
 # 매크로 전달
 CFLAGS += -DSELECTED_BENCH=$(BENCH) -DSELECTED_PAGE_CACHE_SIZE=$(PAGE_CACHE_SIZE)
 
-LDLIBS=-lm -lpthread -lstdc++ -L/usr/lib/gcc/x86_64-linux-gnu/11/
+LDLIBS=-lm -lpthread -lstdc++
 
-INDEXES_OBJ=indexes/rbtree.o indexes/btree.o indexes/filter.o indexes/tnt_centree.o indexes/tnt_subtree.o indexes/tnt_balance.o
+INDEXES_OBJ=indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o indexes/tnt_subtree.o indexes/tnt_balance.o
 OTHERS_OBJ=config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o workload-bgwork.o workload-production.o workload-locality.o utils.o in-memory-index-tnt.o fsst.o db_bench.o ${INDEXES_OBJ}
 MAIN_OBJ=main.o ${OTHERS_OBJ} 
 
@@ -42,4 +42,3 @@ main: $(MAIN_OBJ)
 
 clean:
 	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins makefile.dep
-
