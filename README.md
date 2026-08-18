@@ -1,32 +1,52 @@
 # StellarDB
 
+StellarDB is a storage engine derived from TNTStore/KVell. This repository
+contains the core source code needed to build and run the engine; generated
+binaries, raw traces, and machine-specific experiment outputs are intentionally
+kept out of version control.
+
 ## Compiling
 
 To build StellarDB, install the required dependencies and run `make` in the project directory.
 
 ```bash
 sudo apt install make clang autoconf libtool
-
-# Note: the directory name is different due to an internal development nickname.
-cd TNTStore
+cd stellarDB
 make
+```
+
+The default application page cache is 8 GiB. Build-time defaults can be
+overridden when needed:
+
+```bash
+make PAGE_CACHE_SIZE='(PAGE_SIZE * 1048576)'
 ```
 
 ## Running
 
-Before running, you must manually create the following directory:
+StellarDB stores its local files under `/scratch0/kvell/` by default. Create the
+directory and ensure that the current user can write to it before running:
 
+```bash
+sudo mkdir -p /scratch0/kvell
+sudo chown "$(id -un):$(id -gn)" /scratch0/kvell
 ```
-/scratch0/kvell/
+
+CPU pinning is controlled in `options.h`; the affinity implementation is in
+`utils.c`. Other runtime defaults are defined in `config.c` and `options.h`.
+
+> **Warning:** Never format or clear a storage device without checking its
+> contents and mount point. Machine-specific scripts and raw benchmark outputs
+> are intentionally excluded from this repository.
+
+For workloads backed by an external real-key trace, pass the trace path at
+build time. Trace files themselves are not stored in Git:
+
+```bash
+make REALKEY_FILE_PATH=/path/to/key-trace
 ```
-
-You also need to configure CPU core mapping in `util.c`.
-
-Default values can be changed by modifying `config.c` and `options.c`.
 
 > **Note**: `nb_disks` is currently not supported and must always be set to `1`.
-
-> **Tip**: You may mount your target storage device to `/scratch0/kvell/` if needed.
 
 ### Usage
 
@@ -39,7 +59,7 @@ Default values can be changed by modifying `config.c` and `options.c`.
 ```
   -P, --page-cache-size <bytes>   Set page cache size
   -b, --bench <bench_name>        Select workload (e.g., ycsb_c_zipfian)
-  -a, --api <api_name>            Select API (ycsb, dbbench, bgwork, production)
+  -a, --api <api_name>            Select API (ycsb, dbbench, bgwork, locality, latprobe)
   -k, --kv-size <bytes>           Set KV size (used in Section 4.4 experiments)
   -m, --max-file-size <bytes>     Set max file size (used in Section 4.4 experiments)
   -i, --insert-mode <ascend|descend|random>  Set insert mode (used in Section 4.5 experiments)
@@ -65,7 +85,8 @@ Default values can be changed by modifying `config.c` and `options.c`.
 
 > `-k` and `-m` options are used for experiments in Section 4.4.
 > `-i`, `-c`, `-r`, and `-R` options are used for experiments in Section 4.5.
-> For consistent results across experiments, it is recommended to run `rm /scratch0/kvell/*` or reformat the target device (`mkfs`) before each run.
+For reproducible experiments, record the compiler version, storage device,
+NUMA layout, worker mapping, queue depth, and cache size together with results.
 
 ## Index-Only Testing
 
@@ -79,4 +100,3 @@ make test
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
-

@@ -1,7 +1,59 @@
+# Editors and local tooling
 *.swp
+.cache/
+
+# Build products
 *.o
-main
-microbench
-benchcomponents
-scripts/parse_log
-makefile.dep
+*.a
+*.so
+/main
+/main_r
+/microbench
+/benchcomponents
+/makefile.dep
+/scripts/parse_log
+/test/test_main
+/test/test_reins
+/ycsbl_main
+
+# Generated benchmark binaries
+/bgwork_*
+/des_lock*
+/distribute_test*
+/epoch_*
+/gdbtest
+/io_test
+/latency_*
+/max_file_test
+/onemem_ycsb_stellar
+/rebal_*
+/skt_*
+/temp_test
+/tnt_*
+/ttt*
+/test/rebal_*
+/test/reins_*
+
+# Benchmark outputs and local data
+/bgwork/
+/bin/
+/test/logs/
+/test/results/
+/test_results/
+*.log
+perf.data*
+*.data.profile
+/sim*.csv
+
+# Machine-local experiment scripts. Add sanitized, parameterized versions
+# under scripts/ when they are ready to be shared.
+/20*.sh
+/build*.sh
+/latency.sh
+/locality.sh
+/qd.sh
+/run_*.sh
+/simple_index_test
+/twice_build.sh
+/scripts/restructuring*.sh
+/test/index_test.sh
