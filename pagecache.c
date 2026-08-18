@@ -14,7 +14,7 @@ void page_cache_init(struct pagecache *p) {
 
   p->hash_to_page = tree_create();
   p->used_pages =
-      calloc(MAX_PAGE_CACHE / get_nb_workers(), sizeof(*p->used_pages));
+      calloc((cfg.page_cache_size / PAGE_SIZE) / get_nb_workers(), sizeof(*p->used_pages));
   p->used_page_size = 0;
   p->oldest_page = NULL;
   p->newest_page = NULL;
@@ -70,7 +70,7 @@ int get_page(struct pagecache *p, uint64_t hash, void **page,
   }
 
   // Otherwise allocate a new page, either a free one, or reuse the oldest
-  if (p->used_page_size < MAX_PAGE_CACHE / get_nb_workers()) {
+  if (p->used_page_size < (cfg.page_cache_size / PAGE_SIZE) / get_nb_workers()) {
     dst = &p->cached_data[PAGE_SIZE * p->used_page_size];
     lru_entry = add_page_in_lru(p, dst, hash);
     p->used_page_size++;
@@ -128,7 +128,7 @@ int get_page_with_slab(struct pagecache *p, uint64_t hash, void **page,
   }
 
   // Otherwise allocate a new page, either a free one, or reuse the oldest
-  if (p->used_page_size < MAX_PAGE_CACHE / get_nb_workers()) {
+  if (p->used_page_size < (cfg.page_cache_size / PAGE_SIZE) / get_nb_workers()) {
     dst = &p->cached_data[PAGE_SIZE * p->used_page_size];
     lru_entry = add_page_in_lru(p, dst, hash);
     p->used_page_size++;
@@ -182,7 +182,7 @@ int get_page_for_file(struct pagecache *p, uint64_t hash, uint64_t size,
   }
 
   // Otherwise allocate a new page, either a free one, or reuse the oldest
-  if (p->used_page_size < MAX_PAGE_CACHE / get_nb_workers()) {
+  if (p->used_page_size < (cfg.page_cache_size / PAGE_SIZE) / get_nb_workers()) {
     dst = &p->cached_data[PAGE_SIZE * p->used_page_size];
     lru_entry = add_page_in_lru(p, dst, hash);
     p->used_page_size += 16384;
