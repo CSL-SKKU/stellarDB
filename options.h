@@ -79,7 +79,8 @@
 
 #define KV_SIZE 1024
 #define MAX_FILE_SIZE 16384 * PAGE_SIZE
-//#define REALKEY_FILE_PATH "/home/"
+//#define MAX_FILE_SIZE 52428800 * PAGE_SIZE
 
+/* Define REALKEY_FILE_PATH with `make REALKEY_FILE_PATH=/path/to/trace`. */
 
 #endif
