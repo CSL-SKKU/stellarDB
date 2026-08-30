@@ -107,6 +107,7 @@ node new_node(void *key, tree_entry_t *value, node left, node right) {
   result->value = *value;
   result->left = left;
   result->right = right;
+  result->lu_parent = NULL;
   atomic_store(&result->child_flag, 0);
   if (left != NULL) left->parent = result;
   if (right != NULL) right->parent = result;
