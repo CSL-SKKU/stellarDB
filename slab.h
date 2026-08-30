@@ -71,13 +71,12 @@ struct slab {
 typedef void(slab_cb_t)(struct slab_callback *, void *item);
 enum slab_action {
   ADD,
-  UPDATE,
+  UPSERT,
   DELETE,
   READ,
   READ_NO_LOOKUP,
-  ADD_OR_UPDATE,
   ADD_NO_LOOKUP,
-  UPDATE_NO_LOOKUP,
+  UPSERT_NO_LOOKUP,
   FSST_NO_LOOKUP
 };
 struct slab_callback {
@@ -106,7 +105,7 @@ struct slab_callback {
   struct slab_context *ctx;
 };
 
-void add_in_tree_for_update(struct slab_callback *cb, void *item);
+void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
 
 struct slab *resize_slab(struct slab *s);
 
@@ -114,7 +113,7 @@ void *read_item(struct slab *s, size_t idx);
 void read_item_async(struct slab_callback *callback);
 void scan_item_async(struct slab_callback *callback);
 void add_item_async(struct slab_callback *callback);
-void update_item_async(struct slab_callback *callback);
+void upsert_item_async(struct slab_callback *callback);
 void remove_item_async(struct slab_callback *callback);
 void remove_and_add_item_async(struct slab_callback *callback);
 

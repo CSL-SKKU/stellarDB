@@ -312,12 +312,12 @@ void scan_item_async(struct slab_callback *callback) {
 }
 
 /*
- * Asynchronous update item:
+ * Asynchronous upsert item:
  * - First read the page where the item is staying
  * - Once the page is in page cache, write it
  * - Then send the order to flush it.
  */
-void update_item_async_cb2(struct slab_callback *callback) {
+void upsert_item_async_cb2(struct slab_callback *callback) {
   char *disk_page = callback->lru_entry->page;
   off_t in_page_offset =
       item_in_page_offset(callback->slab, callback->slab_idx);
@@ -335,7 +335,7 @@ void update_item_async_cb2(struct slab_callback *callback) {
     die("DIFF key1: %lu, key2: %lu, key/idx: %lu/%lu\n", key, key2,
         callback->slab->seq, callback->slab_idx);
 
-  if(callback->cb != add_in_tree_for_update 
+  if(callback->cb != add_in_tree_for_upsert
     && callback->cb != add_in_tree)
     __sync_fetch_and_sub(&callback->slab->update_ref, 1);
 
@@ -346,7 +346,7 @@ void update_item_async_cb2(struct slab_callback *callback) {
   if (cbcb) callback->cb_cb(callback, &disk_page[in_page_offset]);
 }
 
-void update_item_async_cb1(struct slab_callback *callback) {
+void upsert_item_async_cb1(struct slab_callback *callback) {
   char *disk_page = callback->lru_entry->page;
 
   struct slab *s = callback->slab;
@@ -380,12 +380,12 @@ void update_item_async_cb1(struct slab_callback *callback) {
      */
 #endif
 
-  callback->io_cb = update_item_async_cb2;
+  callback->io_cb = upsert_item_async_cb2;
   write_page_async(callback);
 }
 
-void update_item_async(struct slab_callback *callback) {
-  callback->io_cb = update_item_async_cb1;
+void upsert_item_async(struct slab_callback *callback) {
+  callback->io_cb = upsert_item_async_cb1;
   read_page_async(callback);
 }
 
@@ -460,7 +460,7 @@ void add_item_async(struct slab_callback *callback) {
   callback->io_cb(callback);
 }
 
-void add_in_tree_for_update(struct slab_callback *cb, void *item) {
+void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   struct slab *s = cb->slab;
   struct slab *old_s = cb->fsst_slab;
   //uint64_t old_idx = cb->fsst_idx;
@@ -549,7 +549,7 @@ skip:
   }
   R_UNLOCK(&s->tree_lock);
 
-  if (cb->cb_cb == add_in_tree_for_update) {
+  if (cb->cb_cb == add_in_tree_for_upsert) {
     free(cb->item);
     free(cb);
   }
@@ -559,11 +559,11 @@ void remove_and_add_item_async(struct slab_callback *callback) {
   callback->io_cb = add_item_async_cb1;
   if (callback->slab_idx != -1) {
     if (!callback->cb){  // making fsst by using cb_cb
-      callback->cb = add_in_tree_for_update;
+      callback->cb = add_in_tree_for_upsert;
     }
     else {
       callback->cb_cb = callback->cb;  // computes_stat
-      callback->cb = add_in_tree_for_update;
+      callback->cb = add_in_tree_for_upsert;
     }
   } else {
     // FSST과정에서는 불가능 해야 하는(호출되면 안되는) 상황

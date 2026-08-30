@@ -23,6 +23,7 @@ struct runtime_config {
 
 extern struct runtime_config cfg;
 void init_default_config(struct runtime_config *cfg);
+int validate_runtime_config(const struct runtime_config *cfg);
 
 bench_t parse_bench(const char *s);
 struct workload_api *parse_api(const char *s);

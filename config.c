@@ -82,3 +82,19 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->nb_requests     = 0;            // 런타임 결정
     cfg->chunk_for_shuffle = 1;
 }
+
+int validate_runtime_config(const struct runtime_config *cfg) {
+    const size_t min_kv_size =
+        sizeof(struct item_metadata) + 2 * sizeof(uint64_t);
+
+    if (cfg->kv_size < (int)min_kv_size ||
+        cfg->kv_size > (int)PAGE_SIZE ||
+        PAGE_SIZE % (size_t)cfg->kv_size != 0) {
+        fprintf(stderr,
+                "Invalid KV size %d: expected a slot size "
+                "between %zu and %lu bytes that divides %lu exactly\n",
+                cfg->kv_size, min_kv_size, PAGE_SIZE, PAGE_SIZE);
+        return 0;
+    }
+    return 1;
+}

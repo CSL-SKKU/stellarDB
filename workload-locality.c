@@ -118,7 +118,7 @@ static void _launch_locality(int total, int nb_requests, double dist_a,
       struct slab_callback *cb = bench_cb();
       cb->item = _create_unique_item_locality(key_rand);
       query_count_put++;
-      kv_update_async(cb);
+      kv_upsert_async(cb);
     } else if (query_type == 2) {
       int scan_len_max = 10000;
       int64_t scan_length =

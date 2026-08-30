@@ -133,7 +133,7 @@ static void add_to_tree(struct slab_callback *cb, char *item) {
 }
 
 // 업데이트 및 레이턴시 측정: subtree_get과 index_add+min/max를 각각 측정 후 합산하여 반환
-double add_to_tree_for_update_timed(struct slab_callback *cb, char *item) {
+double add_to_tree_for_upsert_timed(struct slab_callback *cb, char *item) {
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
   uint64_t key = *(uint64_t *)item_key;
@@ -191,7 +191,7 @@ static inline void init_test_item(char *item, uint64_t key) {
 }
 
 // 업데이트 결정
-static int should_update(unsigned int seed) {
+static int should_upsert(unsigned int seed) {
   return rand_r(&seed) % 100 < UPDATE_THRESHOLD;
 }
 
@@ -237,9 +237,9 @@ void *worker(void *arg) {
     cb.slab_idx = 0;
     cb.item     = buf;
 
-    //if (i == td->start_idx) add_to_tree_for_update_timed(&cb, buf);
-    if (should_update(seed)) {
-      double lat = add_to_tree_for_update_timed(&cb, buf);
+    //if (i == td->start_idx) add_to_tree_for_upsert_timed(&cb, buf);
+    if (should_upsert(seed)) {
+      double lat = add_to_tree_for_upsert_timed(&cb, buf);
       td->upd_lat[td->upd_cnt++] = lat;
     } else {
       struct timespec ts, te;
@@ -291,10 +291,10 @@ void *phase2_worker(void *arg) {
     init_test_item(buf, td->max_key);
     struct slab_callback cb = { .slab_idx = 0, .item = buf };
 
-    if (i == td->start_idx) add_to_tree_for_update_timed(&cb, buf);
+    if (i == td->start_idx) add_to_tree_for_upsert_timed(&cb, buf);
 
-    if (should_update(seed)) {
-      double lat = add_to_tree_for_update_timed(&cb, buf);
+    if (should_upsert(seed)) {
+      double lat = add_to_tree_for_upsert_timed(&cb, buf);
       td->upd_lat[td->upd_cnt++] = lat;
     } else {
       struct timespec ts, te;
@@ -432,8 +432,8 @@ int main(int argc, char *argv[]) {
     char *item = create_test_item(key);
     cb.slab_idx = 0;
     cb.item = item;
-    if (should_update()) {
-      double lat = add_to_tree_for_update_timed(&cb, item);
+    if (should_upsert()) {
+      double lat = add_to_tree_for_upsert_timed(&cb, item);
       update_latencies[update_count++] = lat;
     } else {
       struct timespec ts, te;
@@ -523,4 +523,3 @@ int main(int argc, char *argv[]) {
   free(tds); free(tids);
   return 0;
 }
-

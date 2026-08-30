@@ -29,7 +29,7 @@ static void launch_prod(struct workload *w, bench_t b) {
     // 58% write 40% read 2% scan
     long random = uniform_next() % 100;
     if (random < 58) {
-      kv_update_async(cb);
+      kv_upsert_async(cb);
     } else if (random < 98) {
       kv_read_async(cb);
     }

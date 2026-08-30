@@ -141,7 +141,7 @@ static void issue_one_and_wait(uint64_t seq, uint64_t key, int do_put,
   cb->item = _create_unique_item_latprobe(key);
 
   pthread_mutex_lock(&ctx.mu);
-  if (do_put) kv_update_async(cb);
+  if (do_put) kv_upsert_async(cb);
   else        kv_read_async(cb);
   while (!ctx.done) pthread_cond_wait(&ctx.cv, &ctx.mu);
   pthread_mutex_unlock(&ctx.mu);

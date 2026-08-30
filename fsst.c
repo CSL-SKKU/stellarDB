@@ -204,7 +204,7 @@ void skip_or_invalidate_index_fsst(void *slab, uint64_t slab_idx) {
       (cb->slab_idx % (PAGE_SIZE / cb->slab->item_size)) * cb->slab->item_size;
   src = &vict_file_fsst[(page_num * PAGE_SIZE) + page_idx];
   memcpy(cb->item, src, cb->slab->item_size);
-  kv_update_async(cb);
+  kv_upsert_async(cb);
   R_LOCK(&s->tree_lock);
   return;
 }

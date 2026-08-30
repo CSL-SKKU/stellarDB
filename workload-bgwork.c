@@ -39,7 +39,7 @@ static void _launch_bgwork(int test, int nb_requests) {
     cb->item = _create_unique_item_bgwork(zipf_next());
     if (random_get_put(
             test)) {  // In these tests we update with a given probability
-      kv_update_async(cb);
+      kv_upsert_async(cb);
     } else {  // or we read
       kv_read_async(cb);
     }
@@ -58,7 +58,7 @@ static void _launch_bgwork_e(int test, int nb_requests) {
       struct slab_callback *cb = bench_cb();
       cb->item = _create_unique_item_bgwork(rand_next());
       total_update++;
-      kv_update_async(cb);
+      kv_upsert_async(cb);
     } else {  // or we scan
       uint64_t start_key = rand_next();
       size_t scan_size = uniform_next()%99+1;

@@ -198,16 +198,10 @@ void kv_add_async(struct slab_callback *callback) {
   enqueue_slab_callback(ctx, ADD, callback);
 }
 
-void kv_update_async(struct slab_callback *callback) {
+void kv_upsert_async(struct slab_callback *callback) {
   struct slab_context *ctx = get_slab_context(callback->item);
   callback->ctx = ctx;
-  return enqueue_slab_callback(ctx, UPDATE, callback);
-}
-
-void kv_add_or_update_async(struct slab_callback *callback) {
-  struct slab_context *ctx = get_slab_context(callback->item);
-  callback->ctx = ctx;
-  return enqueue_slab_callback(ctx, ADD_OR_UPDATE, callback);
+  return enqueue_slab_callback(ctx, UPSERT, callback);
 }
 
 void kv_remove_async(struct slab_callback *callback) {
@@ -225,13 +219,13 @@ void kv_add_async_no_lookup(struct slab_callback *callback, struct slab *s,
   return enqueue_slab_callback(ctx, ADD_NO_LOOKUP, callback);
 }
 
-void kv_update_async_no_lookup(struct slab_callback *callback, struct slab *s,
+void kv_upsert_async_no_lookup(struct slab_callback *callback, struct slab *s,
                                size_t slab_idx) {
   struct slab_context *ctx = get_slab_context_uidx((PAGE_SIZE/s->item_size), slab_idx);
   callback->ctx = ctx;
   callback->slab = s;
   callback->slab_idx = slab_idx;
-  return enqueue_slab_callback(ctx, UPDATE_NO_LOOKUP, callback);
+  return enqueue_slab_callback(ctx, UPSERT_NO_LOOKUP, callback);
 }
 void kv_fsst_async_no_lookup(struct slab_callback *callback, struct slab *s,
                              size_t slab_idx) {
@@ -239,7 +233,7 @@ void kv_fsst_async_no_lookup(struct slab_callback *callback, struct slab *s,
   callback->ctx = ctx;
   callback->slab = s;
   callback->slab_idx = slab_idx;
-  return enqueue_slab_callback(ctx, UPDATE_NO_LOOKUP, callback);
+  return enqueue_slab_callback(ctx, UPSERT_NO_LOOKUP, callback);
 }
 
 static void complete_read_miss(struct slab_callback *callback) {
@@ -269,8 +263,8 @@ again:
 
     switch (action) {
       case ADD_NO_LOOKUP:
-      case UPDATE_NO_LOOKUP:
-        update_item_async(callback);
+      case UPSERT_NO_LOOKUP:
+        upsert_item_async(callback);
         break;
       case READ_NO_LOOKUP: {
         // slab idx에 카운트 담아옴
@@ -331,7 +325,7 @@ again:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
         if (e) {
-          die("Adding item that is already in the database! Use update "
+          die("Adding item that is already in the database! Use upsert "
               "instead! (This error might also appear if 2 keys have the same "
               "prefix, TODO: make index more robust to that.)\n");
         } else {
@@ -342,7 +336,7 @@ again:
           add_item_async(callback);
         }
         break;
-      case UPDATE:
+      case UPSERT:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
         if (!e) {

@@ -8,11 +8,10 @@ struct slab_context;
 
 void kv_read_async(struct slab_callback *callback);
 void kv_add_async(struct slab_callback *callback);
-void kv_update_async(struct slab_callback *callback);
-void kv_add_or_update_async(struct slab_callback *callback);
+void kv_upsert_async(struct slab_callback *callback);
 void kv_remove_async(struct slab_callback *callback);
 
-void kv_update_async_no_lookup(struct slab_callback *callback, struct slab *s,
+void kv_upsert_async_no_lookup(struct slab_callback *callback, struct slab *s,
                                size_t slab_idx);
 void kv_add_async_no_lookup(struct slab_callback *callback, struct slab *s,
                             size_t slab_idx);

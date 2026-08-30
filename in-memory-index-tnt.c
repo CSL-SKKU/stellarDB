@@ -477,7 +477,7 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
     //  R_UNLOCK(&s->tree_lock);
     //  if (old_e && s == old_e->slab) {
     //    __sync_fetch_and_add(&s->update_ref, 1);
-    //    // IN-PLACE UPDATE
+    //    // IN-PLACE UPSERT
     //    *idx = -1;
     //    break;
     //  }

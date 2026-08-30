@@ -82,6 +82,9 @@ int main(int argc, char **argv) {
     int nb_workers_per_disk = atoi(argv[optind++]);
     int nb_distributors_per_disk = atoi(argv[optind++]);
 
+    if (!validate_runtime_config(&cfg))
+        return EXIT_FAILURE;
+
     // --- 워크로드 초기화 예시 ---
     struct workload w;
     w.api            = cfg.api;
