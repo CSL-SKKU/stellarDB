@@ -310,8 +310,8 @@ void centree_worker_insert(int worker_id, void *item, tree_entry_t *e) {
   centree_node n;
   W_LOCK(&centree_root_lock);
   n = centree_insert(centree_root, (void *)e->key, e, tnt_pointer_cmp);
-  W_UNLOCK(&centree_root_lock);
   e->slab->centree_node = (void *)n;
+  W_UNLOCK(&centree_root_lock);
 }
 
 void wakeup_subtree_get(void *n) {
