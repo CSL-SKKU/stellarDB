@@ -66,7 +66,7 @@ struct slab {
 
 /* This is the callback enqueued in the engine.
  * slab_callback->item = item looked for (that needs to be freed)
- * item = page on disk (in the page cache)
+ * item = stored item, or NULL when a READ does not find the key
  */
 typedef void(slab_cb_t)(struct slab_callback *, void *item);
 enum slab_action {

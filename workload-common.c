@@ -220,7 +220,10 @@ void print_item(size_t idx, void *_item) {
  * Various callbacks that are called once an item has been read / written
  */
 void show_item(struct slab_callback *cb, void *item) {
-  print_item(cb->slab_idx, item);
+  if (item)
+    print_item(cb->slab_idx, item);
+  else
+    printf("Item not found\n");
   free(cb->item);
   free(cb);
 }

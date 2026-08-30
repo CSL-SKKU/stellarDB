@@ -241,6 +241,12 @@ void kv_fsst_async_no_lookup(struct slab_callback *callback, struct slab *s,
   callback->slab_idx = slab_idx;
   return enqueue_slab_callback(ctx, UPDATE_NO_LOOKUP, callback);
 }
+
+static void complete_read_miss(struct slab_callback *callback) {
+  add_time_in_payload(callback, 6);
+  if (callback->cb) callback->cb(callback, NULL);
+}
+
 /*
  * Worker context
  */
@@ -310,8 +316,7 @@ again:
         e = tnt_index_lookup(callback, callback->item);
         if (!e) {  // Item is not in DB
           __sync_add_and_fetch(&try_fsst, 1);
-          if (!callback->cb)
-            printf("no index for lookup!!!!\n");
+          complete_read_miss(callback);
           break;
         } else {
           struct slab *s = e->slab;
