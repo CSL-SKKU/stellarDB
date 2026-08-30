@@ -298,7 +298,7 @@ void read_item_async_cb(struct slab_callback *callback) {
 skip:
   R_UNLOCK(&s->tree_lock);
   
-  add_time_in_payload(callback, 6);
+  add_time_in_payload(callback, TIMING_STAGE_IO_COMPLETE);
   if (callback->cb) callback->cb(callback, &disk_page[in_page_offset]);
 }
 
@@ -471,7 +471,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   uint64_t cur;
   index_entry_t *e = NULL;
 
-  add_time_in_payload(cb, 6);
+  add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
   W_LOCK(&s->tree_lock);
     // CASE 2에서 여러 쓰레드가 여기 도달 가능.
     // 두 쓰레드들 중 가장 최신의 애가 먼저 lock 잡고 추가했다면
@@ -510,7 +510,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
 
   W_UNLOCK(&s->tree_lock);
 
-  add_time_in_payload(cb, 7);
+  add_time_in_payload(cb, TIMING_STAGE_NEW_INDEX_PUBLISHED);
 
   R_LOCK(&old_s->tree_lock);
   if (old_s->min == -1)
@@ -522,7 +522,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   }
   R_UNLOCK(&old_s->tree_lock);
 
-  add_time_in_payload(cb, 8);
+  add_time_in_payload(cb, TIMING_STAGE_OLD_INDEX_INVALIDATED);
 
 
   if (!removed) {

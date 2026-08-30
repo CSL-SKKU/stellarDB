@@ -107,7 +107,7 @@ static void worker_do_io(struct io_context *ctx) {
             //        complete ios
             //        (old value written to disk)
 
-    add_time_in_payload(callback, 5);
+    add_time_in_payload(callback, TIMING_STAGE_IO_SUBMIT);
   }
 
   // Submit requests to the kernel

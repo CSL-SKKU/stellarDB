@@ -154,7 +154,7 @@ static void enqueue_slab_callback(struct slab_context *ctx,
   size_t buffer_idx = get_slab_buffer(ctx);
   callback->action = action;
   ctx->callbacks[buffer_idx] = callback;
-  add_time_in_payload(callback, 0);
+  add_time_in_payload(callback, TIMING_STAGE_REQUEST_ENQUEUED);
   submit_slab_buffer(ctx, buffer_idx);
 }
 
@@ -237,7 +237,7 @@ void kv_fsst_async_no_lookup(struct slab_callback *callback, struct slab *s,
 }
 
 static void complete_read_miss(struct slab_callback *callback) {
-  add_time_in_payload(callback, 6);
+  add_time_in_payload(callback, TIMING_STAGE_IO_COMPLETE);
   if (callback->cb) callback->cb(callback, NULL);
 }
 
@@ -256,7 +256,7 @@ again:
     struct slab_callback *callback =
         ctx->callbacks[ctx->processed_callbacks % ctx->max_pending_callbacks];
     enum slab_action action = callback->action;
-    add_time_in_payload(callback, 1);
+    add_time_in_payload(callback, TIMING_STAGE_REQUEST_DEQUEUED);
 
     index_entry_t *e = NULL;
     struct tree_entry *tree = NULL;
@@ -332,7 +332,7 @@ again:
           callback->slab = tree->slab;
           //callback->slab =
           //    get_slab(ctx, callback->item, &callback->slab_idx, e);
-          add_time_in_payload(callback, 4);
+          add_time_in_payload(callback, TIMING_STAGE_STORAGE_TARGET_READY);
           add_item_async(callback);
         }
         break;
@@ -342,13 +342,13 @@ again:
         if (!e) {
           __sync_add_and_fetch(&try_fsst, 1);
           callback->slab = tree->slab;
-          add_time_in_payload(callback, 4);
+          add_time_in_payload(callback, TIMING_STAGE_STORAGE_TARGET_READY);
           add_item_async(callback);
           // read_item_async_from_fsst(callback);
           break;
         }
 
-        add_time_in_payload(callback, 4);
+        add_time_in_payload(callback, TIMING_STAGE_STORAGE_TARGET_READY);
 	callback->slab = tree->slab;
         //callback->slab = get_slab(ctx, callback->item, &callback->slab_idx, e);
 

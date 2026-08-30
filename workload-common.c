@@ -338,7 +338,7 @@ void compute_stats(struct slab_callback *cb, void *item) {
   declare_debug_timer;
   start_debug_timer {
     start = get_time_from_payload(cb, 0);
-    add_time_in_payload(cb, 9);
+    add_time_in_payload(cb, TIMING_STAGE_REQUEST_COMPLETE);
     rdtscll(end);
     uint64_t diff = end - start;
     add_timing_stat(diff);

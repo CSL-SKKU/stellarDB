@@ -706,7 +706,7 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   //}
   //R_UNLOCK(&centree_root_lock);
   n = centree_find_leaf((void*)key);
-  add_time_in_payload(cb, 2);
+  add_time_in_payload(cb, TIMING_STAGE_LEAF_FOUND);
 
   // Leaf node에서 upward 탐색
   while (n != NULL) {
@@ -744,7 +744,7 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
     upward_len++;
     n = n->lu_parent;  // parent 필드를 추가하고, 부모 노드로 이동
   }
-  add_time_in_payload(cb, 3);
+  add_time_in_payload(cb, TIMING_STAGE_INDEX_LOOKUP_DONE);
   // printf("%d", try);
   
   if (e){

@@ -57,7 +57,7 @@ void print_stats(void) {
 }
 
 struct timing_s {
-  size_t origin;
+  enum timing_stage origin;
   size_t time;
 };
 
@@ -69,7 +69,7 @@ void *allocate_payload(void) {
 #endif
 }
 
-void add_time_in_payload(struct slab_callback *c, size_t origin) {
+void add_time_in_payload(struct slab_callback *c, enum timing_stage origin) {
 #if DEBUG
   struct timing_s *payload = c->payload;
   if (!payload) return;
@@ -81,7 +81,7 @@ void add_time_in_payload(struct slab_callback *c, size_t origin) {
   payload[pos].time = t;
   payload[pos].origin = origin;
 #else
-  if (origin != 0) return;
+  if (origin != TIMING_STAGE_REQUEST_ENQUEUED) return;
   uint64_t t;
   rdtscll(t);
   c->payload = (void *)t;
