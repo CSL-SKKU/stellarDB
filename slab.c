@@ -299,7 +299,12 @@ skip:
   R_UNLOCK(&s->tree_lock);
   
   add_time_in_payload(callback, TIMING_STAGE_IO_COMPLETE);
-  if (callback->cb) callback->cb(callback, &disk_page[in_page_offset]);
+  struct item_metadata *meta =
+      (struct item_metadata *)&disk_page[in_page_offset];
+  if (item_is_legacy(meta))
+    die("Read encountered legacy item metadata\n");
+  if (callback->cb)
+    callback->cb(callback, item_is_tombstone(meta) ? NULL : meta);
 }
 
 void read_item_async(struct slab_callback *callback) {
