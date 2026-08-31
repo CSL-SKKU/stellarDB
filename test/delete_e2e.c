@@ -240,6 +240,10 @@ int main(int argc, char **argv) {
   printf("== DELETE end-to-end (%s, %lu keys, reins=%d) ==\n",
          verify_only ? "verify" : "populate", nb_keys, cfg.with_reins);
 
+  if (getenv("E2E_WORKERS")) nb_io_workers = atoi(getenv("E2E_WORKERS"));
+  if (getenv("E2E_DISTRIBUTORS"))
+    nb_distributors = atoi(getenv("E2E_DISTRIBUTORS"));
+
   slab_workers_init(1, nb_io_workers, nb_distributors);
   if (cfg.with_reins) fsst_worker_init();
   printf("  recovered %lu index entries\n", get_database_size());

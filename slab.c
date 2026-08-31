@@ -219,7 +219,11 @@ struct slab *close_and_create_slab(struct slab *s) {
   uint64_t new_level;
 
   R_LOCK(&s->tree_lock);
+  assert(s->min != (uint64_t)-1);
+  assert(s->min <= s->max);
   new_key = s->min + (s->max - s->min) / 2;
+  if (new_key == 0 || new_key == UINT64_MAX)
+    die("Cannot split slab %lu with overflowing pivot %lu", s->seq, new_key);
   new_level = tnt_get_centree_level(s->centree_node)+1;
   R_UNLOCK(&s->tree_lock);
 

@@ -11,6 +11,7 @@
  *   readd    - kv_add_async() on a key that was deleted
  *   reuse    - reuse one item buffer for DELETE and then for UPSERT
  *   inplace  - deletes that reuse the existing slot (no split in between)
+ *   narrow   - fill a leaf that routes only a couple of distinct keys
  */
 #include "headers.h"
 
@@ -357,6 +358,93 @@ static void case_inplace(uint64_t n) {
          normals);
 }
 
+/*
+ * Probe the split pivot when a leaf routes a very narrow key range.
+ *
+ * Several writes for one key can be in flight at once: the in-place branch of
+ * centree_lookup_and_reserve() only fires once a previous version has been
+ * published, so every racing writer reserves a slot of its own. A leaf routing
+ * only keys {0,1} can therefore fill while having observed exactly that range,
+ * and
+ *     new_key = min + (max - min) / 2
+ * is then 0, whose left child would be keyed 0 - 1 == UINT64_MAX. This is
+ * reachable whether or not min/max are published at reservation time, so it
+ * says nothing about that change on its own -- it asks what the split does
+ * when the range is genuinely narrow rather than genuinely unpublished.
+ */
+#define NARROW_KEYSPACE 4
+#define NARROW_THREADS 8
+
+struct narrow_arg {
+  int id;
+  uint64_t ops;
+};
+
+static struct req *narrow_reqs;
+static unsigned char **narrow_items;
+
+static void *narrow_worker(void *p) {
+  struct narrow_arg *a = p;
+  pin_me_on(get_nb_workers() + get_nb_distributors() + a->id);
+  for (uint64_t i = 0; i < a->ops; i++) {
+    uint64_t slot = (uint64_t)a->id * a->ops + i;
+    uint64_t k = slot % NARROW_KEYSPACE;
+    narrow_items[slot] = make_item(k, slot);
+    init_req(&narrow_reqs[slot], narrow_items[slot], k, write_done);
+    kv_upsert_async(&narrow_reqs[slot].cb);
+  }
+  return NULL;
+}
+
+static void case_narrow(uint64_t n) {
+  uint64_t per = n / NARROW_THREADS;
+  pthread_t t[NARROW_THREADS];
+  struct narrow_arg a[NARROW_THREADS];
+
+  n = per * NARROW_THREADS;
+  narrow_reqs = calloc(n, sizeof(*narrow_reqs));
+  narrow_items = calloc(n, sizeof(*narrow_items));
+  if (!narrow_reqs || !narrow_items) {
+    fail("out of memory");
+    return;
+  }
+
+  printf("  firing %lu concurrent upserts over keys 0..%d from %d threads\n",
+         n, NARROW_KEYSPACE - 1, NARROW_THREADS);
+  fflush(stdout);
+  for (int i = 0; i < NARROW_THREADS; i++) {
+    a[i].id = i;
+    a[i].ops = per;
+    pthread_create(&t[i], NULL, narrow_worker, &a[i]);
+  }
+  for (int i = 0; i < NARROW_THREADS; i++) pthread_join(t[i], NULL);
+  for (uint64_t i = 0; i < n; i++) {
+    while (!atomic_load(&narrow_reqs[i].done)) NOP10();
+    free(narrow_items[i]);
+  }
+  printf("  burst completed\n");
+
+  size_t slabs = 0, narrow_slabs = 0;
+  for (int seq = 0;; seq++) {
+    tree_entry_t *e = tnt_traverse_use_seq(seq);
+    if (!e) break;
+    struct slab *s = e->slab;
+    slabs++;
+    if (s->min != (uint64_t)-1 && s->max - s->min <= 1) narrow_slabs++;
+    if (slabs <= 20)
+      printf("    slab seq=%lu key=%lu min=%lu max=%lu full=%d last_item=%lu\n",
+             s->seq, s->key, s->min, s->max, atomic_load(&s->full),
+             (size_t)atomic_load(&s->last_item));
+  }
+  printf("  %lu slabs, %lu of them routing a range of <= 2 keys\n", slabs,
+         narrow_slabs);
+
+  /* Values race, so only readability is checkable. */
+  for (uint64_t k = 0; k < NARROW_KEYSPACE; k++)
+    if (!do_read(k, NULL))
+      fail("key %lu is unreadable after the narrow-range burst", k);
+}
+
 int main(int argc, char **argv) {
   const char *what = argc > 1 ? argv[1] : "count";
   uint64_t n = argc > 2 ? strtoull(argv[2], NULL, 0) : 3000;
@@ -372,6 +460,7 @@ int main(int argc, char **argv) {
   else if (!strcmp(what, "readd")) case_readd(n);
   else if (!strcmp(what, "reuse")) case_reuse(n);
   else if (!strcmp(what, "inplace")) case_inplace(n);
+  else if (!strcmp(what, "narrow")) case_narrow(n);
   else { printf("unknown case %s\n", what); return 2; }
 
   uint64_t f = atomic_load(&failures);
