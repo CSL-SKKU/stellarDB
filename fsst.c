@@ -45,6 +45,10 @@ static void *fsst_worker(void *pdata) {
         __atomic_store_n(&s->hot_bits[w], 0ULL, __ATOMIC_RELAXED);
 
         while (word != 0) {
+          struct tree_entry *tree;
+          index_entry_t *c, *e;
+          struct item_metadata *meta;
+
           // (가) 워드 내 최하위 세트 비트(0~63)를 찾는다.
           int bit_pos = __builtin_ctzll(word);
           // (나) 슬랩 내 실제 페이지 인덱스로 변환
@@ -57,7 +61,8 @@ static void *fsst_worker(void *pdata) {
 
           // 페이지 내 모든 KV를 순회
           for (size_t kv_i = 0; kv_i < num_kvs; kv_i++) {
-          // (1) 콜백 구조체 할당
+            size_t slot_idx = page_idx * num_kvs + kv_i;
+            // (1) 콜백 구조체 할당
             cb = malloc(sizeof(*cb));
             if (!cb) {
               perror("slab_callback malloc 실패");
@@ -69,10 +74,10 @@ static void *fsst_worker(void *pdata) {
             cb->cb_cb    = NULL;
             cb->payload  = NULL;
             cb->slab     = s;
-            cb->slab_idx  = page_idx * (PAGE_SIZE / cfg.kv_size) + kv_i;  
+            cb->slab_idx = slot_idx;
             // “페이지 안 몇 번째 KV”인지도 기록하고 싶으면
             cb->fsst_slab = s;
-            cb->fsst_idx  = page_idx * (PAGE_SIZE / cfg.kv_size) + kv_i;  
+            cb->fsst_idx = slot_idx;
 
             // (3) KV 크기만큼 메모리 할당한 뒤, 페이지에서 해당 KV를 복사
             cb->item = malloc(s->item_size);
@@ -80,45 +85,56 @@ static void *fsst_worker(void *pdata) {
               perror("item malloc 실패");
               exit(1);
             }
-            memcpy(
-              cb->item,
-	      &gc_buf[offset + kv_i * s->item_size],
-              s->item_size
-            );
+            memcpy(cb->item, &gc_buf[offset + kv_i * s->item_size],
+                   s->item_size);
 
-	    index_entry_t *c = tnt_index_lookup_utree(s->subtree, cb->item);
-	    if (c) {
-		    unsigned char v;
-		    const uint32_t p = c->slab_idx;
-		    asm("btl %2, %1; setc %0" : "=qm"(v) : "m"(p), "Ir"(31));
-		    if (v == 1) {
-			    free(cb->item);
-			    free(cb);
-			    continue;
-		    }
-	    }
-	    
-            struct item_metadata *meta = (struct item_metadata *)cb->item;
-            size_t size = item_stored_size(meta);
-            char *item_key = &cb->item[sizeof(*meta)];
-            uint64_t key = *(uint64_t *)item_key;
-            if (size != s->item_size) {
-              printf("key: %lu, pgoff: %lu, size: %lu\n", key, offset, size);
-              printf("page_idx: %lu, kv_idx: %lu\n", page_idx, kv_i);
+            meta = (struct item_metadata *)cb->item;
+            if (item_is_legacy(meta))
+              die("Reinsertion encountered legacy item metadata\n");
+            
+            /* empty slot; no need for reinsertion */
+            if (item_is_empty(meta)) goto skip;
+
+            c = tnt_index_lookup_utree(s->subtree, cb->item);
+
+            /* check if c is still indexed */
+            if (!c) goto skip;
+
+            /* inspect invalid/stale marker */
+            {
+              unsigned char v;
+              const uint32_t p = c->slab_idx;
+              asm("btl %2, %1; setc %0" : "=qm"(v) : "m"(p), "Ir"(31));
+              if (v == 1) goto skip;
             }
-            if (key > 100000000) {
-              printf("key: %lu, pgoff: %lu, size: %lu\n", key, offset, size);
-              printf("page_idx: %lu, kv_idx: %lu\n", page_idx, kv_i);
+
+            /* c should be valid, check once more */
+            {
+              size_t size = item_stored_size(meta);
+              char *item_key = &cb->item[sizeof(*meta)];
+              uint64_t key = *(uint64_t *)item_key;
+              /* Tombstones can have: size < s->item_size, so we only check
+              * for oversized items */
+              if (size > s->item_size)
+                die("Oversized item during reinsertion: key=%lu size=%lu slot=%lu\n",
+                    key, size, s->item_size);
+              if (key > 100000000) {
+                printf("key: %lu, pgoff: %lu, size: %lu\n", key, offset, size);
+                printf("page_idx: %lu, kv_idx: %lu\n", page_idx, kv_i);
+              }
             }
+            
             // (4) 비동기 업데이트 호출
-    	    index_entry_t *e = NULL;
-    	    struct tree_entry *tree = NULL;
-            tree = centree_lookup_and_reserve(cb->item, 
-                          &cb->slab_idx, &e);
-	    cb->slab = tree->slab;
+            e = NULL;
+            tree = centree_lookup_and_reserve(cb->item, &cb->slab_idx, &e);
+            cb->slab = tree->slab;
 
-              remove_and_add_item_async(cb);
-              updated++;
+            remove_and_add_item_async(cb);
+            updated++;
+            continue;
+          skip:
+            free(cb->item);
+            free(cb);
           }
 
           // (라) 처리한 비트를 워드에서 지운다.
