@@ -7,11 +7,10 @@ extern uint64_t nb_totals;
 char *create_unique_item(size_t item_size, uint64_t uid) {
   char *item = malloc(item_size);
   struct item_metadata *meta = (struct item_metadata *)item;
-  meta->key_size = 8;
-  meta->value_size = item_size - 8 - sizeof(*meta);
+  item_init(meta, 8, item_size - 8 - sizeof(*meta));
 
   char *item_key = &item[sizeof(*meta)];
-  char *item_value = &item[sizeof(*meta) + meta->key_size];
+  char *item_value = &item[sizeof(*meta) + item_key_size(meta)];
   *(uint64_t *)item_key = uid;
   *(uint64_t *)item_value = uid;
   return item;
@@ -28,11 +27,10 @@ char *create_workload_item(struct workload *w) {
   struct item_metadata *meta;
   char *item = malloc(sizeof(*meta) + key_size + value_size);
   meta = (struct item_metadata *)item;
-  meta->key_size = key_size;
-  meta->value_size = value_size;
+  item_init(meta, key_size, value_size);
 
   char *item_key = &item[sizeof(*meta)];
-  char *item_value = &item[sizeof(*meta) + meta->key_size];
+  char *item_value = &item[sizeof(*meta) + item_key_size(meta)];
   *(uint64_t *)item_key = key;
   strcpy(item_value, name);
   return item;
@@ -207,13 +205,15 @@ void print_item(size_t idx, void *_item) {
   char *item = _item;
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
-  if (meta->key_size == 0)
+  if (item_is_legacy(meta))
+    die("Legacy item metadata passed to print_item\n");
+  if (item_is_empty(meta))
     printf("[%lu] Non existant?\n", idx);
-  else if (meta->key_size == -1)
+  else if (item_is_tombstone(meta))
     printf("[%lu] Removed\n", idx);
   else
     printf("[%lu] K=%lu V=%s\n", idx, *(uint64_t *)item_key,
-           &item[sizeof(*meta) + meta->key_size]);
+           &item[sizeof(*meta) + item_key_size(meta)]);
 }
 
 /*

@@ -357,12 +357,12 @@ void upsert_item_async_cb1(struct slab_callback *callback) {
   struct slab_context *ctx = callback->ctx;
 
   meta->rdt = get_rdt(ctx);
-  if (meta->key_size == -1)
-    memcpy(&disk_page[offset_in_page], meta, sizeof(*meta));
-  else if (get_item_size(item) > s->item_size)
+  if (item_is_legacy(meta))
+    die("Attempted to write legacy item metadata\n");
+  if (item_stored_size(meta) > s->item_size)
     die("Trying to write an item that is too big for its slab\n");
   else
-    memcpy(&disk_page[offset_in_page], item, get_item_size(item));
+    memcpy(&disk_page[offset_in_page], item, item_stored_size(meta));
 
 #if DEBUG
   /*

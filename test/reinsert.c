@@ -175,8 +175,8 @@ static char* create_test_item(uint64_t key) {
   struct item_metadata *meta;
   char *item = malloc(KV_SIZE);
   meta = (struct item_metadata *)item;
-  meta->key_size = sizeof(uint64_t);
-  meta->value_size = KV_SIZE - sizeof(uint64_t) - sizeof(*meta);
+  item_init(meta, sizeof(uint64_t),
+            KV_SIZE - sizeof(uint64_t) - sizeof(*meta));
   *(uint64_t *)(item + sizeof(*meta)) = key;
   memset(item + sizeof(*meta) + sizeof(uint64_t), 0, meta->value_size);
   return item;
@@ -184,8 +184,8 @@ static char* create_test_item(uint64_t key) {
 
 static inline void init_test_item(char *item, uint64_t key) {
   struct item_metadata *meta = (struct item_metadata*)item;
-  meta->key_size   = sizeof(uint64_t);
-  meta->value_size = KV_SIZE - sizeof(uint64_t) - sizeof(*meta);
+  item_init(meta, sizeof(uint64_t),
+            KV_SIZE - sizeof(uint64_t) - sizeof(*meta));
   *(uint64_t*)(item + sizeof(*meta)) = key;
   memset(item + sizeof(*meta) + sizeof(uint64_t), 0, meta->value_size);
 }

@@ -99,7 +99,7 @@ static void *fsst_worker(void *pdata) {
 	    }
 	    
             struct item_metadata *meta = (struct item_metadata *)cb->item;
-            size_t size = sizeof(*meta) + meta->key_size + meta->value_size;
+            size_t size = item_stored_size(meta);
             char *item_key = &cb->item[sizeof(*meta)];
             uint64_t key = *(uint64_t *)item_key;
             if (size != s->item_size) {

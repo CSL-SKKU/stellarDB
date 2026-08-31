@@ -131,7 +131,7 @@ struct slab_context *get_slab_context_uidx(uint64_t items_per_page, uint64_t idx
 
 size_t get_item_size(char *item) {
   struct item_metadata *meta = (struct item_metadata *)item;
-  return sizeof(*meta) + meta->key_size + meta->value_size;
+  return item_stored_size(meta);
 }
 
 static struct slab *get_slab(struct slab_context *ctx, void *item,
@@ -491,12 +491,15 @@ static void *worker_distributor_init(void *pdata) {
  */
 int add_existing_item(struct slab *s, size_t idx, void *item,
                       struct slab_callback *cb) {
-struct item_metadata *meta = item;
-char *item_key = &item[sizeof(*meta)];
-uint64_t key = *(uint64_t *)item_key;
+  struct item_metadata *meta = item;
 
-if (meta->key_size == 0)
-  return 0;
+  if (item_is_legacy(meta))
+    die("Legacy item metadata found while rebuilding slab %lu\n", s->seq);
+  if (item_is_empty(meta))
+    return 0;
+
+  char *item_key = &item[sizeof(*meta)];
+  uint64_t key = *(uint64_t *)item_key;
 
 #if WITH_FILTER
 if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
@@ -535,7 +538,7 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
   if (!already && filter_add((filter_t *)s->filter, (unsigned char *)&key) == 0) {
     printf("Fail adding to filter %p %lu seq/idx %lu/%lu, kvsize: %lu/%lu\n",
            s->filter, key, cb->slab->seq, cb->slab_idx,
-           meta->key_size, meta->value_size);
+           item_key_size(meta), meta->value_size);
     return 0;
 
   } else if (!filter_contain(s->filter, (unsigned char *)&key)) {
