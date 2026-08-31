@@ -336,6 +336,7 @@ again:
           add_item_async(callback);
         }
         break;
+      case DELETE:
       case UPSERT:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
@@ -362,8 +363,6 @@ again:
       case FSST_NO_LOOKUP:
         break;
 
-      case DELETE:
-        break;
       default:
         die("Unknown action\n");
     }
