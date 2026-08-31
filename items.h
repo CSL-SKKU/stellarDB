@@ -50,6 +50,12 @@ static inline void item_init_tombstone(struct item_metadata *meta,
   meta->value_size = 0;
 }
 
+static inline void item_encode_tombstone(struct item_metadata *meta) {
+  assert(meta->key_size_flags <= ITEM_KEY_SIZE_MASK);
+  meta->key_size_flags |= ITEM_TOMBSTONE_FLAG;
+  meta->value_size = 0;
+}
+
 static inline size_t item_stored_size(const struct item_metadata *meta) {
   assert(!item_is_legacy(meta));
   return sizeof(*meta) + item_key_size(meta) +

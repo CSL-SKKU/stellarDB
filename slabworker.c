@@ -337,6 +337,11 @@ again:
         }
         break;
       case DELETE:
+        if (item_is_legacy(callback->item))
+          die("Attempted to delete with legacy item metadata\n");
+        item_encode_tombstone(callback->item);
+
+        /* fall through */
       case UPSERT:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
