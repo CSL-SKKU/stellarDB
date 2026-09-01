@@ -514,8 +514,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
     goto skip;
   }
 
-  if (key < s->min) s->min = key;
-  if (key > s->max) s->max = key;
+  slab_widen_range(s, key);
 
   W_UNLOCK(&s->tree_lock);
 

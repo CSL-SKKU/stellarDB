@@ -105,6 +105,25 @@ struct slab_callback {
   struct slab_context *ctx;
 };
 
+/*
+ * Widen [min, max] so it covers key. The range is monotone -- min only ever
+ * decreases and max only ever increases, and nothing resets them once the slab
+ * is published -- so a CAS loop needs no lock.
+ *
+ * A reader can catch a widening half-applied, but not in a way that breaks
+ * min <= max: whoever reads has already completed its own widening, so max is
+ * at least its key and min is at most its key, and a concurrent partial
+ * widening can only push min further down, below that key.
+ */
+static inline void slab_widen_range(struct slab *s, uint64_t key) {
+  uint64_t old = s->min;
+  while (key < old && !__sync_bool_compare_and_swap(&s->min, old, key))
+    old = s->min;
+  old = s->max;
+  while (key > old && !__sync_bool_compare_and_swap(&s->max, old, key))
+    old = s->max;
+}
+
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
 
 struct slab *resize_slab(struct slab *s);

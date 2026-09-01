@@ -567,10 +567,7 @@ struct tree_entry* centree_lookup_and_reserve(
       __sync_fetch_and_add(&s->update_ref, 1);
       __sync_fetch_and_add(&s->nb_items, 1);
 
-      W_LOCK(&s->tree_lock);
-      if (key < s->min) s->min = key;
-      if (key > s->max) s->max = key;
-      W_UNLOCK(&s->tree_lock);
+      slab_widen_range(s, key);
 
       *out_idx = slot;
       break;

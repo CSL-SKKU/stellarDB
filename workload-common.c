@@ -57,8 +57,7 @@ void add_in_tree(struct slab_callback *cb, void *item) {
   }
 #endif
 
-  if (key < s->min) s->min = key;
-  if (key > s->max) s->max = key;
+  slab_widen_range(s, key);
 
   __sync_fetch_and_sub(&s->update_ref, 1);
 

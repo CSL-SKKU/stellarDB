@@ -536,8 +536,7 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
   __sync_add_and_fetch(&nb_totals, 1);
   tnt_index_add(cb, item);
 
-  if (key < s->min) s->min = key;
-  if (key > s->max) s->max = key;
+  slab_widen_range(s, key);
 
 #if WITH_FILTER
   if (!already && filter_add((filter_t *)s->filter, (unsigned char *)&key) == 0) {
