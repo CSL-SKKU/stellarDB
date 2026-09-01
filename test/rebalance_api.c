@@ -33,9 +33,9 @@ int main(void) {
   assert(tnt_get_node_count() == 1);
   assert(!tnt_rebalancing_needed());
   centree_node root = slabs[0].centree_node;
-  root->parent = root;
+  rcu_ptr_init(&root->parent, root);
   assert(tnt_rebalancing() == -EINVAL);
-  root->parent = NULL;
+  rcu_ptr_init(&root->parent, NULL);
 
   root->value.level = 42;
   root->removed = 1;

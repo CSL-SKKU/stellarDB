@@ -12,36 +12,46 @@ struct rcu_ctx {
      * Monotonically increasing generation.
      * ptr slot = epoch & 1.
      */
-    _Atomic(uint64_t) epoch;
+    uint64_t epoch;
 
-    _Atomic(uint64_t) readers[2];
+    uint64_t readers[2];
 
     /*
      * Only one writer / outstanding grace period.
      */
-    _Atomic(bool) writer_busy;
+    bool writer_busy;
 
     /*
      * -1: no grace period pending
      *  0/1: waiting for readers of this slot
      */
-    _Atomic(int) pending_phase;
+    int pending_phase;
 
     rcu_callback_t callback;
     void *payload;
+
+    /* Writer-owned list of pointers changed in the pending generation. */
+    struct rcu_ptr *updated_ptrs;
 };
 
 /*
  * RCU-managed pointer.
  *
  * Readers access ptr[their_phase].
- * Writer modifies ptr[next_phase].
+ * Writer modifies ptr[next_phase]. After the old readers drain, changed
+ * pointers are copied back into the retired slot so both slots are identical
+ * before the next writer starts.
  */
 struct rcu_ptr {
-    _Atomic(void *) ptr[2];
+    void *ptr[2];
+
+    /* Intrusive writer-only bookkeeping; readers never touch these fields. */
+    struct rcu_ptr *updated_next;
 };
 
 struct rcu_writer {
+    struct rcu_ctx *ctx;
+
     uint64_t old_epoch;
     uint64_t new_epoch;
 
@@ -73,6 +83,13 @@ void rcu_read_out(struct rcu_ctx *ctx);
 
 void *rcu_read_ptr(struct rcu_ctx *ctx, struct rcu_ptr *ptr);
 
+/*
+ * Read the currently published slot without registering an RCU reader.
+ * The caller must externally prevent publication for the duration of every
+ * traversal that uses this helper.
+ */
+void *rcu_current_ptr(struct rcu_ctx *ctx, struct rcu_ptr *ptr);
+
 
 /*
  * Writer API.
@@ -90,6 +107,12 @@ struct rcu_writer rcu_writer_in(struct rcu_ctx *ctx);
 void *rcu_writer_ptr(struct rcu_writer *writer, struct rcu_ptr *ptr);
 
 void rcu_writer_set_ptr(struct rcu_writer *writer, struct rcu_ptr *ptr, void *value);
+
+/*
+ * Discard an unpublished generation and release the writer. All pointers
+ * changed with rcu_writer_set_ptr() are restored to the current generation.
+ */
+void rcu_writer_abort(struct rcu_ctx *ctx, struct rcu_writer *writer);
 
 
 /*

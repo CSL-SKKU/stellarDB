@@ -78,7 +78,7 @@ node dequeue_centnode(background_queue *queue) {
   return data;
 }
 
-static node new_node(void *key, tree_entry_t *value, node left, node right);
+static node new_node(void *key, tree_entry_t *value);
 static node lookup_node(centree t, void *key, compare_func compare);
 
 int tnt_pointer_cmp(void *left, void *right) {
@@ -94,6 +94,7 @@ int tnt_pointer_cmp(void *left, void *right) {
 centree centree_create() {
   centree t = malloc(sizeof(struct centree_t));
   t->root = NULL;
+  rcu_init(&t->topology_rcu);
   atomic_init(&t->depth, 0);
   atomic_init(&t->node_count, 0);
   bgqueue = malloc(sizeof(background_queue));
@@ -101,18 +102,14 @@ centree centree_create() {
   return t;
 }
 
-node new_node(void *key, tree_entry_t *value, node left, node right) {
+node new_node(void *key, tree_entry_t *value) {
   node result = malloc(sizeof(struct centree_node_t));
   result->removed = 0;
   result->key = key;
   result->value = *value;
-  result->left = left;
-  result->right = right;
+  centree_node_init_links(result, NULL, NULL, NULL);
   result->lu_parent = NULL;
   atomic_store(&result->child_flag, 0);
-  if (left != NULL) left->parent = result;
-  if (right != NULL) right->parent = result;
-  result->parent = NULL;
   return result;
 }
 
@@ -123,10 +120,10 @@ node lookup_node(centree t, void *key, compare_func compare) {
     if (comp_result == 0) {
       return n;
     } else if (comp_result < 0) {
-      n = n->left;
+      n = centree_read_left(t, n);
     } else {
       assert(comp_result > 0);
-      n = n->right;
+      n = centree_read_right(t, n);
     }
   }
   return n;
@@ -137,13 +134,16 @@ uint64_t centree_get_depth(centree t) {
 }
 
 tree_entry_t *centree_lookup(centree t, void *key, compare_func compare) {
+  centree_read_in(t);
   node n = lookup_node(t, key, compare);
-  return n == NULL ? NULL : &n->value;
+  tree_entry_t *result = n == NULL ? NULL : &n->value;
+  centree_read_out(t);
+  return result;
 }
 
 node centree_insert(centree t, void *key, tree_entry_t *value,
                     compare_func compare) {
-  node inserted_node = new_node(key, value, NULL, NULL);
+  node inserted_node = new_node(key, value);
   uint64_t level = 1;
 
   if (t->root == NULL) {
@@ -155,24 +155,40 @@ node centree_insert(centree t, void *key, tree_entry_t *value,
 
       level++;
       if (comp_result <= 0) {
-        if (n->left == NULL) {
-          n->left = inserted_node;
+        node left = centree_current_left(t, n);
+
+        if (left == NULL) {
+          struct rcu_writer writer = rcu_writer_in(&t->topology_rcu);
+
+          value->level = level;
+          inserted_node->value = *value;
+          inserted_node->lu_parent = n;
+          rcu_ptr_init(&inserted_node->parent, n);
+          rcu_writer_set_ptr(&writer, &n->left, inserted_node);
+          rcu_writer_publish(&t->topology_rcu, &writer, NULL, NULL);
           break;
         } else {
-          n = n->left;
+          n = left;
         }
       } else {
         assert(comp_result > 0);
-        if (n->right == NULL) {
-          n->right = inserted_node;
+        node right = centree_current_right(t, n);
+
+        if (right == NULL) {
+          struct rcu_writer writer = rcu_writer_in(&t->topology_rcu);
+
+          value->level = level;
+          inserted_node->value = *value;
+          inserted_node->lu_parent = n;
+          rcu_ptr_init(&inserted_node->parent, n);
+          rcu_writer_set_ptr(&writer, &n->right, inserted_node);
+          rcu_writer_publish(&t->topology_rcu, &writer, NULL, NULL);
           break;
         } else {
-          n = n->right;
+          n = right;
         }
       }
     }
-    inserted_node->parent = n;
-    inserted_node->lu_parent = n;
   }
   if (atomic_load_explicit(&t->depth, memory_order_acquire) < level)
     atomic_store_explicit(&t->depth, level, memory_order_release);
@@ -197,26 +213,37 @@ node centree_insert_dual(centree t, void *key,
 
       level++;
       if (comp_result < 0) {
-        if (n->left == NULL) {
+        node left = centree_current_left(t, n);
+
+        if (left == NULL) {
           return NULL;
         } else {
-          n = n->left;
+          n = left;
         }
       } else if (comp_result > 0) {
-        if (n->right == NULL) {
+        node right = centree_current_right(t, n);
+
+        if (right == NULL) {
           return NULL;
         } else {
-          n = n->right;
+          n = right;
         }
       } else {
-        n->left = new_node(lk, lv, NULL, NULL);
-        n->right = new_node(rk, rv, NULL, NULL);
+        node left = new_node(lk, lv);
+        node right = new_node(rk, rv);
+        struct rcu_writer writer = rcu_writer_in(&t->topology_rcu);
+
         lv->level = level;
         rv->level = level;
-        n->left->parent = n;
-        n->right->parent = n;
-        n->left->lu_parent = n;
-        n->right->lu_parent = n;
+        left->value = *lv;
+        right->value = *rv;
+        rcu_ptr_init(&left->parent, n);
+        rcu_ptr_init(&right->parent, n);
+        left->lu_parent = n;
+        right->lu_parent = n;
+        rcu_writer_set_ptr(&writer, &n->left, left);
+        rcu_writer_set_ptr(&writer, &n->right, right);
+        rcu_writer_publish(&t->topology_rcu, &writer, NULL, NULL);
         atomic_fetch_add_explicit(&t->node_count, 2, memory_order_release);
         break;
       }
@@ -233,8 +260,11 @@ node traverse_node_useq(centree t, int key) {
   }
   if (!is_empty(bgqueue)) {
     n = dequeue_centnode(bgqueue);
-    if (n->left) enqueue_centnode(bgqueue, n->left);
-    if (n->right) enqueue_centnode(bgqueue, n->right);
+    node left = centree_current_left(t, n);
+    node right = centree_current_right(t, n);
+
+    if (left) enqueue_centnode(bgqueue, left);
+    if (right) enqueue_centnode(bgqueue, right);
   }
   return n;
 }
@@ -246,7 +276,7 @@ tree_entry_t *centree_traverse_useq(centree t, int seq) {
 
 // Function to print binary tree in 2D
 // It does reverse inorder traversal
-void print2DUtil(node n, int space) {
+void print2DUtil(centree t, node n, int space) {
   // Base case
   if (n == NULL) return;
 
@@ -254,7 +284,7 @@ void print2DUtil(node n, int space) {
   space += 10;
 
   // Process right child first
-  print2DUtil(n->right, space);
+  print2DUtil(t, centree_current_right(t, n), space);
 
   // Print current node after space
   // count
@@ -278,21 +308,21 @@ void print2DUtil(node n, int space) {
     printf("%lu,%lu:0\n", n->value.seq, n->value.level);
 
   // Process left child
-  print2DUtil(n->left, space);
+  print2DUtil(t, centree_current_left(t, n), space);
 }
 
-void centree_print_nodes(node n, compare_func show) {
+void centree_print_nodes(centree t, node n, compare_func show) {
   if (!n) return;
 
   printf("l\n");
-  centree_print_nodes(n->left, show);
+  centree_print_nodes(t, centree_current_left(t, n), show);
   show(n->key, &n->value);
   printf("r\n");
-  centree_print_nodes(n->right, show);
+  centree_print_nodes(t, centree_current_right(t, n), show);
 }
 
 void centree_print(centree t) {
   node n = t->root;
-  print2DUtil(n, 0);
-  // centree_print_nodes(n, show);
+  print2DUtil(t, n, 0);
+  // centree_print_nodes(t, n, show);
 }

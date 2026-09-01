@@ -13,7 +13,7 @@ CFLAGS=(-O2 -ggdb3 -Wall -I. -DSELECTED_BENCH=ycsb_c_zipfian
 OBJS=(config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o
       slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o
       workload-bgwork.o workload-production.o workload-locality.o
-      workload-latency.o utils.o in-memory-index-tnt.o fsst.o db_bench.o
+      workload-latency.o utils.o rcu.o in-memory-index-tnt.o fsst.o db_bench.o
       indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o
       indexes/tnt_subtree.o indexes/tnt_balance.o)
 

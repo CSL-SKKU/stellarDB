@@ -33,13 +33,14 @@ Retrieved from: http://en.literateprograms.org/Red-black_tree_(C)?oldid=16016
 #include <stdatomic.h>
 
 #include "memory-item.h"
+#include "../rcu.h"
 
 typedef struct centree_node_t {
   void* key;
   tree_entry_t value;
-  struct centree_node_t* left;
-  struct centree_node_t* right;
-  struct centree_node_t* parent;
+  struct rcu_ptr left;
+  struct rcu_ptr right;
+  struct rcu_ptr parent;
   struct centree_node_t* lu_parent;
   _Atomic int child_flag;
   unsigned char removed;
@@ -48,9 +49,62 @@ typedef struct centree_node_t {
 
 typedef struct centree_t {
   centree_node root;
+  struct rcu_ctx topology_rcu;
   _Atomic uint64_t depth;
   _Atomic uint64_t node_count;
 } * centree;
+
+/*
+ * Routing-pointer access. read_* requires one surrounding
+ * centree_read_in()/centree_read_out() pair. current_* is for callers that
+ * already prevent topology publication (currently centree_root_lock).
+ */
+static inline void centree_read_in(centree tree) {
+  rcu_read_in(&tree->topology_rcu);
+}
+
+static inline void centree_read_out(centree tree) {
+  rcu_read_out(&tree->topology_rcu);
+}
+
+static inline centree_node centree_read_left(centree tree,
+                                             centree_node node) {
+  return (centree_node)rcu_read_ptr(&tree->topology_rcu, &node->left);
+}
+
+static inline centree_node centree_read_right(centree tree,
+                                              centree_node node) {
+  return (centree_node)rcu_read_ptr(&tree->topology_rcu, &node->right);
+}
+
+static inline centree_node centree_read_parent(centree tree,
+                                               centree_node node) {
+  return (centree_node)rcu_read_ptr(&tree->topology_rcu, &node->parent);
+}
+
+static inline centree_node centree_current_left(centree tree,
+                                                centree_node node) {
+  return (centree_node)rcu_current_ptr(&tree->topology_rcu, &node->left);
+}
+
+static inline centree_node centree_current_right(centree tree,
+                                                 centree_node node) {
+  return (centree_node)rcu_current_ptr(&tree->topology_rcu, &node->right);
+}
+
+static inline centree_node centree_current_parent(centree tree,
+                                                  centree_node node) {
+  return (centree_node)rcu_current_ptr(&tree->topology_rcu, &node->parent);
+}
+
+static inline void centree_node_init_links(centree_node node,
+                                           centree_node left,
+                                           centree_node right,
+                                           centree_node parent) {
+  rcu_ptr_init(&node->left, left);
+  rcu_ptr_init(&node->right, right);
+  rcu_ptr_init(&node->parent, parent);
+}
 
 typedef struct bgq_node_t {
   union {

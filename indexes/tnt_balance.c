@@ -6,24 +6,26 @@
 #include <stdlib.h>
 
 struct node_snapshot {
-  centree_node left;
-  centree_node right;
-  centree_node parent;
   centree_node lu_parent;
+  uint64_t level;
   unsigned char removed;
   bool was_leaf;
 };
 
-static bool validate_subtree(centree_node node, size_t *count) {
-  bool has_left = node->left != NULL;
-  bool has_right = node->right != NULL;
+static bool validate_subtree(centree tree, centree_node node,
+                             size_t *count) {
+  centree_node left = centree_current_left(tree, node);
+  centree_node right = centree_current_right(tree, node);
+  bool has_left = left != NULL;
+  bool has_right = right != NULL;
 
   if (has_left != has_right)
     return false;
-  if (has_left && node->left == node->right)
+  if (has_left && left == right)
     return false;
   if (has_left &&
-      (node->left->parent != node || node->right->parent != node))
+      (centree_current_parent(tree, left) != node ||
+       centree_current_parent(tree, right) != node))
     return false;
   if (*count == SIZE_MAX)
     return false;
@@ -32,53 +34,78 @@ static bool validate_subtree(centree_node node, size_t *count) {
   if (!has_left)
     return true;
 
-  return validate_subtree(node->left, count) &&
-         validate_subtree(node->right, count);
+  return validate_subtree(tree, left, count) &&
+         validate_subtree(tree, right, count);
 }
 
 bool centree_validate_locked(centree tree) {
   size_t count = 0;
 
-  if (tree == NULL || tree->root == NULL || tree->root->parent != NULL)
+  if (tree == NULL || tree->root == NULL ||
+      centree_current_parent(tree, tree->root) != NULL)
     return false;
-  if (!validate_subtree(tree->root, &count))
+  if (!validate_subtree(tree, tree->root, &count))
     return false;
 
   return count % 2 == 1;
 }
 
-static size_t count_nodes(centree_node node) {
+static size_t count_nodes(centree tree, centree_node node) {
   if (node == NULL)
     return 0;
-  return 1 + count_nodes(node->left) + count_nodes(node->right);
+  return 1 + count_nodes(tree, centree_current_left(tree, node)) +
+         count_nodes(tree, centree_current_right(tree, node));
 }
 
-static bool collect_nodes(centree_node node, centree_node *nodes,
-                          size_t capacity, size_t *index) {
+static bool collect_nodes(centree tree, centree_node node,
+                          centree_node *nodes, size_t capacity,
+                          size_t *index) {
   if (node == NULL)
     return true;
-  if (!collect_nodes(node->left, nodes, capacity, index))
+  if (!collect_nodes(tree, centree_current_left(tree, node), nodes, capacity,
+                     index))
     return false;
   if (*index == capacity)
     return false;
   nodes[(*index)++] = node;
-  return collect_nodes(node->right, nodes, capacity, index);
+  return collect_nodes(tree, centree_current_right(tree, node), nodes,
+                       capacity, index);
 }
 
-static void mark_fixed(centree_node node) {
+static void mark_fixed(centree tree, centree_node node) {
+  centree_node left;
+  centree_node right;
+
   if (node == NULL)
     return;
-  if (node->left == NULL && node->right == NULL) {
+  left = centree_current_left(tree, node);
+  right = centree_current_right(tree, node);
+  if (left == NULL && right == NULL) {
     node->removed = 1;
   } else {
     node->removed = 0;
-    mark_fixed(node->left);
-    mark_fixed(node->right);
+    mark_fixed(tree, left);
+    mark_fixed(tree, right);
   }
 }
 
-static int build_tree_from_array(centree_node *nodes, size_t l, size_t r,
-                                 centree_node parent,
+static centree_node writer_left(struct rcu_writer *writer,
+                                centree_node node) {
+  return rcu_writer_ptr(writer, &node->left);
+}
+
+static centree_node writer_right(struct rcu_writer *writer,
+                                 centree_node node) {
+  return rcu_writer_ptr(writer, &node->right);
+}
+
+static centree_node writer_parent(struct rcu_writer *writer,
+                                  centree_node node) {
+  return rcu_writer_ptr(writer, &node->parent);
+}
+
+static int build_tree_from_array(struct rcu_writer *writer,
+                                 centree_node *nodes, size_t l, size_t r,
                                  centree_node *result) {
   size_t count = r - l;
 
@@ -89,9 +116,8 @@ static int build_tree_from_array(centree_node *nodes, size_t l, size_t r,
 
     if (node->removed != 1)
       return EINVAL;
-    node->left = NULL;
-    node->right = NULL;
-    node->parent = parent;
+    rcu_writer_set_ptr(writer, &node->left, NULL);
+    rcu_writer_set_ptr(writer, &node->right, NULL);
     *result = node;
     return 0;
   }
@@ -119,53 +145,41 @@ static int build_tree_from_array(centree_node *nodes, size_t l, size_t r,
 
   if (root->removed != 0)
     return EINVAL;
-  error = build_tree_from_array(nodes, l, best_k, root, &left);
+  error = build_tree_from_array(writer, nodes, l, best_k, &left);
   if (error != 0)
     return error;
-  error = build_tree_from_array(nodes, best_k + 1, r, root, &right);
+  error = build_tree_from_array(writer, nodes, best_k + 1, r, &right);
   if (error != 0)
     return error;
 
-  root->parent = parent;
-  root->left = left;
-  root->right = right;
+  rcu_writer_set_ptr(writer, &root->left, left);
+  rcu_writer_set_ptr(writer, &root->right, right);
   *result = root;
   return 0;
 }
 
-static void restore_tree(centree tree, centree_node old_root,
-                         centree_node *nodes,
-                         const struct node_snapshot *snapshots,
-                         size_t count) {
-  for (size_t i = 0; i < count; i++) {
-    nodes[i]->left = snapshots[i].left;
-    nodes[i]->right = snapshots[i].right;
-    nodes[i]->parent = snapshots[i].parent;
-    nodes[i]->lu_parent = snapshots[i].lu_parent;
-    nodes[i]->removed = snapshots[i].removed;
-  }
-  tree->root = old_root;
-}
-
-static unsigned int refresh_routing_metadata(centree_node node,
+static unsigned int refresh_routing_metadata(struct rcu_writer *writer,
+                                             centree_node node,
                                              centree_node parent,
                                              unsigned int level) {
+  centree_node left = writer_left(writer, node);
+  centree_node right = writer_right(writer, node);
   unsigned int actual_depth = level;
 
-  node->parent = parent;
+  rcu_writer_set_ptr(writer, &node->parent, parent);
   node->value.level = level;
   node->removed = 0;
 
-  if (node->left != NULL) {
+  if (left != NULL) {
     unsigned int left_depth =
-        refresh_routing_metadata(node->left, node, level + 1);
+        refresh_routing_metadata(writer, left, node, level + 1);
 
     if (left_depth > actual_depth)
       actual_depth = left_depth;
   }
-  if (node->right != NULL) {
+  if (right != NULL) {
     unsigned int right_depth =
-        refresh_routing_metadata(node->right, node, level + 1);
+        refresh_routing_metadata(writer, right, node, level + 1);
 
     if (right_depth > actual_depth)
       actual_depth = right_depth;
@@ -174,14 +188,63 @@ static unsigned int refresh_routing_metadata(centree_node node,
   return actual_depth;
 }
 
+static bool validate_writer_subtree(struct rcu_writer *writer,
+                                    centree_node node, size_t *count) {
+  centree_node left = writer_left(writer, node);
+  centree_node right = writer_right(writer, node);
+  bool has_left = left != NULL;
+  bool has_right = right != NULL;
+
+  if (has_left != has_right || (has_left && left == right))
+    return false;
+  if (has_left &&
+      (writer_parent(writer, left) != node ||
+       writer_parent(writer, right) != node))
+    return false;
+  if (*count == SIZE_MAX)
+    return false;
+
+  (*count)++;
+  if (!has_left)
+    return true;
+  return validate_writer_subtree(writer, left, count) &&
+         validate_writer_subtree(writer, right, count);
+}
+
+static bool collect_writer_nodes(struct rcu_writer *writer,
+                                 centree_node node, centree_node *nodes,
+                                 size_t capacity, size_t *index) {
+  if (node == NULL)
+    return true;
+  if (!collect_writer_nodes(writer, writer_left(writer, node), nodes,
+                            capacity, index))
+    return false;
+  if (*index == capacity)
+    return false;
+  nodes[(*index)++] = node;
+  return collect_writer_nodes(writer, writer_right(writer, node), nodes,
+                              capacity, index);
+}
+
+static void restore_metadata(centree_node *nodes,
+                             const struct node_snapshot *snapshots,
+                             size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    nodes[i]->value.level = snapshots[i].level;
+    nodes[i]->removed = snapshots[i].removed;
+  }
+}
+
 int centree_balance(centree tree) {
-  centree_node old_root;
   centree_node new_root;
   centree_node *nodes = NULL;
   centree_node *after = NULL;
   struct node_snapshot *snapshots = NULL;
+  struct rcu_writer writer = {0};
   size_t total_nodes;
   size_t index = 0;
+  unsigned int actual_depth = 0;
+  bool writer_active = false;
   int error = 0;
 
   if (tree == NULL)
@@ -191,8 +254,7 @@ int centree_balance(centree tree) {
   if (!centree_validate_locked(tree))
     return EINVAL;
 
-  old_root = tree->root;
-  total_nodes = count_nodes(old_root);
+  total_nodes = count_nodes(tree, tree->root);
   if (total_nodes > SIZE_MAX / sizeof(*nodes) ||
       total_nodes > SIZE_MAX / sizeof(*snapshots))
     return ENOMEM;
@@ -204,22 +266,20 @@ int centree_balance(centree tree) {
     error = ENOMEM;
     goto out;
   }
-  if (!collect_nodes(old_root, nodes, total_nodes, &index) ||
+  if (!collect_nodes(tree, tree->root, nodes, total_nodes, &index) ||
       index != total_nodes) {
     error = EINVAL;
     goto out;
   }
 
   for (size_t i = 0; i < total_nodes; i++) {
-    snapshots[i].left = nodes[i]->left;
-    snapshots[i].right = nodes[i]->right;
-    snapshots[i].parent = nodes[i]->parent;
     snapshots[i].lu_parent = nodes[i]->lu_parent;
+    snapshots[i].level = nodes[i]->value.level;
     snapshots[i].removed = nodes[i]->removed;
-    snapshots[i].was_leaf = nodes[i]->left == NULL;
+    snapshots[i].was_leaf = centree_current_left(tree, nodes[i]) == NULL;
   }
 
-  mark_fixed(old_root);
+  mark_fixed(tree, tree->root);
   for (size_t i = 0; i < total_nodes; i++) {
     unsigned char expected = i % 2 == 0 ? 1 : 0;
 
@@ -229,21 +289,26 @@ int centree_balance(centree tree) {
     }
   }
 
-  error = build_tree_from_array(nodes, 0, total_nodes, NULL, &new_root);
+  writer = rcu_writer_in(&tree->topology_rcu);
+  writer_active = true;
+  error = build_tree_from_array(&writer, nodes, 0, total_nodes, &new_root);
   if (error != 0)
     goto restore;
-  new_root->parent = NULL;
-  tree->root = new_root;
 
+  actual_depth = refresh_routing_metadata(&writer, new_root, NULL, 1);
+
+  size_t count = 0;
   index = 0;
-  if (!centree_validate_locked(tree) ||
-      !collect_nodes(tree->root, after, total_nodes, &index) ||
+  if (writer_parent(&writer, new_root) != NULL ||
+      !validate_writer_subtree(&writer, new_root, &count) || count % 2 != 1 ||
+      !collect_writer_nodes(&writer, new_root, after, total_nodes, &index) ||
       index != total_nodes) {
     error = EFAULT;
     goto restore;
   }
   for (size_t i = 0; i < total_nodes; i++) {
-    bool is_leaf = nodes[i]->left == NULL && nodes[i]->right == NULL;
+    bool is_leaf = writer_left(&writer, nodes[i]) == NULL &&
+                   writer_right(&writer, nodes[i]) == NULL;
 
     if (after[i] != nodes[i] || is_leaf != snapshots[i].was_leaf ||
         nodes[i]->lu_parent != snapshots[i].lu_parent) {
@@ -252,13 +317,15 @@ int centree_balance(centree tree) {
     }
   }
 
-  unsigned int actual_depth =
-      refresh_routing_metadata(tree->root, NULL, 1);
+  tree->root = new_root;
+  rcu_writer_publish(&tree->topology_rcu, &writer, NULL, NULL);
   atomic_store(&tree->depth, actual_depth);
   goto out;
 
 restore:
-  restore_tree(tree, old_root, nodes, snapshots, total_nodes);
+  if (writer_active)
+    rcu_writer_abort(&tree->topology_rcu, &writer);
+  restore_metadata(nodes, snapshots, total_nodes);
 out:
   free(snapshots);
   free(after);

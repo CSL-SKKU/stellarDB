@@ -26,7 +26,7 @@ endif
 LDLIBS=-lm -lpthread -lstdc++
 
 INDEXES_OBJ=indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o indexes/tnt_subtree.o indexes/tnt_balance.o
-OTHERS_OBJ=config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o workload-bgwork.o workload-production.o workload-locality.o workload-latency.o utils.o in-memory-index-tnt.o fsst.o db_bench.o ${INDEXES_OBJ}
+OTHERS_OBJ=config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o workload-bgwork.o workload-production.o workload-locality.o workload-latency.o utils.o rcu.o in-memory-index-tnt.o fsst.o db_bench.o ${INDEXES_OBJ}
 MAIN_OBJ=main.o ${OTHERS_OBJ} 
 
 .PHONY: all clean
@@ -35,8 +35,8 @@ all: makefile.dep main
 
 test: test/test_main test/test_reins test/test_rebalance test/test_rebalance_api
 
-test/test_rebalance: test/rebalance.o indexes/tnt_balance.o
-	${CC} test/rebalance.o indexes/tnt_balance.o ${CFLAGS} ${LDLIBS} -o test/test_rebalance
+test/test_rebalance: test/rebalance.o indexes/tnt_balance.o rcu.o
+	${CC} test/rebalance.o indexes/tnt_balance.o rcu.o ${CFLAGS} ${LDLIBS} -o test/test_rebalance
 
 test/test_rebalance_api: test/rebalance_api.o ${OTHERS_OBJ}
 	${CC} test/rebalance_api.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_rebalance_api
@@ -47,10 +47,11 @@ test/test_main: test/main.o ${OTHERS_OBJ}
 test/test_reins: test/reinsert.o ${OTHERS_OBJ}
 	${CC} test/reinsert.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_reins
 
-makefile.dep: *.[Cch] indexes/*.[ch] indexes/*.cc
+makefile.dep: *.[Cch] indexes/*.[ch] indexes/*.cc test/*.c
 	for i in *.[Cc]; do ${CC} -MM "$${i}" ${CFLAGS}; done > $@
 	for i in indexes/*.c; do ${CC} -MM "$${i}" -MT $${i%.c}.o ${CFLAGS}; done >> $@
 	for i in indexes/*.cc; do ${CXX} -MM "$${i}" -MT $${i%.cc}.o ${CXXFLAGS}; done >> $@
+	for i in test/*.c; do ${CC} -MM "$${i}" -MT $${i%.c}.o ${CFLAGS}; done >> $@
 	#find ./ -type f \( -iname \*.c -o -iname \*.cc \) | parallel clang -MM "{}" -MT "{.}".o > makefile.dep #If you find that the lines above take too long...
 
 ifneq ($(MAKECMDGOALS),clean)

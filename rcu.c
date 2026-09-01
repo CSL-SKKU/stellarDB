@@ -1,6 +1,7 @@
 #include "rcu.h"
 
 #include <assert.h>
+#include <stddef.h>
 
 #define RCU_NO_PHASE (-1)
 
@@ -58,9 +59,29 @@ rcu_try_finish(
         return;
 
     /*
-     * callback/payload were installed before pending_phase
-     * became visible.
+     * Retire the old topology slot before allowing another writer to reuse
+     * it. This keeps both slots identical between grace periods, so a later
+     * unrelated update cannot expose stale pointer values.
      */
+    struct rcu_ptr *ptr = ctx->updated_ptrs;
+    unsigned current_phase = phase ^ 1U;
+
+    while (ptr != NULL) {
+        struct rcu_ptr *next = ptr->updated_next;
+        void *value = __atomic_load_n(
+            &ptr->ptr[current_phase],
+            __ATOMIC_SEQ_CST);
+
+        __atomic_store_n(
+            &ptr->ptr[phase],
+            value,
+            __ATOMIC_SEQ_CST);
+        ptr->updated_next = ptr;
+        ptr = next;
+    }
+    ctx->updated_ptrs = NULL;
+
+    /* callback/payload were installed before pending_phase became visible. */
     rcu_callback_t callback = ctx->callback;
     void *payload = ctx->payload;
 
@@ -133,6 +154,7 @@ rcu_init(struct rcu_ctx *ctx)
 
     ctx->callback = NULL;
     ctx->payload = NULL;
+    ctx->updated_ptrs = NULL;
 }
 
 
@@ -150,6 +172,9 @@ rcu_ptr_init(
         &ptr->ptr[1],
         value,
         __ATOMIC_SEQ_CST);
+
+    /* A self-link marks a pointer that is not in an update list. */
+    ptr->updated_next = ptr;
 }
 
 
@@ -235,6 +260,21 @@ rcu_read_ptr(
 }
 
 
+void *
+rcu_current_ptr(
+    struct rcu_ctx *ctx,
+    struct rcu_ptr *ptr)
+{
+    uint64_t epoch = __atomic_load_n(
+        &ctx->epoch,
+        __ATOMIC_SEQ_CST);
+
+    return __atomic_load_n(
+        &ptr->ptr[epoch & 1U],
+        __ATOMIC_SEQ_CST);
+}
+
+
 struct rcu_writer
 rcu_writer_in(struct rcu_ctx *ctx)
 {
@@ -271,6 +311,7 @@ rcu_writer_in(struct rcu_ctx *ctx)
             __ATOMIC_SEQ_CST);
 
     struct rcu_writer writer = {
+        .ctx = ctx,
         .old_epoch = old_epoch,
         .new_epoch = old_epoch + 1,
 
@@ -302,9 +343,54 @@ rcu_writer_set_ptr(
     struct rcu_ptr *ptr,
     void *value)
 {
+    assert(writer->ctx != NULL);
+
+    if (ptr->updated_next == ptr) {
+        ptr->updated_next = writer->ctx->updated_ptrs;
+        writer->ctx->updated_ptrs = ptr;
+    }
+
     __atomic_store_n(
         &ptr->ptr[writer->new_phase],
         value,
+        __ATOMIC_SEQ_CST);
+}
+
+
+void
+rcu_writer_abort(
+    struct rcu_ctx *ctx,
+    struct rcu_writer *writer)
+{
+    assert(writer->ctx == ctx);
+    assert(__atomic_load_n(
+               &ctx->writer_busy,
+               __ATOMIC_SEQ_CST));
+    assert(__atomic_load_n(
+               &ctx->pending_phase,
+               __ATOMIC_SEQ_CST) == RCU_NO_PHASE);
+
+    struct rcu_ptr *ptr = ctx->updated_ptrs;
+
+    while (ptr != NULL) {
+        struct rcu_ptr *next = ptr->updated_next;
+        void *value = __atomic_load_n(
+            &ptr->ptr[writer->old_phase],
+            __ATOMIC_SEQ_CST);
+
+        __atomic_store_n(
+            &ptr->ptr[writer->new_phase],
+            value,
+            __ATOMIC_SEQ_CST);
+        ptr->updated_next = ptr;
+        ptr = next;
+    }
+    ctx->updated_ptrs = NULL;
+    writer->ctx = NULL;
+
+    __atomic_store_n(
+        &ctx->writer_busy,
+        false,
         __ATOMIC_SEQ_CST);
 }
 
@@ -316,6 +402,7 @@ rcu_writer_publish(
     rcu_callback_t callback,
     void *payload)
 {
+    assert(writer->ctx == ctx);
     /*
      * New-phase topology must already be completely built
      * before this function is called.
@@ -356,4 +443,6 @@ rcu_writer_publish(
     rcu_try_finish(
         ctx,
         writer->old_phase);
+
+    writer->ctx = NULL;
 }

@@ -286,12 +286,14 @@ static void split_midpoint_test_hook(struct slab *parent_slab) {
   centree_node parent = parent_slab->centree_node;
 
   TEST_CHECK(parent != NULL);
-  TEST_CHECK(parent->left != NULL);
-  TEST_CHECK(parent->right == NULL);
+  centree_node left = tnt_routing_left(parent);
+  centree_node right = tnt_routing_right(parent);
+  TEST_CHECK(left != NULL);
+  TEST_CHECK(right == NULL);
   TEST_CHECK(atomic_load_explicit(&parent->child_flag,
                                   memory_order_acquire) == 0);
   paused_split_parent = parent;
-  paused_left_child = parent->left;
+  paused_left_child = left;
   atomic_store_explicit(&split_hook_reached, true, memory_order_release);
 
   while (!atomic_load_explicit(&split_hook_release, memory_order_acquire))
@@ -324,25 +326,27 @@ static void *concurrent_rebalance_client(void *opaque) {
 }
 
 static centree_node find_routing_root(centree_node node) {
-  while (node != NULL && node->parent != NULL)
-    node = node->parent;
+  centree_node parent;
+
+  while (node != NULL && (parent = tnt_routing_parent(node)) != NULL)
+    node = parent;
   return node;
 }
 
 static size_t count_routing_nodes(centree_node node) {
   if (node == NULL)
     return 0;
-  return 1 + count_routing_nodes(node->left) +
-         count_routing_nodes(node->right);
+  return 1 + count_routing_nodes(tnt_routing_left(node)) +
+         count_routing_nodes(tnt_routing_right(node));
 }
 
 static void collect_routing_nodes(centree_node node, centree_node *nodes,
                                   size_t *index) {
   if (node == NULL)
     return;
-  collect_routing_nodes(node->left, nodes, index);
+  collect_routing_nodes(tnt_routing_left(node), nodes, index);
   nodes[(*index)++] = node;
-  collect_routing_nodes(node->right, nodes, index);
+  collect_routing_nodes(tnt_routing_right(node), nodes, index);
 }
 
 static bool validate_routing_node(centree_node node, centree_node parent,
@@ -354,10 +358,12 @@ static bool validate_routing_node(centree_node node, centree_node parent,
 
   if (node == NULL)
     return true;
-  has_left = node->left != NULL;
-  has_right = node->right != NULL;
-  if (has_left != has_right || (has_left && node->left == node->right) ||
-      node->parent != parent ||
+  centree_node left = tnt_routing_left(node);
+  centree_node right = tnt_routing_right(node);
+  has_left = left != NULL;
+  has_right = right != NULL;
+  if (has_left != has_right || (has_left && left == right) ||
+      tnt_routing_parent(node) != parent ||
       node->value.level != level || node->value.slab == NULL ||
       node->value.slab->centree_node != node)
     return false;
@@ -365,9 +371,9 @@ static bool validate_routing_node(centree_node node, centree_node parent,
   (*node_count)++;
   if (level > *actual_depth)
     *actual_depth = level;
-  return validate_routing_node(node->left, node, level + 1, actual_depth,
+  return validate_routing_node(left, node, level + 1, actual_depth,
                                node_count) &&
-         validate_routing_node(node->right, node, level + 1, actual_depth,
+         validate_routing_node(right, node, level + 1, actual_depth,
                                node_count);
 }
 
@@ -407,7 +413,8 @@ static struct topology_snapshot take_topology_snapshot(centree_node any_node) {
     snapshot.keys[i] = node->key;
     snapshot.value_keys[i] = node->value.key;
     snapshot.slabs[i] = node->value.slab;
-    snapshot.leaves[i] = node->left == NULL && node->right == NULL;
+    snapshot.leaves[i] = tnt_routing_left(node) == NULL &&
+                         tnt_routing_right(node) == NULL;
   }
   return snapshot;
 }
@@ -429,7 +436,8 @@ static bool topology_matches_snapshot(const struct topology_snapshot *snapshot,
   matches = index == count;
   for (size_t i = 0; matches && i < count; i++) {
     centree_node node = inorder[i];
-    bool is_leaf = node->left == NULL && node->right == NULL;
+    bool is_leaf = tnt_routing_left(node) == NULL &&
+                   tnt_routing_right(node) == NULL;
 
     matches = node == snapshot->inorder[i] &&
               node->lu_parent == snapshot->lu_parents[i] &&
@@ -529,8 +537,8 @@ static void run_mid_split_rebalance_test(void) {
   split_request = submit_request(TEST_UPSERT, 64, 64);
   TEST_CHECK(wait_for_flag(&split_hook_reached, REQUEST_TIMEOUT_SECONDS));
   TEST_CHECK(paused_split_parent != NULL && paused_left_child != NULL);
-  TEST_CHECK(paused_split_parent->left == paused_left_child);
-  TEST_CHECK(paused_split_parent->right == NULL);
+  TEST_CHECK(tnt_routing_left(paused_split_parent) == paused_left_child);
+  TEST_CHECK(tnt_routing_right(paused_split_parent) == NULL);
   parent_lu_parent = paused_split_parent->lu_parent;
   left_lu_parent = paused_left_child->lu_parent;
 
@@ -546,7 +554,7 @@ static void run_mid_split_rebalance_test(void) {
 
   /* The writer must remain blocked while the split holds the gate in read mode. */
   TEST_CHECK(timed_join(rebalance_thread, 1000) == ETIMEDOUT);
-  TEST_CHECK(paused_split_parent->right == NULL);
+  TEST_CHECK(tnt_routing_right(paused_split_parent) == NULL);
   TEST_CHECK(atomic_load_explicit(&paused_split_parent->child_flag,
                                   memory_order_acquire) == 0);
 
