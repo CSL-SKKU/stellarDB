@@ -27,6 +27,7 @@ Retrieved from: http://en.literateprograms.org/Red-black_tree_(C)?oldid=16016
 
 #ifndef _CENTREE_H_
 #define _CENTREE_H_ 1
+#include <stdbool.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -48,6 +49,7 @@ typedef struct centree_node_t {
 typedef struct centree_t {
   centree_node root;
   _Atomic uint64_t depth;
+  _Atomic uint64_t node_count;
 } * centree;
 
 typedef struct bgq_node_t {
@@ -87,6 +89,10 @@ struct centree_scan_tmp {
   size_t nb_entries;
 };
 
-void centree_balance(centree t);
+/* The caller must hold centree_root_lock. */
+bool centree_validate_locked(centree tree);
+
+/* Returns zero on success/no-op, otherwise an errno value. */
+int centree_balance(centree tree);
 
 #endif

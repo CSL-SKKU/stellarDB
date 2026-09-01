@@ -95,6 +95,7 @@ centree centree_create() {
   centree t = malloc(sizeof(struct centree_t));
   t->root = NULL;
   atomic_init(&t->depth, 0);
+  atomic_init(&t->node_count, 0);
   bgqueue = malloc(sizeof(background_queue));
   init_queue(bgqueue);
   return t;
@@ -177,6 +178,7 @@ node centree_insert(centree t, void *key, tree_entry_t *value,
     atomic_store_explicit(&t->depth, level, memory_order_release);
   value->level = level;
   inserted_node->value = *value;
+  atomic_fetch_add_explicit(&t->node_count, 1, memory_order_release);
   return inserted_node;
 }
 
@@ -215,6 +217,7 @@ node centree_insert_dual(centree t, void *key,
         n->right->parent = n;
         n->left->lu_parent = n;
         n->right->lu_parent = n;
+        atomic_fetch_add_explicit(&t->node_count, 2, memory_order_release);
         break;
       }
     }

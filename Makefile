@@ -9,9 +9,16 @@ CXXFLAGS=${CFLAGS}
 BENCH ?= ycsb_c_zipfian
 PAGE_CACHE_SIZE ?= "(PAGE_SIZE * 2097152)" # Default 8 GiB
 STELLAR_DEBUG ?= 0
+DISTRIBUTOR_HIGH_UTIL ?= 80
+IO_WORKER_LOW_UTIL ?= 50
+REBALANCE_THRESHOLD ?= 1.5
 
 # 매크로 전달
-CFLAGS += -DSELECTED_BENCH=$(BENCH) -DSELECTED_PAGE_CACHE_SIZE=$(PAGE_CACHE_SIZE) -DDEBUG=$(STELLAR_DEBUG)
+CFLAGS += -DSELECTED_BENCH=$(BENCH) -DSELECTED_PAGE_CACHE_SIZE=$(PAGE_CACHE_SIZE) \
+	-DDEBUG=$(STELLAR_DEBUG) \
+	-DDISTRIBUTOR_HIGH_UTIL=$(DISTRIBUTOR_HIGH_UTIL) \
+	-DIO_WORKER_LOW_UTIL=$(IO_WORKER_LOW_UTIL) \
+	-DREBALANCE_THRESHOLD=$(REBALANCE_THRESHOLD)
 ifneq ($(REALKEY_FILE_PATH),)
 CFLAGS += -DREALKEY_FILE_PATH=\"$(REALKEY_FILE_PATH)\"
 endif
@@ -26,7 +33,13 @@ MAIN_OBJ=main.o ${OTHERS_OBJ}
 
 all: makefile.dep main 
 
-test: test/test_main test/test_reins
+test: test/test_main test/test_reins test/test_rebalance test/test_rebalance_api
+
+test/test_rebalance: test/rebalance.o indexes/tnt_balance.o
+	${CC} test/rebalance.o indexes/tnt_balance.o ${CFLAGS} ${LDLIBS} -o test/test_rebalance
+
+test/test_rebalance_api: test/rebalance_api.o ${OTHERS_OBJ}
+	${CC} test/rebalance_api.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_rebalance_api
 
 test/test_main: test/main.o ${OTHERS_OBJ}
 	${CC} test/main.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_main
@@ -47,4 +60,5 @@ endif
 main: $(MAIN_OBJ)
 
 clean:
-	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins makefile.dep
+	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins \
+		test/test_rebalance test/test_rebalance_api makefile.dep

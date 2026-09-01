@@ -23,6 +23,11 @@
 struct slab;
 struct slab_callback;
 
+typedef void (*slab_split_test_hook_t)(struct slab *parent);
+
+/* Test-only synchronization hook; production leaves it unset. */
+void slab_set_split_midpoint_test_hook(slab_split_test_hook_t hook);
+
 /* Header of a slab -- shouldn't contain any pointer as it is persisted on disk.
  */
 #define NUM_LOAD_BATCH 64

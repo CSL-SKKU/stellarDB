@@ -37,6 +37,23 @@
      // check again if new incoming requests have arrived. Boost performance a
      // tiny bit for zipfian workloads on AWS, but really not worthwhile
 
+/* Runtime routing-maintenance thresholds (percentages are inclusive). */
+#ifndef DISTRIBUTOR_HIGH_UTIL
+#define DISTRIBUTOR_HIGH_UTIL 80U
+#endif
+
+#ifndef IO_WORKER_LOW_UTIL
+#define IO_WORKER_LOW_UTIL 50U
+#endif
+
+#ifndef REBALANCE_THRESHOLD
+#define REBALANCE_THRESHOLD 1.5
+#endif
+
+#ifndef WORKER_UTILIZATION_PERIOD_MS
+#define WORKER_UTILIZATION_PERIOD_MS 1000U
+#endif
+
 
 /* Page cache */
 //#define PAGE_CACHE_SIZE (PAGE_SIZE * 20480)

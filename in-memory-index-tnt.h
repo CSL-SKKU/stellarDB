@@ -21,6 +21,9 @@ index_entry_t *subtree_worker_lookup_ukey(subtree_t *tree, uint64_t key);
 int subtree_worker_delete(subtree_t *tree, void *item);
 
 void centree_init(void);
+/* Split callers must not already hold centree_root_lock. */
+void tnt_topology_split_lock(void);
+void tnt_topology_split_unlock(void);
 struct tree_entry *tnt_worker_lookup(int worker_id, void *item);
 
 int tnt_centree_node_is_child (centree_node n);
@@ -50,8 +53,21 @@ index_entry_t *tnt_index_lookup_for_test(struct slab_callback *cb, void *item, i
 int tnt_index_invalid(void *item);
 
 uint64_t tnt_get_depth(void);
+uint64_t tnt_get_node_count(void);
+bool tnt_rebalancing_needed(void);
 void tnt_print(void);
-void tnt_rebalancing(void);
+
+enum tnt_rebalance_status {
+  TNT_REBALANCE_SUCCESS = 0,
+  TNT_REBALANCE_NOOP = 1,
+};
+
+/*
+ * Safe while client operations are running. The caller must not hold a slab
+ * lock, centree_root_lock, or centree_topology_gate. Returns a status above or
+ * a negative errno value.
+ */
+int tnt_rebalancing(void);
 
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);

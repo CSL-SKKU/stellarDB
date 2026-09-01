@@ -1,5 +1,7 @@
 #include "headers.h"
 
+#include <errno.h>
+
 /*
  * A slab worker takes care of processing requests sent to the KV-Store.
  * E.g.:
@@ -36,6 +38,11 @@ static int nb_disks = 0;
 static int nb_workers_launched = 0;
 static int nb_workers_ready = 0;
 
+static pthread_mutex_t restructuring_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t restructuring_cond = PTHREAD_COND_INITIALIZER;
+static _Atomic int restructuring_started = 0;
+static int restructuring_requested = 0;
+
 uint64_t nb_totals;
 int try_fsst = 0;
 _Atomic size_t epoch;
@@ -64,7 +71,107 @@ struct slab_context {
   struct pagecache *pagecache __attribute__((aligned(64)));
   struct io_context *io_ctx;
   uint64_t rdt;  // Latest timestamp
+  _Atomic unsigned int utilization;
+  _Atomic int utilization_ready;
 } *slab_contexts;
+
+struct utilization_window {
+  uint64_t start;
+  uint64_t wait_cycles;
+};
+
+_Static_assert(DISTRIBUTOR_HIGH_UTIL >= 0 && DISTRIBUTOR_HIGH_UTIL <= 100,
+               "DISTRIBUTOR_HIGH_UTIL must be a percentage");
+_Static_assert(IO_WORKER_LOW_UTIL >= 0 && IO_WORKER_LOW_UTIL <= 100,
+               "IO_WORKER_LOW_UTIL must be a percentage");
+_Static_assert(WORKER_UTILIZATION_PERIOD_MS > 0,
+               "WORKER_UTILIZATION_PERIOD_MS must be positive");
+
+static int pool_utilization_ready(size_t first, size_t count);
+
+static unsigned int get_pool_utilization(size_t first, size_t count) {
+  uint64_t total = 0;
+
+  if (!pool_utilization_ready(first, count))
+    return 0;
+  for (size_t i = first; i < first + count; i++)
+    total += atomic_load_explicit(&slab_contexts[i].utilization,
+                                  memory_order_acquire);
+  return (unsigned int)(total / count);
+}
+
+unsigned int get_distributor_utilization(void) {
+  return get_pool_utilization(0, (size_t)nb_distributors);
+}
+
+unsigned int get_io_worker_utilization(void) {
+  return get_pool_utilization((size_t)nb_distributors, (size_t)nb_workers);
+}
+
+static int pool_utilization_ready(size_t first, size_t count) {
+  if (slab_contexts == NULL || count == 0)
+    return 0;
+  for (size_t i = first; i < first + count; i++) {
+    if (!atomic_load_explicit(&slab_contexts[i].utilization_ready,
+                              memory_order_acquire))
+      return 0;
+  }
+  return 1;
+}
+
+static int restructuring_utilization_thresholds_met(void) {
+  if (!pool_utilization_ready(0, (size_t)nb_distributors) ||
+      !pool_utilization_ready((size_t)nb_distributors,
+                              (size_t)nb_workers))
+    return 0;
+  return get_distributor_utilization() >= DISTRIBUTOR_HIGH_UTIL &&
+         get_io_worker_utilization() <= IO_WORKER_LOW_UTIL;
+}
+
+static void maybe_wake_restructuring_worker(void) {
+  if (!atomic_load_explicit(&restructuring_started, memory_order_acquire) ||
+      !restructuring_utilization_thresholds_met())
+    return;
+
+  pthread_mutex_lock(&restructuring_lock);
+  restructuring_requested = 1;
+  pthread_cond_signal(&restructuring_cond);
+  pthread_mutex_unlock(&restructuring_lock);
+}
+
+static void publish_utilization_if_due(struct slab_context *ctx,
+                                       struct utilization_window *window,
+                                       uint64_t now) {
+  uint64_t elapsed = now - window->start;
+
+  if (cycles_to_us(elapsed) < WORKER_UTILIZATION_PERIOD_MS * 1000LU)
+    return;
+
+  uint64_t wait_cycles = window->wait_cycles;
+  if (wait_cycles > elapsed)
+    wait_cycles = elapsed;
+  unsigned int utilization =
+      (unsigned int)((elapsed - wait_cycles) * 100LU / elapsed);
+
+  atomic_store_explicit(&ctx->utilization, utilization,
+                        memory_order_release);
+  atomic_store_explicit(&ctx->utilization_ready, 1,
+                        memory_order_release);
+  window->start = now;
+  window->wait_cycles = 0;
+  maybe_wake_restructuring_worker();
+}
+
+static void account_wait_sample(struct slab_context *ctx,
+                                struct utilization_window *window,
+                                uint64_t *wait_start) {
+  uint64_t now;
+
+  rdtscll(now);
+  window->wait_cycles += now - *wait_start;
+  *wait_start = now;
+  publish_utilization_if_due(ctx, window, now);
+}
 
 
 void increase_processed(struct slab_context *ctx) {
@@ -389,8 +496,6 @@ again:
   }
 }
 
-static uint64_t io_wait = 0;
-
 static void *worker_slab_init(void *pdata) {
   struct slab_context *ctx = pdata;
 
@@ -410,6 +515,8 @@ static void *worker_slab_init(void *pdata) {
 
   /* Main loop: do IOs and process enqueued requests */
   declare_breakdown;
+  struct utilization_window utilization_window = {0};
+  rdtscll(utilization_window.start);
   while (1) {
     ctx->rdt++;
 
@@ -421,24 +528,32 @@ static void *worker_slab_init(void *pdata) {
     }
 
     volatile size_t pending = ctx->sent_callbacks - ctx->processed_callbacks;
-    while (!pending && !io_pending(ctx->io_ctx)) {
-      if (!PINNING) {
-        usleep(2);
-      } else {
-        NOP10();
-      }
-      pending = ctx->sent_callbacks - ctx->processed_callbacks;
+    if (!pending && !io_pending(ctx->io_ctx)) {
+      uint64_t wait_start;
+      unsigned int wait_polls = 0;
+
+      rdtscll(wait_start);
+      do {
+        if (!PINNING) {
+          usleep(2);
+        } else {
+          NOP10();
+        }
+        pending = ctx->sent_callbacks - ctx->processed_callbacks;
+        if ((++wait_polls & 1023U) == 0)
+          account_wait_sample(ctx, &utilization_window, &wait_start);
+      } while (!pending && !io_pending(ctx->io_ctx));
+      account_wait_sample(ctx, &utilization_window, &wait_start);
     }
     __4
 
     worker_dequeue_requests(ctx);
     __5  // Process queue
 
-    if (ctx->worker_id == nb_distributors) {
-      rdtscll(__breakdown.now);
-      uint64_t elapsed = __breakdown.now - __breakdown.real_start;
-      io_wait = (__breakdown.evt4 * 100LU / elapsed);
-    }
+    uint64_t utilization_now;
+    rdtscll(utilization_now);
+    publish_utilization_if_due(ctx, &utilization_window, utilization_now);
+
     show_breakdown_periodic(1000, ctx->processed_callbacks, "io_submit",
                             "io_getevents", "io_cb", "wait", "slab_cb");
   }
@@ -462,32 +577,91 @@ static void *worker_distributor_init(void *pdata) {
   __sync_add_and_fetch(&nb_workers_ready, 1);
 
   declare_breakdown;
+  struct utilization_window utilization_window = {0};
+  rdtscll(utilization_window.start);
   while (1) {
     ctx->rdt++;
     if (ctx->rdt % cfg.epoch == 0 && ctx->worker_id == 0) {
       atomic_fetch_add_explicit(&epoch, 1, memory_order_seq_cst);
     }
     volatile size_t pending = ctx->sent_callbacks - ctx->processed_callbacks;
-    while (!pending) {
-      if (!PINNING) {
-        usleep(2);
-      } else {
-        NOP10();
-      }
-      pending = ctx->sent_callbacks - ctx->processed_callbacks;
+    if (!pending) {
+      uint64_t wait_start;
+      unsigned int wait_polls = 0;
+
+      rdtscll(wait_start);
+      do {
+        if (!PINNING) {
+          usleep(2);
+        } else {
+          NOP10();
+        }
+        pending = ctx->sent_callbacks - ctx->processed_callbacks;
+        if ((++wait_polls & 1023U) == 0)
+          account_wait_sample(ctx, &utilization_window, &wait_start);
+      } while (!pending);
+      account_wait_sample(ctx, &utilization_window, &wait_start);
     }
     __4
 
     worker_dequeue_requests(ctx);
     __5  // Process queue
 
-                                show_breakdown_periodic(1000, ctx->processed_callbacks, "io_submit",
-      "io_getevents", "io_cb", "wait", "slab_cb");
+    uint64_t utilization_now;
+    rdtscll(utilization_now);
+    publish_utilization_if_due(ctx, &utilization_window, utilization_now);
+
+    show_breakdown_periodic(1000, ctx->processed_callbacks, "io_submit",
+                            "io_getevents", "io_cb", "wait", "slab_cb");
     //if (ctx->worker_id == 0)
     //    check_and_handle_tnt(__breakdown.real_start, __breakdown.evt5);
   }
 
   return NULL;
+}
+
+static void *worker_restructuring_init(void *pdata) {
+  (void)pdata;
+
+  while (1) {
+    pthread_mutex_lock(&restructuring_lock);
+    while (!restructuring_requested)
+      pthread_cond_wait(&restructuring_cond, &restructuring_lock);
+    restructuring_requested = 0;
+    pthread_mutex_unlock(&restructuring_lock);
+
+    while (restructuring_utilization_thresholds_met() &&
+           tnt_rebalancing_needed()) {
+      int status = tnt_rebalancing();
+
+      if (status >= 0)
+        break;
+      fprintf(stderr, "Background rebalancing failed: %s; retrying\n",
+              strerror(-status));
+      sleep(1);
+    }
+  }
+
+  return NULL;
+}
+
+int restructuring_worker_init(void) {
+  int expected = 0;
+  pthread_t thread;
+
+  if (!atomic_compare_exchange_strong_explicit(
+          &restructuring_started, &expected, 1,
+          memory_order_acq_rel, memory_order_acquire))
+    return 0;
+
+  int error = pthread_create(&thread, NULL, worker_restructuring_init, NULL);
+  if (error != 0) {
+    atomic_store_explicit(&restructuring_started, 0, memory_order_release);
+    return -error;
+  }
+  pthread_detach(thread);
+  maybe_wake_restructuring_worker();
+  return 0;
 }
 
 /*
@@ -852,6 +1026,10 @@ void slab_workers_init(int _nb_disks, int nb_workers_per_disk,
   nb_totals = 0;
 
   slab_contexts = calloc(nb_workers + nb_distributors, sizeof(*slab_contexts));
+  for (size_t w = 0; w < (size_t)(nb_workers + nb_distributors); w++) {
+    atomic_init(&slab_contexts[w].utilization, 0);
+    atomic_init(&slab_contexts[w].utilization_ready, 0);
+  }
   if (!create_root_slab()) {
     pthread_t *t = malloc((nb_distributors + nb_workers)*sizeof(pthread_t));
     for (size_t w = 0; w < nb_distributors + nb_workers; w++) {

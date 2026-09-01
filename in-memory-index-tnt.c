@@ -2,8 +2,10 @@
 #include "indexes/tnt_centree.h"
 #include "indexes/tnt_subtree.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <linux/futex.h>
+#include <math.h>
 #include <sys/syscall.h>
 
 extern int print;
@@ -239,6 +241,15 @@ centree_node get_next_node(background_queue *queue, centree_node target) {
 
 static centree centree_root;
 static pthread_lock_t centree_root_lock;
+static pthread_rwlock_t centree_topology_gate;
+
+void tnt_topology_split_lock(void) {
+  R_LOCK(&centree_topology_gate);
+}
+
+void tnt_topology_split_unlock(void) {
+  R_UNLOCK(&centree_topology_gate);
+}
 
 void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
   // 1) Initialize arr[i] = i
@@ -303,7 +314,25 @@ tree_entry_t *centree_worker_lookup(void *key) {
 }
 
 uint64_t tnt_get_depth(void) {
+  if (centree_root == NULL)
+    return 0;
   return centree_get_depth(centree_root);
+}
+
+uint64_t tnt_get_node_count(void) {
+  if (centree_root == NULL)
+    return 0;
+  return atomic_load_explicit(&centree_root->node_count,
+                              memory_order_acquire);
+}
+
+bool tnt_rebalancing_needed(void) {
+  uint64_t node_count = tnt_get_node_count();
+  uint64_t depth = tnt_get_depth();
+
+  if (node_count <= 1)
+    return false;
+  return (double)depth > log2((double)node_count) * REBALANCE_THRESHOLD;
 }
 
 void centree_worker_insert(int worker_id, void *item, tree_entry_t *e) {
@@ -661,7 +690,11 @@ void tnt_subtree_update_key(uint64_t old_key, uint64_t new_key) {
     W_LOCK(&s->tree_lock);
     comp_result = tnt_pointer_cmp((void *)old_key, n->key);
     if (comp_result == 0) {
+      /* (we rely on x86 strong memory model)
+       * holding a wlock is not needed.
+       * the key(pivot) is automatically set if aligned properly */
       n->key = (void *)new_key;
+
       W_UNLOCK(&s->tree_lock);
       R_UNLOCK(&centree_root_lock);
       return;
@@ -821,6 +854,7 @@ void centree_init(void) {
   fsst_queue = malloc(sizeof(background_queue));
   init_queue(gc_queue);
   init_queue(fsst_queue);
+  INIT_LOCK(&centree_topology_gate, NULL);
   INIT_LOCK(&centree_root_lock, NULL);
   INIT_LOCK(&gc_lock, NULL);
   INIT_LOCK(&fsst_lock, NULL);
@@ -835,8 +869,29 @@ void tnt_print(void) {
   R_UNLOCK(&centree_root_lock);
 }
 
-void tnt_rebalancing(void) {
+int tnt_rebalancing(void) {
+  int result;
+
+  if (centree_root == NULL)
+    return -EINVAL;
+
+  W_LOCK(&centree_topology_gate);
   W_LOCK(&centree_root_lock);
-  centree_balance(centree_root);
+
+  if (centree_root->root == NULL) {
+    result = TNT_REBALANCE_NOOP;
+  } else {
+    bool topology_noop = centree_root->root->left == NULL &&
+                         centree_root->root->right == NULL;
+    int error = centree_balance(centree_root);
+
+    if (error != 0)
+      result = -error;
+    else
+      result = topology_noop ? TNT_REBALANCE_NOOP : TNT_REBALANCE_SUCCESS;
+  }
+
   W_UNLOCK(&centree_root_lock);
+  W_UNLOCK(&centree_topology_gate);
+  return result;
 }

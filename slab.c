@@ -13,6 +13,20 @@ extern uint64_t nb_totals;
 
 
 static int create_sequence = 0;
+static _Atomic(slab_split_test_hook_t) split_midpoint_test_hook;
+
+void slab_set_split_midpoint_test_hook(slab_split_test_hook_t hook) {
+  atomic_store_explicit(&split_midpoint_test_hook, hook,
+                        memory_order_release);
+}
+
+static void run_split_midpoint_test_hook(struct slab *parent) {
+  slab_split_test_hook_t hook = atomic_load_explicit(
+      &split_midpoint_test_hook, memory_order_acquire);
+
+  if (hook != NULL)
+    hook(parent);
+}
 
 /*
  * Where is my item in the slab?
@@ -214,17 +228,39 @@ int create_root_slab() {
   return 1;
 }
 
+static void create_and_add_split_child(uint64_t level, uint64_t key) {
+  struct slab *child = create_slab(NULL, level, key, 0, NULL);
+  void *filter = NULL;
+
+#if WITH_FILTER
+  filter = filter_create(200000);
+#endif
+  tnt_subtree_add(child, tnt_subtree_create(), filter, key);
+}
+
 struct slab *close_and_create_slab(struct slab *s) {
   uint64_t new_key;
   uint64_t new_level;
+  uint64_t range_min;
+  uint64_t range_max;
 
+  tnt_topology_split_lock();
   R_LOCK(&s->tree_lock);
-  assert(s->min != (uint64_t)-1);
-  assert(s->min <= s->max);
-  new_key = s->min + (s->max - s->min) / 2;
-  if (new_key == 0 || new_key == UINT64_MAX)
+  range_min = __atomic_load_n(&s->min, __ATOMIC_ACQUIRE);
+  range_max = __atomic_load_n(&s->max, __ATOMIC_ACQUIRE);
+  if (range_min == (uint64_t)-1 || range_min > range_max) {
+    R_UNLOCK(&s->tree_lock);
+    tnt_topology_split_unlock();
+    die("Cannot split slab %lu with invalid range [%lu, %lu]", s->seq,
+        range_min, range_max);
+  }
+  new_key = range_min + (range_max - range_min) / 2;
+  if (new_key == 0 || new_key == UINT64_MAX) {
+    R_UNLOCK(&s->tree_lock);
+    tnt_topology_split_unlock();
     die("Cannot split slab %lu with overflowing pivot %lu", s->seq, new_key);
-  new_level = tnt_get_centree_level(s->centree_node)+1;
+  }
+  new_level = tnt_get_centree_level(s->centree_node) + 1;
   R_UNLOCK(&s->tree_lock);
 
   tnt_subtree_update_key(s->key, new_key);
@@ -235,26 +271,27 @@ struct slab *close_and_create_slab(struct slab *s) {
   char path[128], spath[128];
   int len;
   sprintf(path, "/proc/self/fd/%d", s->fd);
-  if ((len = readlink(path, spath, 512)) < 0) {
+  if ((len = readlink(path, spath, sizeof(spath) - 1)) < 0) {
+    tnt_topology_split_unlock();
     perr("Can't find file\n");
   }
   spath[len] = 0;
   strncpy(path, spath, len);
-  snprintf(path + len, 128 - len, "-%lu", s->key);
-  rename(spath, path);
+  int suffix_len = snprintf(path + len, sizeof(path) - len, "-%lu", s->key);
+  if (suffix_len < 0 || (size_t)suffix_len >= sizeof(path) - (size_t)len) {
+    tnt_topology_split_unlock();
+    die("Cannot append pivot to slab %lu filename", s->seq);
+  }
+  if (rename(spath, path) != 0) {
+    tnt_topology_split_unlock();
+    perr("Cannot rename slab %lu for pivot %lu", s->seq, new_key);
+  }
 
-#if WITH_FILTER
-  tnt_subtree_add(create_slab(NULL, new_level, new_key - 1, 0, NULL), tnt_subtree_create(),
-                  (void *)filter_create(200000), new_key - 1);
-  tnt_subtree_add(create_slab(NULL, new_level, new_key + 1, 0, NULL), tnt_subtree_create(),
-                  (void *)filter_create(200000), new_key + 1);
-#else
-  tnt_subtree_add(create_slab(NULL, new_level, new_key - 1, 0, NULL), tnt_subtree_create(),
-                  NULL, new_key - 1);
-  tnt_subtree_add(create_slab(NULL, new_level, new_key + 1, 0, NULL), tnt_subtree_create(),
-                  NULL, new_key + 1);
-#endif
+  create_and_add_split_child(new_level, new_key - 1);
+  run_split_midpoint_test_hook(s);
+  create_and_add_split_child(new_level, new_key + 1);
   wakeup_subtree_get(s->centree_node);
+  tnt_topology_split_unlock();
 
   return s;
 }

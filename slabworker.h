@@ -26,6 +26,13 @@ void slab_workers_init(int nb_disks, int nb_workers_per_disk,
                        int nb_distributors_per_disk);
 int get_nb_workers(void);
 int get_nb_distributors(void);
+/*
+ * One-second average non-wait time for each worker pool, in [0, 100].
+ * A pool reports zero until its workers have completed their first window.
+ */
+unsigned int get_distributor_utilization(void);
+unsigned int get_io_worker_utilization(void);
+int restructuring_worker_init(void);
 void *kv_read_sync(void *item);  // Unsafe
 struct pagecache *get_pagecache(struct slab_context *ctx);
 struct pagecache *get_scancache(struct slab_context *ctx);

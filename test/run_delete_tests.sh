@@ -53,6 +53,8 @@ echo "== in-process unit / stress tests (no slab files) =="
 ./test/test_delete >/dev/null 2>&1;               report "delete (unit)" $?
 ./test/test_delete_stress >/dev/null 2>&1;        report "delete_stress" $?
 ./test/test_delete_worker_stress >/dev/null 2>&1; report "delete_worker_stress" $?
+./test/test_delete_worker_stress --rebalance-concurrent >/dev/null 2>&1
+report "deterministic mid-split rebalance" $?
 
 echo
 echo "== end-to-end through the real pipeline =="

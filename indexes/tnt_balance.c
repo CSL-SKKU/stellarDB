@@ -1,162 +1,267 @@
 #include "tnt_centree.h"
-#include <limits.h>  // for INT_MAX
+
+#include <errno.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdlib.h>
-#include <stdio.h>
 
-/***** 내부 정적 함수들 *****/
+struct node_snapshot {
+  centree_node left;
+  centree_node right;
+  centree_node parent;
+  centree_node lu_parent;
+  unsigned char removed;
+  bool was_leaf;
+};
 
-/* (1) 트리의 전체 노드 수를 센다. */
-static int count_nodes(centree_node node) {
-    if (node == NULL)
-        return 0;
-    return 1 + count_nodes(node->left) + count_nodes(node->right);
+static bool validate_subtree(centree_node node, size_t *count) {
+  bool has_left = node->left != NULL;
+  bool has_right = node->right != NULL;
+
+  if (has_left != has_right)
+    return false;
+  if (has_left && node->left == node->right)
+    return false;
+  if (has_left &&
+      (node->left->parent != node || node->right->parent != node))
+    return false;
+  if (*count == SIZE_MAX)
+    return false;
+
+  (*count)++;
+  if (!has_left)
+    return true;
+
+  return validate_subtree(node->left, count) &&
+         validate_subtree(node->right, count);
 }
 
-/* (2) in‐order 순회하면서 노드들을 배열에 저장한다.
-       (배열에 담긴 순서는 BST의 키 순서와 일치함) */
-static void collect_nodes(centree_node node, centree_node* arr, int* idx) {
-    if (node == NULL)
-        return;
-    collect_nodes(node->left, arr, idx);
-    arr[(*idx)++] = node;
-    collect_nodes(node->right, arr, idx);
+bool centree_validate_locked(centree tree) {
+  size_t count = 0;
+
+  if (tree == NULL || tree->root == NULL || tree->root->parent != NULL)
+    return false;
+  if (!validate_subtree(tree->root, &count))
+    return false;
+
+  return count % 2 == 1;
 }
 
-/* (3) 트리 전체를 순회하여, 자식이 없는 노드는 fixed(=1)로,
-       내부 노드는 fixed(=0)로 표시한다. */
+static size_t count_nodes(centree_node node) {
+  if (node == NULL)
+    return 0;
+  return 1 + count_nodes(node->left) + count_nodes(node->right);
+}
+
+static bool collect_nodes(centree_node node, centree_node *nodes,
+                          size_t capacity, size_t *index) {
+  if (node == NULL)
+    return true;
+  if (!collect_nodes(node->left, nodes, capacity, index))
+    return false;
+  if (*index == capacity)
+    return false;
+  nodes[(*index)++] = node;
+  return collect_nodes(node->right, nodes, capacity, index);
+}
+
 static void mark_fixed(centree_node node) {
-    if (node == NULL)
-        return;
-    if (node->left == NULL && node->right == NULL) {
-        node->removed = 1;  // fixed leaf
-    } else {
-        node->removed = 0;
-        mark_fixed(node->left);
-        mark_fixed(node->right);
-    }
+  if (node == NULL)
+    return;
+  if (node->left == NULL && node->right == NULL) {
+    node->removed = 1;
+  } else {
+    node->removed = 0;
+    mark_fixed(node->left);
+    mark_fixed(node->right);
+  }
 }
 
-/* (4) in‐order 배열로부터 균형 잡힌 full binary tree를 재구성한다.
-       인수 [l, r) 구간의 노드들은 원래 full 트리의 in‐order 순서로,
-       전체 트리에서는 첫번째와 마지막 노드가 fixed (리프)여야 하며,
-       내부(중간) 노드들은 fixed가 아니어야 한다.
-       
-       parent: 현재 서브트리의 부모 노드 (최상위 호출은 NULL)
-       
-       [리턴] 재구성된 서브트리의 루트 */
-static centree_node build_tree_from_array(centree_node* nodes, int l, int r, centree_node parent) {
-    int count = r - l;
-    if (count == 0)
-        return NULL;
-    if (count == 1) {
-        // 구간에 단 하나의 노드가 있으면(=리프) 그대로 리턴
-        centree_node n = nodes[l];
-        n->left = n->right = NULL;
-        n->parent = parent;
-        return n;
+static int build_tree_from_array(centree_node *nodes, size_t l, size_t r,
+                                 centree_node parent,
+                                 centree_node *result) {
+  size_t count = r - l;
+
+  if (count == 0 || count % 2 == 0)
+    return EINVAL;
+  if (count == 1) {
+    centree_node node = nodes[l];
+
+    if (node->removed != 1)
+      return EINVAL;
+    node->left = NULL;
+    node->right = NULL;
+    node->parent = parent;
+    *result = node;
+    return 0;
+  }
+
+  size_t best_k = SIZE_MAX;
+  size_t best_diff = SIZE_MAX;
+  for (size_t k = l + 1; k < r - 1; k += 2) {
+    size_t left_size = k - l;
+    size_t right_size = r - k - 1;
+    size_t diff = left_size > right_size ? left_size - right_size
+                                          : right_size - left_size;
+
+    if (diff < best_diff) {
+      best_diff = diff;
+      best_k = k;
     }
-    // 구간의 노드 수는 full binary tree이므로 홀수 (2m+1)이며, 
-    // 구간의 첫, 마지막 노드는 fixed (리프)여야 한다.
-    // 내부 노드 후보는 l+1, l+3, ..., r-2 (즉, 구간 내에서 홀수 인덱스)
-    int best_k = -1;
-    int best_diff = INT_MAX;
-    for (int k = l+1; k < r-1; k += 2) {
-        int left_size = k - l;
-        int right_size = r - k - 1;
-        int diff = left_size > right_size ? left_size - right_size : right_size - left_size;
-        if (diff < best_diff) {
-            best_diff = diff;
-            best_k = k;
-        }
-    }
-    if (best_k == -1) {
-        fprintf(stderr, "Error in build_tree_from_array: no valid root found in segment [%d, %d).\n", l, r);
-        exit(1);
-    }
-    // best_k에 해당하는 노드는 내부 노드여야 함.
-    centree_node root = nodes[best_k];
-    if (root->removed != 0) {
-        fprintf(stderr, "Error: chosen root at index %d is fixed (originally leaf) but must be internal.\n", best_k);
-        exit(1);
-    }
-    root->parent = parent;
-    root->left = build_tree_from_array(nodes, l, best_k, root);
-    root->right = build_tree_from_array(nodes, best_k+1, r, root);
-    return root;
+  }
+  if (best_k == SIZE_MAX)
+    return EINVAL;
+
+  centree_node root = nodes[best_k];
+  centree_node left;
+  centree_node right;
+  int error;
+
+  if (root->removed != 0)
+    return EINVAL;
+  error = build_tree_from_array(nodes, l, best_k, root, &left);
+  if (error != 0)
+    return error;
+  error = build_tree_from_array(nodes, best_k + 1, r, root, &right);
+  if (error != 0)
+    return error;
+
+  root->parent = parent;
+  root->left = left;
+  root->right = right;
+  *result = root;
+  return 0;
 }
 
-/***** centree_balance() 함수 *****/
-
-/*
-   centree_balance()
-    - 밸런싱 시작 시점의 리프 노드(즉, 자식이 없는 노드)는 fixed 상태로 표시된다.
-    - in‐order 순회 결과(전체 노드 수는 full tree이므로 홀수)는
-      [fixed, internal, fixed, internal, …, fixed]의 순서를 갖는다.
-    - build_tree_from_array()를 이용해 이 배열로부터 균형 잡힌 full binary tree를 재구성한다.
-      이때, 내부 노드는 그대로 사용되고, fixed 노드는 반드시 자식 없이(leaf) 남게 된다.
-    - 기존 노드들을 새롭게 연결하므로, 새 노드 할당이나 기존 노드 해제는 하지 않는다.
-*/
-void centree_balance(centree t) {
-    if (t == NULL || t->root == NULL)
-        return;
-    
-    /* (A) 원래 트리에서 자식이 없는 노드를 fixed(=1)로 표시 */
-    mark_fixed(t->root);
-    
-    /* (B) 전체 노드 수를 센다.
-           full binary tree이면 총 노드 수는 2n+1 (홀수)여야 한다. */
-    int total_nodes = count_nodes(t->root);
-    if (total_nodes == 0)
-        return;
-    if (total_nodes % 2 == 0) {
-        fprintf(stderr, "Error: Tree does not have an odd number of nodes. (Not a full binary tree?)\n");
-        return;
-    }
-    
-    /* (C) in‐order 순회로 노드들을 배열에 저장한다. */
-    centree_node* nodes = malloc(sizeof(centree_node) * total_nodes);
-    if (nodes == NULL) {
-        perror("malloc");
-        exit(1);
-    }
-    int index = 0;
-    collect_nodes(t->root, nodes, &index);
-    if (index != total_nodes) {
-        fprintf(stderr, "Error: Mismatch in node count: expected %d, got %d.\n", total_nodes, index);
-        free(nodes);
-        exit(1);
-    }
-    
-    /* (D) 배열의 순서가 예상대로 fixed/내부 노드가 번갈아 나타나는지 확인 (전체 노드가 1개인 경우는 예외) */
-    if (total_nodes > 1) {
-        if (nodes[0]->removed != 1 || nodes[total_nodes-1]->removed != 1) {
-            fprintf(stderr, "Error: In-order array does not start and end with fixed (leaf) nodes.\n");
-            free(nodes);
-            exit(1);
-        }
-        for (int i = 1; i < total_nodes-1; i++) {
-            if (i % 2 == 1) { // 홀수 인덱스 → 내부 노드여야 함.
-                if (nodes[i]->removed != 0) {
-                    fprintf(stderr, "Error: Node at index %d is fixed but expected to be internal.\n", i);
-                    free(nodes);
-                    exit(1);
-                }
-            } else { // 짝수 인덱스 → fixed (리프)여야 함.
-                if (nodes[i]->removed != 1) {
-                    fprintf(stderr, "Error: Node at index %d is internal but expected to be fixed.\n", i);
-                    free(nodes);
-                    exit(1);
-                }
-            }
-        }
-    }
-    
-    /* (E) in‐order 배열을 이용해 균형 잡힌 full binary tree를 재구성한다.
-           이 과정에서 모든 노드를 재사용하며, 새 할당은 하지 않는다. */
-    centree_node new_root = build_tree_from_array(nodes, 0, total_nodes, NULL);
-    new_root->parent = NULL;
-    t->root = new_root;
-    
-    free(nodes);
+static void restore_tree(centree tree, centree_node old_root,
+                         centree_node *nodes,
+                         const struct node_snapshot *snapshots,
+                         size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    nodes[i]->left = snapshots[i].left;
+    nodes[i]->right = snapshots[i].right;
+    nodes[i]->parent = snapshots[i].parent;
+    nodes[i]->lu_parent = snapshots[i].lu_parent;
+    nodes[i]->removed = snapshots[i].removed;
+  }
+  tree->root = old_root;
 }
 
+static unsigned int refresh_routing_metadata(centree_node node,
+                                             centree_node parent,
+                                             unsigned int level) {
+  unsigned int actual_depth = level;
+
+  node->parent = parent;
+  node->value.level = level;
+  node->removed = 0;
+
+  if (node->left != NULL) {
+    unsigned int left_depth =
+        refresh_routing_metadata(node->left, node, level + 1);
+
+    if (left_depth > actual_depth)
+      actual_depth = left_depth;
+  }
+  if (node->right != NULL) {
+    unsigned int right_depth =
+        refresh_routing_metadata(node->right, node, level + 1);
+
+    if (right_depth > actual_depth)
+      actual_depth = right_depth;
+  }
+
+  return actual_depth;
+}
+
+int centree_balance(centree tree) {
+  centree_node old_root;
+  centree_node new_root;
+  centree_node *nodes = NULL;
+  centree_node *after = NULL;
+  struct node_snapshot *snapshots = NULL;
+  size_t total_nodes;
+  size_t index = 0;
+  int error = 0;
+
+  if (tree == NULL)
+    return EINVAL;
+  if (tree->root == NULL)
+    return 0;
+  if (!centree_validate_locked(tree))
+    return EINVAL;
+
+  old_root = tree->root;
+  total_nodes = count_nodes(old_root);
+  if (total_nodes > SIZE_MAX / sizeof(*nodes) ||
+      total_nodes > SIZE_MAX / sizeof(*snapshots))
+    return ENOMEM;
+
+  nodes = malloc(total_nodes * sizeof(*nodes));
+  after = malloc(total_nodes * sizeof(*after));
+  snapshots = malloc(total_nodes * sizeof(*snapshots));
+  if (nodes == NULL || after == NULL || snapshots == NULL) {
+    error = ENOMEM;
+    goto out;
+  }
+  if (!collect_nodes(old_root, nodes, total_nodes, &index) ||
+      index != total_nodes) {
+    error = EINVAL;
+    goto out;
+  }
+
+  for (size_t i = 0; i < total_nodes; i++) {
+    snapshots[i].left = nodes[i]->left;
+    snapshots[i].right = nodes[i]->right;
+    snapshots[i].parent = nodes[i]->parent;
+    snapshots[i].lu_parent = nodes[i]->lu_parent;
+    snapshots[i].removed = nodes[i]->removed;
+    snapshots[i].was_leaf = nodes[i]->left == NULL;
+  }
+
+  mark_fixed(old_root);
+  for (size_t i = 0; i < total_nodes; i++) {
+    unsigned char expected = i % 2 == 0 ? 1 : 0;
+
+    if (nodes[i]->removed != expected) {
+      error = EINVAL;
+      goto restore;
+    }
+  }
+
+  error = build_tree_from_array(nodes, 0, total_nodes, NULL, &new_root);
+  if (error != 0)
+    goto restore;
+  new_root->parent = NULL;
+  tree->root = new_root;
+
+  index = 0;
+  if (!centree_validate_locked(tree) ||
+      !collect_nodes(tree->root, after, total_nodes, &index) ||
+      index != total_nodes) {
+    error = EFAULT;
+    goto restore;
+  }
+  for (size_t i = 0; i < total_nodes; i++) {
+    bool is_leaf = nodes[i]->left == NULL && nodes[i]->right == NULL;
+
+    if (after[i] != nodes[i] || is_leaf != snapshots[i].was_leaf ||
+        nodes[i]->lu_parent != snapshots[i].lu_parent) {
+      error = EFAULT;
+      goto restore;
+    }
+  }
+
+  unsigned int actual_depth =
+      refresh_routing_metadata(tree->root, NULL, 1);
+  atomic_store(&tree->depth, actual_depth);
+  goto out;
+
+restore:
+  restore_tree(tree, old_root, nodes, snapshots, total_nodes);
+out:
+  free(snapshots);
+  free(after);
+  free(nodes);
+  return error;
+}

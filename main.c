@@ -117,6 +117,12 @@ int main(int argc, char **argv) {
   printf("# \tChunk for shuffling: %lu\n", cfg.chunk_for_shuffle);
   printf("# \tReinsertion: %s\n", cfg.with_reins ? "enabled" : "disabled");
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
+  if (cfg.with_rebal) {
+    printf("# \tRebalancing thresholds: distributor >= %u%%, "
+           "I/O worker <= %u%%, depth > log2(nodes) * %.2f\n",
+           DISTRIBUTOR_HIGH_UTIL, IO_WORKER_LOW_UTIL,
+           (double)REBALANCE_THRESHOLD);
+  }
 
   /* Initialization of random library */
   start_timer {
@@ -165,10 +171,22 @@ int main(int argc, char **argv) {
   //}
 
   if (cfg.with_rebal) {
+    int rebalance_status;
+    int worker_status;
+
     start_timer {
-      tnt_rebalancing();
+      rebalance_status = tnt_rebalancing();
     }
     stop_timer("Rebalancing operations");
+    if (rebalance_status < 0)
+      fprintf(stderr, "Rebalancing failed: %s\n", strerror(-rebalance_status));
+    else if (rebalance_status == TNT_REBALANCE_NOOP)
+      puts("Rebalancing was not needed");
+
+    worker_status = restructuring_worker_init();
+    if (worker_status < 0)
+      fprintf(stderr, "Cannot start restructuring worker: %s\n",
+              strerror(-worker_status));
   }
 
   if (cfg.with_reins)
