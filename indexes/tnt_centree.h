@@ -143,8 +143,23 @@ struct centree_scan_tmp {
   size_t nb_entries;
 };
 
-/* The caller must hold centree_root_lock. */
+/* The caller must prevent concurrent topology publication. */
 bool centree_validate_locked(centree tree);
+
+struct centree_balance_plan;
+
+/*
+ * Prepare rewires only the unpublished RCU slot. The caller must prevent
+ * splits and other topology writers until it commits or aborts the plan.
+ * Publish must run while new root-lock readers are excluded. Complete does
+ * the retired-slot cleanup and may run after releasing that lock.
+ */
+int centree_balance_prepare(centree tree,
+                            struct centree_balance_plan **out_plan);
+void centree_balance_publish(struct centree_balance_plan *plan);
+void centree_balance_complete(struct centree_balance_plan *plan);
+void centree_balance_commit(struct centree_balance_plan *plan);
+void centree_balance_abort(struct centree_balance_plan *plan);
 
 /* Returns zero on success/no-op, otherwise an errno value. */
 int centree_balance(centree tree);

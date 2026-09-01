@@ -198,8 +198,8 @@
     __breakdown.start = __breakdown.now;                     \
   } while (0);
 
-#define show_breakdown_periodic(period, _count, _evt1, _evt2, _evt3, _evt4,   \
-                                _evt5)                                        \
+#define show_breakdown_periodic_hook(period, _count, _evt1, _evt2, _evt3,    \
+                                     _evt4, _evt5, _hook)                     \
   do {                                                                        \
     __breakdown.loops++;                                                      \
     rdtscll(__breakdown.now);                                                 \
@@ -207,6 +207,7 @@
     if (cycles_to_us(elapsed) > ((period)*1000LU)) {                          \
       uint64_t count_diff = _count - __breakdown.count;                       \
       __breakdown.count = _count;                                             \
+      _hook;                                                                  \
       printf("[WORKER BREAKDOWN] " _evt1 "%3lu%% - " _evt2 " %3lu%% - " _evt3 \
              " %3lu%% - " _evt4 " %3lu%% - " _evt5                            \
              " %3lu%% - %7lu ops - %7lu ops/s - %3lu ops / loop - %lu "       \
@@ -227,6 +228,11 @@
       __breakdown.loops = 0;                                                  \
     }                                                                         \
   } while (0);
+
+#define show_breakdown_periodic(period, _count, _evt1, _evt2, _evt3, _evt4, \
+                                _evt5)                                      \
+  show_breakdown_periodic_hook(period, _count, _evt1, _evt2, _evt3, _evt4,  \
+                               _evt5, ((void)0))
 
 #endif
 

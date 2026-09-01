@@ -134,6 +134,18 @@ void rcu_writer_publish(struct rcu_ctx *ctx,
                         void *payload);
 
 /*
+ * Split publication from retired-slot cleanup. This is useful when the epoch
+ * change must happen under an external lock but the potentially linear
+ * cleanup work must not. No other writer can enter between these calls.
+ */
+void rcu_writer_publish_deferred(struct rcu_ctx *ctx,
+                                 struct rcu_writer *writer,
+                                 rcu_callback_t callback,
+                                 void *payload);
+void rcu_writer_finish_deferred(struct rcu_ctx *ctx,
+                                struct rcu_writer *writer);
+
+/*
  * Convenience initialization for a two-slot pointer.
  *
  * Both generations initially point to the same object.

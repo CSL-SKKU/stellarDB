@@ -241,14 +241,81 @@ centree_node get_next_node(background_queue *queue, centree_node target) {
 
 static centree centree_root;
 static pthread_lock_t centree_root_lock;
-static pthread_rwlock_t centree_topology_gate;
+static atomic_int centree_phase_state;
+static void (*rebalance_precommit_test_hook)(void);
+static void (*rebalance_postpublish_test_hook)(void);
 
-void tnt_topology_split_lock(void) {
-  R_LOCK(&centree_topology_gate);
+#define CENTREE_RESTRUCTURING (1U << 30)
+#define CENTREE_SPLIT_COUNT_MASK (CENTREE_RESTRUCTURING - 1)
+
+void tnt_split_phase_enter(void) {
+  for (;;) {
+    int state = atomic_load_explicit(&centree_phase_state,
+                                     memory_order_acquire);
+
+    if (state & CENTREE_RESTRUCTURING) {
+      futex_wait(&centree_phase_state, state);
+      continue;
+    }
+    assert((state & CENTREE_SPLIT_COUNT_MASK) <
+           CENTREE_SPLIT_COUNT_MASK);
+
+    if (atomic_compare_exchange_weak_explicit(
+            &centree_phase_state, &state, state + 1,
+            memory_order_acq_rel, memory_order_acquire))
+      return;
+  }
 }
 
-void tnt_topology_split_unlock(void) {
-  R_UNLOCK(&centree_topology_gate);
+void tnt_split_phase_exit(void) {
+  int old = atomic_fetch_sub_explicit(&centree_phase_state, 1,
+                                      memory_order_acq_rel);
+
+  assert((old & CENTREE_SPLIT_COUNT_MASK) > 0);
+  if ((old & CENTREE_SPLIT_COUNT_MASK) == 1)
+    futex_wake(&centree_phase_state, INT_MAX);
+}
+
+static void restructuring_phase_enter(void) {
+  for (;;) {
+    int state = atomic_load_explicit(&centree_phase_state,
+                                     memory_order_acquire);
+
+    if (state & CENTREE_RESTRUCTURING) {
+      futex_wait(&centree_phase_state, state);
+      continue;
+    }
+    if (atomic_compare_exchange_weak_explicit(
+            &centree_phase_state, &state,
+            state | CENTREE_RESTRUCTURING, memory_order_acq_rel,
+            memory_order_acquire))
+      break;
+  }
+
+  for (;;) {
+    int state = atomic_load_explicit(&centree_phase_state,
+                                     memory_order_acquire);
+
+    if ((state & CENTREE_SPLIT_COUNT_MASK) == 0)
+      return;
+    futex_wait(&centree_phase_state, state);
+  }
+}
+
+static void restructuring_phase_exit(void) {
+  int old = atomic_exchange_explicit(&centree_phase_state, 0,
+                                     memory_order_acq_rel);
+
+  assert(old == CENTREE_RESTRUCTURING);
+  futex_wake(&centree_phase_state, INT_MAX);
+}
+
+void tnt_set_rebalance_precommit_test_hook(void (*hook)(void)) {
+  rebalance_precommit_test_hook = hook;
+}
+
+void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void)) {
+  rebalance_postpublish_test_hook = hook;
 }
 
 void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
@@ -718,7 +785,7 @@ int tnt_get_nodes_at_level(int level, background_queue *q) {
 void tnt_subtree_update_key(uint64_t old_key, uint64_t new_key) {
   centree t = centree_root;
   centree_node n = t->root;
-  R_LOCK(&centree_root_lock);
+  W_LOCK(&centree_root_lock);
 
   while (n != NULL) {
     struct slab *s = n->value.slab;
@@ -726,13 +793,10 @@ void tnt_subtree_update_key(uint64_t old_key, uint64_t new_key) {
     W_LOCK(&s->tree_lock);
     comp_result = tnt_pointer_cmp((void *)old_key, n->key);
     if (comp_result == 0) {
-      /* (we rely on x86 strong memory model)
-       * holding a wlock is not needed.
-       * the key(pivot) is automatically set if aligned properly */
       n->key = (void *)new_key;
 
       W_UNLOCK(&s->tree_lock);
-      R_UNLOCK(&centree_root_lock);
+      W_UNLOCK(&centree_root_lock);
       return;
     } else if (comp_result < 0) {
       n = centree_current_left(t, n);
@@ -742,7 +806,7 @@ void tnt_subtree_update_key(uint64_t old_key, uint64_t new_key) {
     }
     W_UNLOCK(&s->tree_lock);
   }
-  R_UNLOCK(&centree_root_lock);
+  W_UNLOCK(&centree_root_lock);
 }
 
 static __thread int try = 0;
@@ -890,7 +954,7 @@ void centree_init(void) {
   fsst_queue = malloc(sizeof(background_queue));
   init_queue(gc_queue);
   init_queue(fsst_queue);
-  INIT_LOCK(&centree_topology_gate, NULL);
+  atomic_init(&centree_phase_state, 0);
   INIT_LOCK(&centree_root_lock, NULL);
   INIT_LOCK(&gc_lock, NULL);
   INIT_LOCK(&fsst_lock, NULL);
@@ -906,13 +970,13 @@ void tnt_print(void) {
 }
 
 int tnt_rebalancing(void) {
+  struct centree_balance_plan *plan = NULL;
   int result;
 
   if (centree_root == NULL)
     return -EINVAL;
 
-  W_LOCK(&centree_topology_gate);
-  W_LOCK(&centree_root_lock);
+  restructuring_phase_enter();
 
   if (centree_root->root == NULL) {
     result = TNT_REBALANCE_NOOP;
@@ -920,15 +984,24 @@ int tnt_rebalancing(void) {
     bool topology_noop =
         centree_current_left(centree_root, centree_root->root) == NULL &&
         centree_current_right(centree_root, centree_root->root) == NULL;
-    int error = centree_balance(centree_root);
+    int error = centree_balance_prepare(centree_root, &plan);
 
-    if (error != 0)
+    if (error != 0) {
       result = -error;
-    else
+    } else {
+      if (rebalance_precommit_test_hook != NULL)
+        rebalance_precommit_test_hook();
+
+      W_LOCK(&centree_root_lock);
+      centree_balance_publish(plan);
+      W_UNLOCK(&centree_root_lock);
+      if (rebalance_postpublish_test_hook != NULL)
+        rebalance_postpublish_test_hook();
+      centree_balance_complete(plan);
       result = topology_noop ? TNT_REBALANCE_NOOP : TNT_REBALANCE_SUCCESS;
+    }
   }
 
-  W_UNLOCK(&centree_root_lock);
-  W_UNLOCK(&centree_topology_gate);
+  restructuring_phase_exit();
   return result;
 }

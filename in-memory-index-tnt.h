@@ -21,9 +21,9 @@ index_entry_t *subtree_worker_lookup_ukey(subtree_t *tree, uint64_t key);
 int subtree_worker_delete(subtree_t *tree, void *item);
 
 void centree_init(void);
-/* Split callers must not already hold centree_root_lock. */
-void tnt_topology_split_lock(void);
-void tnt_topology_split_unlock(void);
+/* Split/restructure phase exclusion; these do not guard topology pointers. */
+void tnt_split_phase_enter(void);
+void tnt_split_phase_exit(void);
 struct tree_entry *tnt_worker_lookup(int worker_id, void *item);
 
 int tnt_centree_node_is_child (centree_node n);
@@ -67,10 +67,14 @@ enum tnt_rebalance_status {
 
 /*
  * Safe while client operations are running. The caller must not hold a slab
- * lock, centree_root_lock, or centree_topology_gate. Returns a status above or
- * a negative errno value.
+ * lock or centree_root_lock. Returns a status above or a negative errno value.
  */
 int tnt_rebalancing(void);
+
+/* Test-only hook: runs after RCU preparation and before the commit lock. */
+void tnt_set_rebalance_precommit_test_hook(void (*hook)(void));
+/* Test-only hook: runs after publication/root unlock and before RCU cleanup. */
+void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void));
 
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);

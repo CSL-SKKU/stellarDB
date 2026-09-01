@@ -36,12 +36,21 @@ static _Atomic uint64_t read_tombstones;
 static _Atomic uint64_t delete_nontombstones;
 static _Atomic bool split_hook_reached;
 static _Atomic bool split_hook_release;
+static _Atomic bool rebalance_hook_reached;
+static _Atomic bool rebalance_hook_release;
+static _Atomic bool rebalance_postpublish_hook_reached;
+static _Atomic bool rebalance_postpublish_hook_release;
 static centree_node paused_split_parent;
 static centree_node paused_left_child;
 
 struct rebalance_thread_state {
   _Atomic bool started;
   int status;
+};
+
+struct split_phase_state {
+  _Atomic bool started;
+  _Atomic bool acquired;
 };
 
 struct concurrent_client_state {
@@ -300,11 +309,36 @@ static void split_midpoint_test_hook(struct slab *parent_slab) {
     sched_yield();
 }
 
+static void rebalance_precommit_test_hook(void) {
+  atomic_store_explicit(&rebalance_hook_reached, true, memory_order_release);
+  while (!atomic_load_explicit(&rebalance_hook_release,
+                               memory_order_acquire))
+    sched_yield();
+}
+
+static void rebalance_postpublish_test_hook(void) {
+  atomic_store_explicit(&rebalance_postpublish_hook_reached, true,
+                        memory_order_release);
+  while (!atomic_load_explicit(&rebalance_postpublish_hook_release,
+                               memory_order_acquire))
+    sched_yield();
+}
+
 static void *rebalance_thread_main(void *opaque) {
   struct rebalance_thread_state *state = opaque;
 
   atomic_store_explicit(&state->started, true, memory_order_release);
   state->status = tnt_rebalancing();
+  return NULL;
+}
+
+static void *split_phase_main(void *opaque) {
+  struct split_phase_state *state = opaque;
+
+  atomic_store_explicit(&state->started, true, memory_order_release);
+  tnt_split_phase_enter();
+  atomic_store_explicit(&state->acquired, true, memory_order_release);
+  tnt_split_phase_exit();
   return NULL;
 }
 
@@ -515,11 +549,13 @@ static int timed_join(pthread_t thread, long timeout_milliseconds) {
 static void run_mid_split_rebalance_test(void) {
   struct test_request *split_request;
   struct rebalance_thread_state rebalance_state = {0};
+  struct split_phase_state late_split = {0};
   struct concurrent_client_state clients[2] = {
       {.writer = false},
       {.writer = true},
   };
   pthread_t rebalance_thread;
+  pthread_t late_split_thread;
   pthread_t client_threads[2];
   centree_node parent_lu_parent;
   centree_node left_lu_parent;
@@ -527,6 +563,14 @@ static void run_mid_split_rebalance_test(void) {
 
   atomic_store_explicit(&split_hook_reached, false, memory_order_relaxed);
   atomic_store_explicit(&split_hook_release, false, memory_order_relaxed);
+  atomic_store_explicit(&rebalance_hook_reached, false,
+                        memory_order_relaxed);
+  atomic_store_explicit(&rebalance_hook_release, false,
+                        memory_order_relaxed);
+  atomic_store_explicit(&rebalance_postpublish_hook_reached, false,
+                        memory_order_relaxed);
+  atomic_store_explicit(&rebalance_postpublish_hook_release, false,
+                        memory_order_relaxed);
   paused_split_parent = NULL;
   paused_left_child = NULL;
 
@@ -534,6 +578,8 @@ static void run_mid_split_rebalance_test(void) {
     (void)run_and_wait(TEST_UPSERT, key, key);
 
   slab_set_split_midpoint_test_hook(split_midpoint_test_hook);
+  tnt_set_rebalance_precommit_test_hook(rebalance_precommit_test_hook);
+  tnt_set_rebalance_postpublish_test_hook(rebalance_postpublish_test_hook);
   split_request = submit_request(TEST_UPSERT, 64, 64);
   TEST_CHECK(wait_for_flag(&split_hook_reached, REQUEST_TIMEOUT_SECONDS));
   TEST_CHECK(paused_split_parent != NULL && paused_left_child != NULL);
@@ -552,16 +598,46 @@ static void run_mid_split_rebalance_test(void) {
                             &rebalance_state) == 0);
   TEST_CHECK(wait_for_flag(&rebalance_state.started, REQUEST_TIMEOUT_SECONDS));
 
-  /* The writer must remain blocked while the split holds the gate in read mode. */
+  /* Restructuring must remain blocked while a split phase is active. */
   TEST_CHECK(timed_join(rebalance_thread, 1000) == ETIMEDOUT);
   TEST_CHECK(tnt_routing_right(paused_split_parent) == NULL);
   TEST_CHECK(atomic_load_explicit(&paused_split_parent->child_flag,
                                   memory_order_acquire) == 0);
 
+  /* Once restructuring is queued, a later split must not barge ahead. */
+  TEST_CHECK(pthread_create(&late_split_thread, NULL,
+                            split_phase_main, &late_split) == 0);
+  TEST_CHECK(wait_for_flag(&late_split.started, REQUEST_TIMEOUT_SECONDS));
+  TEST_CHECK(timed_join(late_split_thread, 1000) == ETIMEDOUT);
+  TEST_CHECK(!atomic_load_explicit(&late_split.acquired,
+                                   memory_order_acquire));
+
   atomic_store_explicit(&split_hook_release, true, memory_order_release);
   TEST_CHECK(wait_for_request(split_request));
+  TEST_CHECK(wait_for_flag(&rebalance_hook_reached,
+                           REQUEST_TIMEOUT_SECONDS));
+  TEST_CHECK(!atomic_load_explicit(&late_split.acquired,
+                                   memory_order_acquire));
+
+  /* Prepared restructuring must not hold the root write lock. */
+  expect_present_range(1, 64);
+
+  atomic_store_explicit(&rebalance_hook_release, true, memory_order_release);
+  TEST_CHECK(wait_for_flag(&rebalance_postpublish_hook_reached,
+                           REQUEST_TIMEOUT_SECONDS));
+  TEST_CHECK(!atomic_load_explicit(&late_split.acquired,
+                                   memory_order_acquire));
+
+  /* Published topology and retired-slot cleanup must not hold the root lock. */
+  expect_present_range(1, 64);
+
+  atomic_store_explicit(&rebalance_postpublish_hook_release, true,
+                        memory_order_release);
   TEST_CHECK(pthread_join(rebalance_thread, NULL) == 0);
   TEST_CHECK(rebalance_state.status == TNT_REBALANCE_SUCCESS);
+  TEST_CHECK(pthread_join(late_split_thread, NULL) == 0);
+  TEST_CHECK(atomic_load_explicit(&late_split.acquired,
+                                  memory_order_acquire));
 
   for (size_t i = 0; i < 2; i++)
     atomic_store_explicit(&clients[i].stop, true, memory_order_release);
@@ -570,6 +646,8 @@ static void run_mid_split_rebalance_test(void) {
     TEST_CHECK(clients[i].operations != 0);
   }
   slab_set_split_midpoint_test_hook(NULL);
+  tnt_set_rebalance_precommit_test_hook(NULL);
+  tnt_set_rebalance_postpublish_test_hook(NULL);
 
   TEST_CHECK(atomic_load_explicit(&paused_split_parent->child_flag,
                                   memory_order_acquire) == 1);

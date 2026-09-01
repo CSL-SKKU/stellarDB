@@ -244,20 +244,20 @@ struct slab *close_and_create_slab(struct slab *s) {
   uint64_t range_min;
   uint64_t range_max;
 
-  tnt_topology_split_lock();
+  tnt_split_phase_enter();
   R_LOCK(&s->tree_lock);
   range_min = __atomic_load_n(&s->min, __ATOMIC_ACQUIRE);
   range_max = __atomic_load_n(&s->max, __ATOMIC_ACQUIRE);
   if (range_min == (uint64_t)-1 || range_min > range_max) {
     R_UNLOCK(&s->tree_lock);
-    tnt_topology_split_unlock();
+    tnt_split_phase_exit();
     die("Cannot split slab %lu with invalid range [%lu, %lu]", s->seq,
         range_min, range_max);
   }
   new_key = range_min + (range_max - range_min) / 2;
   if (new_key == 0 || new_key == UINT64_MAX) {
     R_UNLOCK(&s->tree_lock);
-    tnt_topology_split_unlock();
+    tnt_split_phase_exit();
     die("Cannot split slab %lu with overflowing pivot %lu", s->seq, new_key);
   }
   new_level = tnt_get_centree_level(s->centree_node) + 1;
@@ -272,18 +272,18 @@ struct slab *close_and_create_slab(struct slab *s) {
   int len;
   sprintf(path, "/proc/self/fd/%d", s->fd);
   if ((len = readlink(path, spath, sizeof(spath) - 1)) < 0) {
-    tnt_topology_split_unlock();
+    tnt_split_phase_exit();
     perr("Can't find file\n");
   }
   spath[len] = 0;
   strncpy(path, spath, len);
   int suffix_len = snprintf(path + len, sizeof(path) - len, "-%lu", s->key);
   if (suffix_len < 0 || (size_t)suffix_len >= sizeof(path) - (size_t)len) {
-    tnt_topology_split_unlock();
+    tnt_split_phase_exit();
     die("Cannot append pivot to slab %lu filename", s->seq);
   }
   if (rename(spath, path) != 0) {
-    tnt_topology_split_unlock();
+    tnt_split_phase_exit();
     perr("Cannot rename slab %lu for pivot %lu", s->seq, new_key);
   }
 
@@ -291,7 +291,7 @@ struct slab *close_and_create_slab(struct slab *s) {
   run_split_midpoint_test_hook(s);
   create_and_add_split_child(new_level, new_key + 1);
   wakeup_subtree_get(s->centree_node);
-  tnt_topology_split_unlock();
+  tnt_split_phase_exit();
 
   return s;
 }

@@ -28,7 +28,8 @@ int get_nb_workers(void);
 int get_nb_distributors(void);
 /*
  * One-second average non-wait time for each worker pool, in [0, 100].
- * A pool reports zero until its workers have completed their first window.
+ * Workers contribute zero before their first sample and after an idle sample
+ * has aged out.
  */
 unsigned int get_distributor_utilization(void);
 unsigned int get_io_worker_utilization(void);

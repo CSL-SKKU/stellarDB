@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #define RCU_NO_PHASE (-1)
+#define RCU_DEFERRED_PHASE (-2)
 
 #if defined(__x86_64__) || defined(__i386__)
 #define cpu_relax() __asm__ __volatile__("pause" ::: "memory")
@@ -396,7 +397,7 @@ rcu_writer_abort(
 
 
 void
-rcu_writer_publish(
+rcu_writer_publish_deferred(
     struct rcu_ctx *ctx,
     struct rcu_writer *writer,
     rcu_callback_t callback,
@@ -411,6 +412,16 @@ rcu_writer_publish(
     ctx->payload = payload;
 
     /*
+     * Keep readers from claiming cleanup before the external publication
+     * lock has been released. A reader racing with the epoch change can only
+     * observe this sentinel and leave cleanup to finish_deferred().
+     */
+    __atomic_store_n(
+        &ctx->pending_phase,
+        RCU_DEFERRED_PHASE,
+        __ATOMIC_SEQ_CST);
+
+    /*
      * Linearization point.
      *
      * Readers entering after this point use new_phase.
@@ -419,6 +430,23 @@ rcu_writer_publish(
         &ctx->epoch,
         writer->new_epoch,
         __ATOMIC_SEQ_CST);
+
+    /* writer remains live until rcu_writer_finish_deferred(). */
+}
+
+
+void
+rcu_writer_finish_deferred(
+    struct rcu_ctx *ctx,
+    struct rcu_writer *writer)
+{
+    assert(writer->ctx == ctx);
+    assert(__atomic_load_n(
+               &ctx->writer_busy,
+               __ATOMIC_SEQ_CST));
+    assert(__atomic_load_n(
+               &ctx->pending_phase,
+               __ATOMIC_SEQ_CST) == RCU_DEFERRED_PHASE);
 
     /*
      * Old generation is now draining.
@@ -445,4 +473,16 @@ rcu_writer_publish(
         writer->old_phase);
 
     writer->ctx = NULL;
+}
+
+
+void
+rcu_writer_publish(
+    struct rcu_ctx *ctx,
+    struct rcu_writer *writer,
+    rcu_callback_t callback,
+    void *payload)
+{
+    rcu_writer_publish_deferred(ctx, writer, callback, payload);
+    rcu_writer_finish_deferred(ctx, writer);
 }
