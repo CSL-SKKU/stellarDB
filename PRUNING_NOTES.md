@@ -310,3 +310,80 @@ disagreements).
 
 The file-count assertion first reported three extra files. That was `check_prune_link()`, which
 deliberately stops mid-prune and did not retire its triple; it now retires at the end.
+
+## Step 9 — scheduling, config, and what the end-to-end run found
+
+- `tnt_prune_once()` does a whole prune under `tnt_maintenance_lock()`: select, build, freeze,
+  link, splice, retire. Selection runs inside the lock, so a candidate cannot go stale before its
+  leaf is frozen. Returns `TNT_PRUNE_DONE`, `TNT_PRUNE_NOOP`, or a negative errno;
+  `-EAGAIN`/`-EBUSY`/`-ENOSPC` mean the candidate was dropped with nothing changed and are normal
+  races, not failures.
+- The existing restructuring worker runs it, one prune per wake-up, after the rebalance check.
+  One thread for both maintenance operations means they exclude each other by construction; the
+  mutex remains for `main.c` and the tests. `main.c` now starts that worker when either
+  `--with-rebal` or `--with-prune` is given.
+- Config: `-p/--with-prune`, `--prune-margin <slots>` (slack kept free in the merged slab) and
+  `--prune-min-age <slabs>` (skip a triple whose leaf is among the newest N slabs, so the pruner
+  stays off the slab the writes are landing in). `slab_create_sequence()` provides the age.
+- `test/run_delete_tests.sh` keeps its own object list and needed `indexes/tnt_prune.o` added.
+
+### A bug of mine, found only by the end-to-end run
+
+Step 6 sized N's buffer from the *selection bound* (`cold_bound + nb_items`) and derived the freeze
+budget from what was left of it. But `slab_freeze()` can only count **slots ever reserved**
+(`last_item`), which is ≥ the valid count. So for the most attractive candidates -- the ones whose
+internal slabs are 100% stale, `cold_bound == 0` -- the budget was exactly the leaf's valid count
+and any leaf with a single invalidated entry was rejected with `-ENOSPC`, silently. Every prune in
+a uniform benchmark was being dropped.
+
+The plan's `budget = nb_max_items - cold_count` is what avoids this, so N's buffer now covers a
+whole slab. To keep that cheap it is `mmap`ed rather than `malloc`ed + `memset`: page-aligned for
+O_DIRECT, reads as zeroes (`item_is_empty`), and a page that never receives a record is never
+faulted in. After the fix the same benchmark does 24 background prunes.
+
+None of the unit or single-prune tests could have caught this: they all had `cold_bound > 0`,
+which happens to leave exactly enough slack.
+
+### Where pruning does and does not fire
+
+`ycsb_a_uniform`, 20k keys, 1M requests, reinsertion + rebalancing + pruning on: **24 prunes**,
+no faults, and one prune consumed a node an earlier prune had produced (`Prune: 76 <- 64/71/54`),
+which is the "repeated prunes up the chain" case.
+
+`ycsb_a_zipfian`, same shape: **0 prunes**, and the instrumentation says why -- 8 of 16 leaves had
+a historically adjacent triple, and *all* of them failed the fit test with
+`cold = 2048 of 1024 slots`, i.e. both internal slabs were 100% valid. Under a skewed workload the
+immediate history ancestors of a live leaf are young and mostly still authoritative, so there is
+nothing to reclaim. That is the rule working as specified (AGENTS.md: "works effectively well when
+history is skewed, but may struggle to find candidates if the history chain is well balanced"),
+not a defect -- but it does mean pruning reclaims little under zipfian traffic.
+
+### The trigger inherited from the rebalancer
+
+The restructuring worker only runs when `distributor utilization >= 80% && I/O worker utilization
+<= 50%`. In the benchmark above the I/O workers sit at ~99%, so with the default thresholds the
+gate never opens and **no background prune fires at all** (the 24 prunes above needed
+`make DISTRIBUTOR_HIGH_UTIL=0 IO_WORKER_LOW_UTIL=100`). That gate is a sensible policy for
+rebalancing, which trades index depth against CPU, but pruning is about space, and space pressure
+is unrelated to how busy the I/O workers are. Worth revisiting; left as the plan specifies.
+
+### A pre-existing bug that pruning exposed
+
+One stress run died in the pruner with `slab 129 slot 188 not holding indexed key 11272` -- the
+local index and the file disagreed about a slot. It is not pruning's doing:
+
+- `fsst.c` sets `cb->fsst_slab = s` and `cb->fsst_idx = slot_idx` (the **source** slot) *before*
+  calling `centree_lookup_and_reserve()`.
+- `slabworker.c`'s UPSERT case corrects those fields from the entry it found, but only
+  `if (e && callback->fsst_slab == NULL)` -- and the reinsertion worker calls
+  `remove_and_add_item_async()` directly anyway.
+- `remove_and_add_item_async()`'s in-place branch (`slab_idx == -1`) does
+  `callback->slab_idx = callback->fsst_idx`, so the record is written into the **destination**
+  slab at the **source's** slot index, overwriting whatever record that slot held.
+
+It needs a key that reinsertion is copying forward to already exist in the current leaf, which is
+why it is rare (once in ~6 runs with `-r`). This is very likely the defect AGENTS.md records as
+"background reinsertions can silently drop real-upserts ... We'll leave this bug intentionally", so
+it is reported, not fixed. The pruner now skips such a slot with a warning and keeps the database
+running instead of dying; `prune_bad_slot_count()` counts them. The key was already lost when the
+slot was overwritten.

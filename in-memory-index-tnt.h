@@ -212,6 +212,26 @@ void prune_splice_routing(const struct prune_candidate *c,
  */
 void prune_retire(const struct prune_candidate *c);
 
+enum tnt_prune_status {
+  TNT_PRUNE_DONE = 0,
+  TNT_PRUNE_NOOP = 1, /* nothing was prunable */
+};
+
+/*
+ * One prune, start to finish, under tnt_maintenance_lock(): select, build,
+ * freeze, link, splice, retire. Returns a status above or a negative errno.
+ * -EAGAIN/-EBUSY/-ENOSPC mean the candidate was dropped with nothing changed;
+ * they are normal races, not failures. Safe while clients are running, but
+ * only one caller at a time is intended.
+ */
+int tnt_prune_once(void);
+
+/*
+ * Slots the pruner found holding a record other than the one the local index
+ * named. Not caused by pruning; see the comment in prune_build_add_source().
+ */
+uint64_t prune_bad_slot_count(void);
+
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);
 int bgq_count(enum fsst_mode m);

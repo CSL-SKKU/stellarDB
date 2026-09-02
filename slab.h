@@ -162,6 +162,8 @@ void slab_retire(struct slab *s);
  */
 void slab_release_if_idle(struct slab *s);
 
+uint64_t slab_create_sequence(void);
+
 /* A fresh slab file, or (rebuild != 0) a descriptor over an existing one. */
 struct slab *create_slab(struct slab_context *ctx, uint64_t level, uint64_t key,
                          int rebuild, char *name);

@@ -33,9 +33,6 @@
 #include <errno.h>
 #include <stdbool.h>
 
-/* Slack kept free in the merged slab. Step 9 makes this configurable. */
-static size_t prune_fit_margin;
-
 static bool retired(centree_node n) {
   return atomic_load_explicit(&n->removed, memory_order_acquire) != 0;
 }
@@ -102,7 +99,16 @@ bool prune_select(centree_node leaf, struct prune_candidate *out) {
    * count actually copied.
    */
   cold_bound = is->nb_items + os->nb_items;
-  if (cold_bound + ls->nb_items + prune_fit_margin > ls->nb_max_items)
+  if (cold_bound + ls->nb_items + cfg.prune_margin > ls->nb_max_items)
+    return false;
+
+  /*
+   * A leaf that was created a moment ago is where the writes are going, and
+   * it is attractive to the fit test precisely because it is still nearly
+   * empty. Skipping the newest slabs keeps the pruner off the hot spot.
+   */
+  if (cfg.prune_min_age &&
+      slab_create_sequence() - ls->seq < cfg.prune_min_age)
     return false;
 
   out->leaf = leaf;
@@ -210,6 +216,9 @@ size_t prune_count_candidates(void) {
  * of its slot, and copying the slot keeps it intact.
  * ===================================================================== */
 
+/* Slots whose record did not match the index; see prune_build_add_source(). */
+static uint64_t prune_bad_slots;
+
 struct prune_src_entry {
   uint64_t key;
   uint32_t slot;
@@ -259,9 +268,18 @@ static size_t pages_for(struct slab *n, size_t slots) {
   return (slots + items_per_page - 1) / items_per_page;
 }
 
+/* The buffer's own size; kept as a function so discard can run any time. */
+static size_t pages_for_capacity(struct prune_build *b) {
+  size_t pages;
+
+  if (b->slab == NULL || b->capacity == 0)
+    return 1;
+  pages = pages_for(b->slab, b->capacity);
+  return pages ? pages : 1;
+}
+
 int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
                       struct prune_build *out) {
-  struct slab *leaf_slab = c->leaf->value.slab;
   uint64_t level = atomic_load_explicit(&pivot_from->value.level,
                                         memory_order_acquire);
   uint64_t pivot = centree_pivot_load(pivot_from);
@@ -270,15 +288,6 @@ int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
 
   memset(out, 0, sizeof(*out));
   out->dirty_lo = (size_t)-1;
-
-  /*
-   * Room for what selection said could survive. The freeze budget in the
-   * next step is derived from what is left of this, so the buffer size is
-   * also the hard cap on the merged slab.
-   */
-  out->capacity = c->cold_bound + leaf_slab->nb_items + prune_fit_margin;
-  if (out->capacity > leaf_slab->nb_max_items)
-    out->capacity = leaf_slab->nb_max_items;
 
   /* N routes exactly as pivot_from did. */
   out->slab = create_slab(NULL, level, pivot, 0, NULL);
@@ -290,16 +299,26 @@ int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
   out->slab->subtree = tnt_subtree_create();
   subtree_set_slab(out->slab->subtree, out->slab);
 
+  /*
+   * A whole slab's worth of slots. The freeze budget is what is left of this
+   * after the cold part, so anything less would reject a leaf whose *valid*
+   * entries fit but which has reserved more slots than that -- and slots are
+   * what slab_freeze() can count.
+   *
+   * mmap, not malloc: the mapping is page-aligned for O_DIRECT and reads as
+   * zeroes (item_is_empty) without touching a page that never gets a record.
+   */
+  out->capacity = out->slab->nb_max_items;
   pages = pages_for(out->slab, out->capacity);
   if (pages == 0)
     pages = 1;
-  out->buffer = aligned_alloc(PAGE_SIZE, pages * PAGE_SIZE);
-  if (out->buffer == NULL) {
+  out->buffer = mmap(NULL, pages * PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (out->buffer == MAP_FAILED) {
+    out->buffer = NULL;
     prune_build_discard(out);
     return -ENOMEM;
   }
-  /* Unused slots stay zeroed, which is what item_is_empty() reads. */
-  memset(out->buffer, 0, pages * PAGE_SIZE);
 
   out->pivot_from = pivot_from;
   value.key = pivot;
@@ -407,9 +426,24 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
     record = page + (slot % items_per_page) * src->item_size;
     meta = (struct item_metadata *)record;
     if (item_is_legacy(meta) || item_is_empty(meta) ||
-        *(uint64_t *)(record + sizeof(*meta)) != key)
-      die("Pruning found slab %lu slot %lu not holding indexed key %lu\n",
-          src->seq, slot, key);
+        *(uint64_t *)(record + sizeof(*meta)) != key) {
+      /*
+       * The local index and the file disagree about this slot, so there is
+       * nothing here worth carrying over. It is not the pruner's doing:
+       * reinsertion can write a record into a live slab at the *source's*
+       * slot index (fsst.c leaves cb->fsst_idx pointing at the source, which
+       * suppresses the correction in slabworker.c's UPSERT case), which
+       * overwrites whatever record that slot held. Skipping keeps the
+       * database running; the key was already lost when the slot was
+       * overwritten.
+       */
+      if (__sync_fetch_and_add(&prune_bad_slots, 1) < 8)
+        fprintf(stderr,
+                "Pruning: slab %lu slot %lu does not hold indexed key %lu; "
+                "skipping it\n",
+                src->seq, slot, key);
+      continue;
+    }
 
     memcpy(slot_in_buffer(b, dst), record, n->item_size);
     mark_dirty(b, dst);
@@ -501,7 +535,8 @@ void prune_build_discard(struct prune_build *b) {
   }
   /* Unpublished, so unlike a live node this one may be freed (I-4). */
   free(b->node);
-  free(b->buffer);
+  if (b->buffer != NULL)
+    munmap(b->buffer, pages_for_capacity(b) * PAGE_SIZE);
   memset(b, 0, sizeof(*b));
 }
 
@@ -718,4 +753,43 @@ void prune_retire(const struct prune_candidate *c) {
   slab_retire(c->leaf->value.slab);
   slab_retire(c->inner->value.slab);
   slab_retire(c->outer->value.slab);
+}
+
+/* ===================================================================== *
+ * One whole prune
+ * ===================================================================== */
+
+uint64_t prune_bad_slot_count(void) {
+  return __sync_fetch_and_or(&prune_bad_slots, 0);
+}
+
+int tnt_prune_once(void) {
+  struct prune_candidate c;
+  struct prune_build b;
+  int error;
+
+  if (tnt_centree() == NULL)
+    return -EINVAL;
+
+  /*
+   * Selection runs under the same lock as the rest, so the candidate cannot
+   * go stale between picking it and freezing its leaf.
+   */
+  tnt_maintenance_lock();
+  if (!prune_scan_for_candidate(&c)) {
+    tnt_maintenance_unlock();
+    return TNT_PRUNE_NOOP;
+  }
+  error = prune_freeze_and_link(&c, &b);
+  if (!error) {
+    prune_splice_routing(&c, &b);
+    prune_retire(&c);
+  }
+  tnt_maintenance_unlock();
+
+  if (error)
+    return error;
+  printf("Prune: %lu <- %lu/%lu/%lu\n", b.slab->seq, c.outer->value.slab->seq,
+         c.leaf->value.slab->seq, c.inner->value.slab->seq);
+  return TNT_PRUNE_DONE;
 }

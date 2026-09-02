@@ -21,6 +21,9 @@ static void print_help(char *n) {
   puts("  -e, --epoch <number>            set EPOCH");
   puts("  -r, --with-reins                enable reinsertion logic");
   puts("  -R, --with-rebal                enable rebalancing logic");
+  puts("  -p, --with-prune                enable pruning logic");
+  puts("      --prune-margin <slots>      slots kept free in a merged slab");
+  puts("      --prune-min-age <slabs>     skip triples whose leaf is newer than this");
   puts("  -n, --items <number>            set number of items in DB");
   puts("  -q, --requests <number>         set number of requests");
   puts("  -c, --chunk <number>            chunk size for shuffling");
@@ -42,6 +45,9 @@ int main(int argc, char **argv) {
         {"epoch",           required_argument, 0, 'e'},
         {"with-reins",      no_argument,       0, 'r'},
         {"with-rebal",      no_argument,       0, 'R'},
+        {"with-prune",      no_argument,       0, 'p'},
+        {"prune-margin",    required_argument, 0, 1000},
+        {"prune-min-age",   required_argument, 0, 1001},
         {"items",           required_argument, 0, 'n'},
         {"requests",        required_argument, 0, 'q'},
         {"chunk",           required_argument, 0, 'c'},
@@ -50,7 +56,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:rRn:q:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:rRpn:q:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'P': cfg.page_cache_size = strtoul(optarg, NULL, 0); break;
         case 'b': cfg.bench           = parse_bench(optarg);     break;
@@ -62,6 +68,9 @@ int main(int argc, char **argv) {
         case 'e': cfg.epoch           = strtoul(optarg, NULL, 0); break;
         case 'r': cfg.with_reins      = 1;                       break;
         case 'R': cfg.with_rebal      = 1;                       break;
+        case 'p': cfg.with_prune      = 1;                       break;
+        case 1000: cfg.prune_margin   = strtoul(optarg, NULL, 0); break;
+        case 1001: cfg.prune_min_age  = strtoul(optarg, NULL, 0); break;
         case 'n': cfg.nb_items_in_db  = strtoull(optarg, NULL, 0); break;
         case 'q': cfg.nb_requests     = strtoull(optarg, NULL, 0); break;
         case 'c': cfg.chunk_for_shuffle = strtoull(optarg, NULL, 0); break;
@@ -117,6 +126,10 @@ int main(int argc, char **argv) {
   printf("# \tChunk for shuffling: %lu\n", cfg.chunk_for_shuffle);
   printf("# \tReinsertion: %s\n", cfg.with_reins ? "enabled" : "disabled");
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
+  printf("# \tPruning: %s\n", cfg.with_prune ? "enabled" : "disabled");
+  if (cfg.with_prune)
+    printf("# \tPruning: margin %lu slots, minimum leaf age %lu slabs\n",
+           cfg.prune_margin, cfg.prune_min_age);
   if (cfg.with_rebal) {
     printf("# \tRebalancing thresholds: distributor >= %u%%, "
            "I/O worker <= %u%%, depth > log2(nodes) * %.2f\n",
@@ -172,7 +185,6 @@ int main(int argc, char **argv) {
 
   if (cfg.with_rebal) {
     int rebalance_status;
-    int worker_status;
 
     start_timer {
       rebalance_status = tnt_rebalancing();
@@ -182,8 +194,12 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Rebalancing failed: %s\n", strerror(-rebalance_status));
     else if (rebalance_status == TNT_REBALANCE_NOOP)
       puts("Rebalancing was not needed");
+  }
 
-    worker_status = restructuring_worker_init();
+  /* One thread runs both maintenance operations, so they exclude each other. */
+  if (cfg.with_rebal || cfg.with_prune) {
+    int worker_status = restructuring_worker_init();
+
     if (worker_status < 0)
       fprintf(stderr, "Cannot start restructuring worker: %s\n",
               strerror(-worker_status));

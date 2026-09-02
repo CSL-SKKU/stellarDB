@@ -16,6 +16,11 @@ struct runtime_config {
     unsigned long      epoch;
     int                with_reins;
     int                with_rebal;
+    int                with_prune;
+    /* Slots kept free in a merged slab. */
+    unsigned long      prune_margin;
+    /* Skip a triple whose leaf is among the newest N slabs (0: no minimum). */
+    unsigned long      prune_min_age;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;

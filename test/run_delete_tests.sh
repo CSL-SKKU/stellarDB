@@ -15,7 +15,7 @@ OBJS=(config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o
       workload-bgwork.o workload-production.o workload-locality.o
       workload-latency.o utils.o rcu.o in-memory-index-tnt.o fsst.o db_bench.o
       indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o
-      indexes/tnt_subtree.o indexes/tnt_balance.o)
+      indexes/tnt_subtree.o indexes/tnt_balance.o indexes/tnt_prune.o)
 
 make -j"$(nproc)" >/dev/null || exit 1
 

@@ -578,7 +578,7 @@ static void *worker_restructuring_init(void *pdata) {
     restructuring_requested = 0;
     pthread_mutex_unlock(&restructuring_lock);
 
-    while (restructuring_utilization_thresholds_met() &&
+    while (cfg.with_rebal && restructuring_utilization_thresholds_met() &&
            tnt_rebalancing_needed()) {
       int status = tnt_rebalancing();
 
@@ -587,6 +587,19 @@ static void *worker_restructuring_init(void *pdata) {
       fprintf(stderr, "Background rebalancing failed: %s; retrying\n",
               strerror(-status));
       sleep(1);
+    }
+
+    /*
+     * One prune per wake-up. Both maintenance operations run on this thread,
+     * which is what keeps them exclusive; the mutex is there for the callers
+     * in main.c and the tests.
+     */
+    if (cfg.with_prune && restructuring_utilization_thresholds_met()) {
+      int status = tnt_prune_once();
+
+      if (status < 0 && status != -EAGAIN && status != -EBUSY &&
+          status != -ENOSPC)
+        fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
     }
   }
 

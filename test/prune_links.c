@@ -19,6 +19,7 @@
  */
 #include "headers.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <linux/futex.h>
 #include <stdbool.h>
@@ -979,27 +980,41 @@ static void check_prune_link(void) {
   /* N is live now: the build must not be discarded. */
 }
 
+static int prune_one(void);
+
+/* The two config knobs must be able to hold the pruner off. */
+static void check_prune_config(void) {
+  size_t nodes = tnt_get_node_count();
+
+  check(prune_count_candidates() > 0, "nothing is prunable to begin with");
+
+  cfg.prune_margin = 1u << 30;
+  check(prune_count_candidates() == 0, "prune_margin did not reject anything");
+  check(tnt_prune_once() == TNT_PRUNE_NOOP, "a prune slipped past the margin");
+  cfg.prune_margin = 0;
+
+  cfg.prune_min_age = 1u << 30;
+  check(prune_count_candidates() == 0, "prune_min_age did not reject anything");
+  check(tnt_prune_once() == TNT_PRUNE_NOOP, "a prune slipped past the min age");
+  cfg.prune_min_age = 0;
+
+  check(tnt_get_node_count() == nodes, "a rejected prune changed the tree");
+  check(prune_count_candidates() > 0, "the knobs did not come back");
+  printf("  %-34s margin and min-age both hold it off\n", "prune config");
+}
+
 /* Prune until nothing is prunable any more. */
 static void check_prune_all(void) {
   size_t done = 0;
 
   for (;;) {
-    struct prune_candidate c;
-    struct prune_build b;
-    int error;
+    int r = prune_one();
 
-    if (!prune_scan_for_candidate(&c)) break;
-    tnt_maintenance_lock();
-    error = prune_freeze_and_link(&c, &b);
-    if (!error) {
-      prune_splice_routing(&c, &b);
-      prune_retire(&c);
-    }
-    tnt_maintenance_unlock();
-    if (error) {
+    if (r == 0) break;
+    if (r < 0) {
       /* Nothing changed, and the scan would hand back the same candidate. */
-      printf("  %-34s stopped at %d after %zu prunes\n", "prune sweep", error,
-             done);
+      printf("  %-34s a candidate was dropped after %zu prunes\n",
+             "prune sweep", done);
       break;
     }
     if (++done > 500) break;
@@ -1261,20 +1276,15 @@ static void queue_for_reinsertion(unsigned *seed) {
   }
 }
 
+/* The production entry point: 1 pruned, 0 nothing to do, -1 dropped. */
 static int prune_one(void) {
-  struct prune_candidate c;
-  struct prune_build b;
-  int error;
+  int status = tnt_prune_once();
 
-  if (!prune_scan_for_candidate(&c)) return 0;
-  tnt_maintenance_lock();
-  error = prune_freeze_and_link(&c, &b);
-  if (!error) {
-    prune_splice_routing(&c, &b);
-    prune_retire(&c);
-  }
-  tnt_maintenance_unlock();
-  return error ? -1 : 1;
+  if (status == TNT_PRUNE_DONE) return 1;
+  if (status == TNT_PRUNE_NOOP) return 0;
+  check(status == -EAGAIN || status == -EBUSY || status == -ENOSPC,
+        "tnt_prune_once() failed with %d", status);
+  return -1;
 }
 
 static void check_concurrent_prune(void) {
@@ -1311,6 +1321,10 @@ static void check_concurrent_prune(void) {
 
   check(atomic_load(&stress_bad) == 0, "%zu reads disagreed with the model",
         (size_t)atomic_load(&stress_bad));
+  if (prune_bad_slot_count())
+    printf("    NOTE %lu slots held a record the index did not name "
+           "(see PRUNING_NOTES.md: reinsertion writes at the source slot)\n",
+           prune_bad_slot_count());
   check(prunes > 0, "no prune happened under load");
   check(centree_validate_locked(tnt_centree()),
         "the routing tree does not validate after the stress run");
@@ -1381,6 +1395,7 @@ int main(int argc, char **argv) {
   check_blocked_writer(nb_keys / 2 + 1);
   validate("after blocked-writer restart");
 
+  check_prune_config();
   check_prune_link();
   check_retire();
   check_prune_all();

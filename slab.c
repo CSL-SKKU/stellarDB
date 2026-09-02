@@ -58,6 +58,11 @@ void mark_page_hot(struct slab *s, size_t page_idx) {
     //     연산 전(old value)을 반환. (반환 값이 필요 없으면 쓰지 않아도 됨)
 }
 
+/* How many slabs have ever been created; slab->seq is a stamp from this. */
+uint64_t slab_create_sequence(void) {
+  return (uint64_t)__sync_fetch_and_or(&create_sequence, 0);
+}
+
 /*
  * Create a slab: a file that only contains items of a given size.
  * @callback is a callback that will be called on all previously existing items
