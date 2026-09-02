@@ -746,6 +746,11 @@ long slab_freeze(struct slab *s, size_t budget) {
   }
 }
 
+void slab_drain_updates(struct slab *s) {
+  while (__sync_fetch_and_or(&s->update_ref, 0) != 0)
+    NOP10();
+}
+
 void slab_retire(struct slab *s) {
   /*
    * The node is marked removed before this runs (the routing splice does it),

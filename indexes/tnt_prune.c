@@ -609,6 +609,14 @@ int prune_freeze_and_link(const struct prune_candidate *c,
   error = prune_build_begin(c, q, b);
   if (error)
     return error;
+  /*
+   * The two internal slabs are only immutable once every write that reserved
+   * a slot in them has completed and published: a split happens when the last
+   * slot is reserved, not when its write lands. Wait for that before taking
+   * their snapshot, exactly as the freeze waits for the leaf.
+   */
+  slab_drain_updates(c->inner->value.slab);
+  slab_drain_updates(c->outer->value.slab);
   error = prune_build_add_source(b, c->inner, 0);
   if (!error)
     error = prune_build_add_source(b, c->outer, 0);

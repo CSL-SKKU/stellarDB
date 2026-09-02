@@ -211,10 +211,40 @@ static void test_race(void) {
         froze, split);
 }
 
+static struct slab wait_slab;
+static _Atomic int wait_done;
+
+static void *wait_worker(void *arg) {
+  (void)arg;
+  slab_drain_updates(&wait_slab);
+  atomic_store(&wait_done, 1);
+  return NULL;
+}
+
+static void test_drain_updates(void) {
+  pthread_t thread;
+
+  init_slab(&wait_slab, 3);
+  __sync_fetch_and_add(&wait_slab.update_ref, 1);
+  atomic_store(&wait_done, 0);
+  pthread_create(&thread, NULL, wait_worker, NULL);
+  usleep(100000);
+  check(atomic_load(&wait_done) == 0,
+        "slab_drain_updates returned while a writer held update_ref");
+  __sync_fetch_and_sub(&wait_slab.update_ref, 1);
+  for (int i = 0; i < 2000 && !atomic_load(&wait_done); i++) usleep(1000);
+  check(atomic_load(&wait_done) == 1, "slab_drain_updates did not return");
+  pthread_join(thread, NULL);
+  /* Unlike freeze, a drain changes nothing on the slab. */
+  check(atomic_load(&wait_slab.full) == 0 && atomic_load(&wait_slab.last_item) == 3,
+        "slab_drain_updates modified the slab");
+}
+
 int main(void) {
   printf("== slab_freeze ==\n");
   test_rejects();
   test_drain();
+  test_drain_updates();
   test_race();
 
   if (failures) {

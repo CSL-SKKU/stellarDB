@@ -166,6 +166,15 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
 long slab_freeze(struct slab *s, size_t budget);
 
 /*
+ * Wait until no write holds a reference on the slab. A slab becomes internal
+ * the moment its final slot is *reserved*, but a record is published only when
+ * its page write completes, so for a short while after a split an internal
+ * slab is not yet immutable. Anyone about to treat it as immutable (the
+ * pruner, before snapshotting inner/outer) waits here first.
+ */
+void slab_drain_updates(struct slab *s);
+
+/*
  * Give up a retired slab's memory: its node must already be marked removed.
  * Frees the local index (and filter) and makes the legacy range checks reject
  * every key. The descriptor, the node and hot_bits are deliberately kept --
