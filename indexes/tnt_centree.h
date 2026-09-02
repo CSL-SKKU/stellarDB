@@ -35,20 +35,34 @@ Retrieved from: http://en.literateprograms.org/Red-black_tree_(C)?oldid=16016
 #include "memory-item.h"
 #include "../rcu.h"
 
+/*
+ * Lifetime contract until pruning/reclamation is implemented:
+ *
+ * Once published, center-tree nodes and their slab descriptors remain
+ * allocated for the lifetime of the database process. RCU protects routing
+ * generation consistency, not object reclamation. Raw node/tree_entry/slab
+ * pointers may therefore outlive a read section, but only because this
+ * no-reclamation rule is in force.
+ *
+ * Future pruning must either retain the RCU read section through the final
+ * object access, or acquire a stable object reference and retire the removed
+ * node/slab only after a grace period.
+ */
 typedef struct centree_node_t {
-  void* key;
+  _Atomic(uint64_t) key;
   tree_entry_t value;
   struct rcu_ptr left;
   struct rcu_ptr right;
   struct rcu_ptr parent;
   struct centree_node_t* lu_parent;
   _Atomic int child_flag;
-  unsigned char removed;
+  /* Advisory maintenance metadata; never used to choose a routing edge. */
+  _Atomic(unsigned char) removed;
   // unsigned char gc;
 } * centree_node;
 
 typedef struct centree_t {
-  centree_node root;
+  struct rcu_ptr root;
   struct rcu_ctx topology_rcu;
   _Atomic uint64_t depth;
   _Atomic uint64_t node_count;
@@ -58,6 +72,8 @@ typedef struct centree_t {
  * Routing-pointer access. read_* requires one surrounding
  * centree_read_in()/centree_read_out() pair. current_* is for callers that
  * already prevent topology publication (currently centree_root_lock).
+ * Keeping a returned node after read_out() relies on the lifetime contract
+ * above; it does not pin the routing generation.
  */
 static inline void centree_read_in(centree tree) {
   rcu_read_in(&tree->topology_rcu);
@@ -65,6 +81,10 @@ static inline void centree_read_in(centree tree) {
 
 static inline void centree_read_out(centree tree) {
   rcu_read_out(&tree->topology_rcu);
+}
+
+static inline centree_node centree_read_root(centree tree) {
+  return (centree_node)rcu_read_ptr(&tree->topology_rcu, &tree->root);
 }
 
 static inline centree_node centree_read_left(centree tree,
@@ -82,6 +102,10 @@ static inline centree_node centree_read_parent(centree tree,
   return (centree_node)rcu_read_ptr(&tree->topology_rcu, &node->parent);
 }
 
+static inline centree_node centree_current_root(centree tree) {
+  return (centree_node)rcu_current_ptr(&tree->topology_rcu, &tree->root);
+}
+
 static inline centree_node centree_current_left(centree tree,
                                                 centree_node node) {
   return (centree_node)rcu_current_ptr(&tree->topology_rcu, &node->left);
@@ -97,6 +121,7 @@ static inline centree_node centree_current_parent(centree tree,
   return (centree_node)rcu_current_ptr(&tree->topology_rcu, &node->parent);
 }
 
+/* Construction only: the node must not be reachable from a published root. */
 static inline void centree_node_init_links(centree_node node,
                                            centree_node left,
                                            centree_node right,
@@ -104,6 +129,14 @@ static inline void centree_node_init_links(centree_node node,
   rcu_ptr_init(&node->left, left);
   rcu_ptr_init(&node->right, right);
   rcu_ptr_init(&node->parent, parent);
+}
+
+static inline uint64_t centree_pivot_load(centree_node node) {
+  return atomic_load_explicit(&node->key, memory_order_acquire);
+}
+
+static inline void centree_pivot_store(centree_node node, uint64_t pivot) {
+  atomic_store_explicit(&node->key, pivot, memory_order_release);
 }
 
 typedef struct bgq_node_t {
@@ -123,12 +156,23 @@ typedef struct background_queue_t {
 typedef int (*compare_func)(void* left, void* right);
 int tnt_pointer_cmp(void* left, void* right);
 
+/* compare(requested_key, pivot): left for <, right for >=. */
+static inline bool centree_route_left(int comparison) {
+  return comparison < 0;
+}
+
 uint64_t centree_get_depth(centree t);
 centree centree_create();
+/* The returned entry remains allocated under the no-reclamation contract. */
 tree_entry_t* centree_lookup(centree t, void* key, compare_func compare);
 tree_entry_t* centree_traverse_useq(centree t, int seq);
-centree_node centree_insert(centree t, void* key, tree_entry_t* value,
-                            compare_func compare);
+/*
+ * Stage one insertion in writer's inactive generation. The caller owns the
+ * topology writer and prevents concurrent current-generation mutation.
+ * Publication remains the caller's responsibility.
+ */
+centree_node centree_insert(centree t, struct rcu_writer *writer, void* key,
+                            tree_entry_t* value, compare_func compare);
 // void centree_delete(centree t, void* key, compare_func compare);
 
 void centree_print(centree t);

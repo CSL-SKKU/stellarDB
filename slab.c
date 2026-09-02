@@ -169,7 +169,7 @@ int rebuild_slabs(int filenum, struct dirent **file_list) {
                   NULL, old_key);
 #endif
         if (keynum == 4) {
-          tnt_subtree_update_key(s->key, key);
+          centree_pivot_store(s->centree_node, key);
           s->key = key;
         }
         ret++;
@@ -235,7 +235,7 @@ static void create_and_add_split_child(uint64_t level, uint64_t key) {
 #if WITH_FILTER
   filter = filter_create(200000);
 #endif
-  tnt_subtree_add(child, tnt_subtree_create(), filter, key);
+  tnt_subtree_add_split(child, tnt_subtree_create(), filter, key);
 }
 
 struct slab *close_and_create_slab(struct slab *s) {
@@ -263,7 +263,7 @@ struct slab *close_and_create_slab(struct slab *s) {
   new_level = tnt_get_centree_level(s->centree_node) + 1;
   R_UNLOCK(&s->tree_lock);
 
-  tnt_subtree_update_key(s->key, new_key);
+  centree_pivot_store(s->centree_node, new_key);
 
   W_LOCK(&s->tree_lock);
   s->key = new_key;

@@ -8,7 +8,9 @@
 
 static void init_node(struct centree_node_t *node, uintptr_t key) {
   memset(node, 0, sizeof(*node));
-  node->key = (void *)key;
+  atomic_init(&node->key, key);
+  atomic_init(&node->value.level, 0);
+  atomic_init(&node->removed, 0);
   centree_node_init_links(node, NULL, NULL, NULL);
 }
 
@@ -37,13 +39,14 @@ static void test_valid_rebalance(void) {
   centree_node before[7];
   centree_node after[7];
   centree_node lu_parents[7];
-  void *keys[7];
+  uint64_t keys[7];
   uint64_t value_keys[7];
   uint64_t seqs[7];
   struct slab *slabs[7];
   size_t index = 0;
 
   rcu_init(&tree.topology_rcu);
+  rcu_ptr_init(&tree.root, NULL);
   for (size_t i = 0; i < 7; i++) {
     init_node(&nodes[i], i + 1);
     nodes[i].lu_parent = i == 0 ? &nodes[0] : &nodes[i - 1];
@@ -52,7 +55,7 @@ static void test_valid_rebalance(void) {
     nodes[i].value.level = 90 + i;
     nodes[i].value.slab = (struct slab *)(uintptr_t)(300 + i);
     lu_parents[i] = nodes[i].lu_parent;
-    keys[i] = nodes[i].key;
+    keys[i] = centree_pivot_load(&nodes[i]);
     value_keys[i] = nodes[i].value.key;
     seqs[i] = nodes[i].value.seq;
     slabs[i] = nodes[i].value.slab;
@@ -61,25 +64,25 @@ static void test_valid_rebalance(void) {
   link_children(&nodes[1], &nodes[0], &nodes[3]);
   link_children(&nodes[3], &nodes[2], &nodes[5]);
   link_children(&nodes[5], &nodes[4], &nodes[6]);
-  tree.root = &nodes[1];
+  rcu_ptr_init(&tree.root, &nodes[1]);
   atomic_store(&tree.depth, 99);
 
   assert(centree_validate_locked(&tree));
-  collect_inorder(&tree, tree.root, before, &index);
+  collect_inorder(&tree, centree_current_root(&tree), before, &index);
   assert(index == 7);
 
   assert(centree_balance(&tree) == 0);
-  assert(tree.root == &nodes[3]);
+  assert(centree_current_root(&tree) == &nodes[3]);
   assert(centree_validate_locked(&tree));
   assert(atomic_load(&tree.depth) == 3);
 
   index = 0;
-  collect_inorder(&tree, tree.root, after, &index);
+  collect_inorder(&tree, centree_current_root(&tree), after, &index);
   assert(index == 7);
   for (size_t i = 0; i < 7; i++) {
     assert(after[i] == before[i]);
     assert(nodes[i].lu_parent == lu_parents[i]);
-    assert(nodes[i].key == keys[i]);
+    assert(centree_pivot_load(&nodes[i]) == keys[i]);
     assert(nodes[i].value.key == value_keys[i]);
     assert(nodes[i].value.seq == seqs[i]);
     assert(nodes[i].value.slab == slabs[i]);
@@ -103,14 +106,15 @@ static void test_single_node_metadata(void) {
   struct centree_t tree = {0};
 
   rcu_init(&tree.topology_rcu);
+  rcu_ptr_init(&tree.root, NULL);
   init_node(&root, 1);
   root.value.level = 42;
   root.removed = 1;
-  tree.root = &root;
+  rcu_ptr_init(&tree.root, &root);
   atomic_store(&tree.depth, 42);
 
   assert(centree_balance(&tree) == 0);
-  assert(tree.root == &root);
+  assert(centree_current_root(&tree) == &root);
   assert(centree_current_parent(&tree, &root) == NULL);
   assert(root.value.level == 1);
   assert(root.removed == 0);
@@ -120,28 +124,63 @@ static void test_single_node_metadata(void) {
 static void test_reader_keeps_old_generation(void) {
   struct centree_node_t nodes[7];
   struct centree_t tree = {0};
+  struct centree_balance_plan *plan = NULL;
   centree_node old_root;
   centree_node old_left;
   centree_node old_right;
+  centree_node new_root;
+  uint64_t old_levels[7];
+  unsigned char old_removed[7];
 
   rcu_init(&tree.topology_rcu);
-  for (size_t i = 0; i < 7; i++)
+  rcu_ptr_init(&tree.root, NULL);
+  for (size_t i = 0; i < 7; i++) {
     init_node(&nodes[i], i + 1);
+    old_levels[i] = 100 + i;
+    old_removed[i] = i % 3 == 0;
+    atomic_store(&nodes[i].value.level, old_levels[i]);
+    atomic_store(&nodes[i].removed, old_removed[i]);
+  }
   link_children(&nodes[1], &nodes[0], &nodes[3]);
   link_children(&nodes[3], &nodes[2], &nodes[5]);
   link_children(&nodes[5], &nodes[4], &nodes[6]);
-  tree.root = &nodes[1];
+  rcu_ptr_init(&tree.root, &nodes[1]);
 
   centree_read_in(&tree);
-  old_root = tree.root;
+  assert(centree_balance_prepare(&tree, &plan) == 0);
+  assert(plan != NULL);
+  for (size_t i = 0; i < 7; i++) {
+    assert(atomic_load(&nodes[i].value.level) == old_levels[i]);
+    assert(atomic_load(&nodes[i].removed) == old_removed[i]);
+  }
+  centree_balance_publish(plan);
+  assert(centree_current_root(&tree) == &nodes[3]);
+
+  /* Entered before publication, but load root and links afterwards. */
+  old_root = centree_read_root(&tree);
   old_left = centree_read_left(&tree, old_root);
   old_right = centree_read_right(&tree, old_root);
-
-  assert(centree_balance(&tree) == 0);
-  assert(tree.root == &nodes[3]);
-  assert(centree_read_left(&tree, old_root) == old_left);
-  assert(centree_read_right(&tree, old_root) == old_right);
+  assert(old_root == &nodes[1]);
+  assert(old_left == &nodes[0]);
+  assert(old_right == &nodes[3]);
   centree_read_out(&tree);
+
+  /* A reader entering after publication must see only the new topology. */
+  centree_read_in(&tree);
+  new_root = centree_read_root(&tree);
+  assert(new_root == &nodes[3]);
+  assert(centree_read_left(&tree, new_root) == &nodes[1]);
+  assert(centree_read_right(&tree, new_root) == &nodes[5]);
+  centree_read_out(&tree);
+
+  /* Reader exit must not claim the pending writer cleanup. */
+  assert(__atomic_load_n(&tree.topology_rcu.writer_busy,
+                         __ATOMIC_SEQ_CST));
+  assert(tree.topology_rcu.updated_ptrs != NULL);
+  centree_balance_complete(plan);
+  assert(!__atomic_load_n(&tree.topology_rcu.writer_busy,
+                          __ATOMIC_SEQ_CST));
+  assert(tree.topology_rcu.updated_ptrs == NULL);
 
   assert(centree_validate_locked(&tree));
   assert(centree_balance(&tree) == 0);
@@ -156,7 +195,9 @@ static void test_invalid_trees_return_errors(void) {
   struct centree_t tree = {0};
 
   rcu_init(&empty.topology_rcu);
+  rcu_ptr_init(&empty.root, NULL);
   rcu_init(&tree.topology_rcu);
+  rcu_ptr_init(&tree.root, NULL);
   assert(!centree_validate_locked(NULL));
   assert(centree_balance(NULL) == EINVAL);
   assert(!centree_validate_locked(&empty));
@@ -166,10 +207,10 @@ static void test_invalid_trees_return_errors(void) {
   init_node(&left, 1);
   rcu_ptr_init(&root.left, &left);
   rcu_ptr_init(&left.parent, &root);
-  tree.root = &root;
+  rcu_ptr_init(&tree.root, &root);
   assert(!centree_validate_locked(&tree));
   assert(centree_balance(&tree) == EINVAL);
-  assert(tree.root == &root);
+  assert(centree_current_root(&tree) == &root);
   assert(centree_current_left(&tree, &root) == &left &&
          centree_current_right(&tree, &root) == NULL);
 
@@ -179,7 +220,7 @@ static void test_invalid_trees_return_errors(void) {
   rcu_ptr_init(&root.left, &left);
   rcu_ptr_init(&root.right, &right);
   rcu_ptr_init(&right.parent, &root);
-  tree.root = &root;
+  rcu_ptr_init(&tree.root, &root);
   assert(!centree_validate_locked(&tree));
   assert(centree_balance(&tree) == EINVAL);
 
@@ -188,12 +229,15 @@ static void test_invalid_trees_return_errors(void) {
   rcu_ptr_init(&root.left, &left);
   rcu_ptr_init(&root.right, &left);
   rcu_ptr_init(&left.parent, &root);
-  tree.root = &root;
+  rcu_ptr_init(&tree.root, &root);
   assert(!centree_validate_locked(&tree));
   assert(centree_balance(&tree) == EINVAL);
 }
 
 int main(void) {
+  assert(centree_route_left(-1));
+  assert(!centree_route_left(0));
+  assert(!centree_route_left(1));
   test_valid_rebalance();
   test_single_node_metadata();
   test_reader_keeps_old_generation();

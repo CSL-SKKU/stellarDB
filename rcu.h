@@ -16,9 +16,7 @@ struct rcu_ctx {
 
     uint64_t readers[2];
 
-    /*
-     * Only one writer / outstanding grace period.
-     */
+    /* Only one writer, including its synchronous grace-period cleanup. */
     bool writer_busy;
 
     /*
@@ -96,8 +94,8 @@ void *rcu_current_ptr(struct rcu_ctx *ctx, struct rcu_ptr *ptr);
  *
  * Only one writer is allowed at a time.
  *
- * writer_in() may spin until the previous grace period,
- * including its callback, has completed.
+ * writer_in() may spin until the previous writer has completed its grace
+ * period and callback.
  */
 struct rcu_writer rcu_writer_in(struct rcu_ctx *ctx);
 
@@ -118,13 +116,10 @@ void rcu_writer_abort(struct rcu_ctx *ctx, struct rcu_writer *writer);
 /*
  * Publish the new generation.
  *
- * callback(payload) runs after all readers of the old
- * generation have left.
- *
- * The callback may run either:
- *
- *   - inside rcu_writer_publish(), or
- *   - inside the last rcu_read_out().
+ * This waits for all readers of the old generation to leave, mirrors the
+ * changed pointers into the retired slot, and then runs callback(payload).
+ * All cleanup runs synchronously in the publishing thread; readers only
+ * unregister themselves.
  *
  * callback MUST NOT call rcu_writer_in() on the same ctx.
  */
@@ -134,9 +129,11 @@ void rcu_writer_publish(struct rcu_ctx *ctx,
                         void *payload);
 
 /*
- * Split publication from retired-slot cleanup. This is useful when the epoch
- * change must happen under an external lock but the potentially linear
- * cleanup work must not. No other writer can enter between these calls.
+ * Split publication from the grace-period wait and retired-slot cleanup. This
+ * is useful when the epoch change must happen under an external lock but the
+ * wait and potentially linear cleanup work must not. No other writer can
+ * enter between these calls. finish_deferred() must not be called while this
+ * thread is an active reader of the same context.
  */
 void rcu_writer_publish_deferred(struct rcu_ctx *ctx,
                                  struct rcu_writer *writer,

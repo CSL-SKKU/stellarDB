@@ -90,7 +90,7 @@ static struct slab *close_and_create_slab(struct slab *s) {
   new_level = tnt_get_centree_level(s->centree_node)+1;
   R_UNLOCK(&s->tree_lock);
 
-  tnt_subtree_update_key(s->key, new_key);
+  centree_pivot_store(s->centree_node, new_key);
   //printf("mem_create: %lu, %lu // %lu-%lu\n", (uint64_t)s->key, (uint64_t)new_key,
   //       s->min, s->max);
   W_LOCK(&s->tree_lock);

@@ -8,8 +8,7 @@
 
 struct node_snapshot {
   centree_node lu_parent;
-  uint64_t level;
-  unsigned char removed;
+  uint64_t prospective_level;
   bool was_leaf;
 };
 
@@ -40,12 +39,15 @@ static bool validate_subtree(centree tree, centree_node node,
 }
 
 bool centree_validate_locked(centree tree) {
+  centree_node root;
   size_t count = 0;
 
-  if (tree == NULL || tree->root == NULL ||
-      centree_current_parent(tree, tree->root) != NULL)
+  if (tree == NULL)
     return false;
-  if (!validate_subtree(tree, tree->root, &count))
+  root = centree_current_root(tree);
+  if (root == NULL || centree_current_parent(tree, root) != NULL)
+    return false;
+  if (!validate_subtree(tree, root, &count))
     return false;
 
   return count % 2 == 1;
@@ -73,23 +75,6 @@ static bool collect_nodes(centree tree, centree_node node,
                        capacity, index);
 }
 
-static void mark_fixed(centree tree, centree_node node) {
-  centree_node left;
-  centree_node right;
-
-  if (node == NULL)
-    return;
-  left = centree_current_left(tree, node);
-  right = centree_current_right(tree, node);
-  if (left == NULL && right == NULL) {
-    node->removed = 1;
-  } else {
-    node->removed = 0;
-    mark_fixed(tree, left);
-    mark_fixed(tree, right);
-  }
-}
-
 static centree_node writer_left(struct rcu_writer *writer,
                                 centree_node node) {
   return rcu_writer_ptr(writer, &node->left);
@@ -106,7 +91,12 @@ static centree_node writer_parent(struct rcu_writer *writer,
 }
 
 static int build_tree_from_array(struct rcu_writer *writer,
-                                 centree_node *nodes, size_t l, size_t r,
+                                 centree_node *nodes,
+                                 struct node_snapshot *snapshots,
+                                 size_t l, size_t r,
+                                 centree_node parent,
+                                 unsigned int level,
+                                 unsigned int *actual_depth,
                                  centree_node *result) {
   size_t count = r - l;
 
@@ -115,10 +105,14 @@ static int build_tree_from_array(struct rcu_writer *writer,
   if (count == 1) {
     centree_node node = nodes[l];
 
-    if (node->removed != 1)
+    if (!snapshots[l].was_leaf)
       return EINVAL;
     rcu_writer_set_ptr(writer, &node->left, NULL);
     rcu_writer_set_ptr(writer, &node->right, NULL);
+    rcu_writer_set_ptr(writer, &node->parent, parent);
+    snapshots[l].prospective_level = level;
+    if (level > *actual_depth)
+      *actual_depth = level;
     *result = node;
     return 0;
   }
@@ -144,12 +138,19 @@ static int build_tree_from_array(struct rcu_writer *writer,
   centree_node right;
   int error;
 
-  if (root->removed != 0)
+  if (snapshots[best_k].was_leaf)
     return EINVAL;
-  error = build_tree_from_array(writer, nodes, l, best_k, &left);
+  rcu_writer_set_ptr(writer, &root->parent, parent);
+  snapshots[best_k].prospective_level = level;
+  if (level > *actual_depth)
+    *actual_depth = level;
+
+  error = build_tree_from_array(writer, nodes, snapshots, l, best_k,
+                                root, level + 1, actual_depth, &left);
   if (error != 0)
     return error;
-  error = build_tree_from_array(writer, nodes, best_k + 1, r, &right);
+  error = build_tree_from_array(writer, nodes, snapshots, best_k + 1, r,
+                                root, level + 1, actual_depth, &right);
   if (error != 0)
     return error;
 
@@ -157,36 +158,6 @@ static int build_tree_from_array(struct rcu_writer *writer,
   rcu_writer_set_ptr(writer, &root->right, right);
   *result = root;
   return 0;
-}
-
-static unsigned int refresh_routing_metadata(struct rcu_writer *writer,
-                                             centree_node node,
-                                             centree_node parent,
-                                             unsigned int level) {
-  centree_node left = writer_left(writer, node);
-  centree_node right = writer_right(writer, node);
-  unsigned int actual_depth = level;
-
-  rcu_writer_set_ptr(writer, &node->parent, parent);
-  node->value.level = level;
-  node->removed = 0;
-
-  if (left != NULL) {
-    unsigned int left_depth =
-        refresh_routing_metadata(writer, left, node, level + 1);
-
-    if (left_depth > actual_depth)
-      actual_depth = left_depth;
-  }
-  if (right != NULL) {
-    unsigned int right_depth =
-        refresh_routing_metadata(writer, right, node, level + 1);
-
-    if (right_depth > actual_depth)
-      actual_depth = right_depth;
-  }
-
-  return actual_depth;
 }
 
 static bool validate_writer_subtree(struct rcu_writer *writer,
@@ -227,15 +198,6 @@ static bool collect_writer_nodes(struct rcu_writer *writer,
                               capacity, index);
 }
 
-static void restore_metadata(centree_node *nodes,
-                             const struct node_snapshot *snapshots,
-                             size_t count) {
-  for (size_t i = 0; i < count; i++) {
-    nodes[i]->value.level = snapshots[i].level;
-    nodes[i]->removed = snapshots[i].removed;
-  }
-}
-
 struct centree_balance_plan {
   centree tree;
   centree_node new_root;
@@ -261,13 +223,15 @@ int centree_balance_prepare(centree tree,
   size_t index = 0;
   bool writer_active = false;
   int error = 0;
+  centree_node root;
 
   if (out_plan == NULL)
     return EINVAL;
   *out_plan = NULL;
   if (tree == NULL)
     return EINVAL;
-  if (tree->root == NULL)
+  root = centree_current_root(tree);
+  if (root == NULL)
     return 0;
   if (!centree_validate_locked(tree))
     return EINVAL;
@@ -276,7 +240,7 @@ int centree_balance_prepare(centree tree,
   if (plan == NULL)
     return ENOMEM;
   plan->tree = tree;
-  plan->total_nodes = count_nodes(tree, tree->root);
+  plan->total_nodes = count_nodes(tree, root);
   if (plan->total_nodes > SIZE_MAX / sizeof(*plan->nodes) ||
       plan->total_nodes > SIZE_MAX / sizeof(*plan->snapshots)) {
     error = ENOMEM;
@@ -291,7 +255,7 @@ int centree_balance_prepare(centree tree,
     error = ENOMEM;
     goto out;
   }
-  if (!collect_nodes(tree, tree->root, plan->nodes, plan->total_nodes,
+  if (!collect_nodes(tree, root, plan->nodes, plan->total_nodes,
                      &index) ||
       index != plan->total_nodes) {
     error = EINVAL;
@@ -300,31 +264,24 @@ int centree_balance_prepare(centree tree,
 
   for (size_t i = 0; i < plan->total_nodes; i++) {
     plan->snapshots[i].lu_parent = plan->nodes[i]->lu_parent;
-    plan->snapshots[i].level = plan->nodes[i]->value.level;
-    plan->snapshots[i].removed = plan->nodes[i]->removed;
     plan->snapshots[i].was_leaf =
         centree_current_left(tree, plan->nodes[i]) == NULL;
-  }
 
-  mark_fixed(tree, tree->root);
-  for (size_t i = 0; i < plan->total_nodes; i++) {
-    unsigned char expected = i % 2 == 0 ? 1 : 0;
-
-    if (plan->nodes[i]->removed != expected) {
+    if (plan->snapshots[i].was_leaf != (i % 2 == 0)) {
       error = EINVAL;
-      goto restore;
+      goto out;
     }
   }
 
   plan->writer = rcu_writer_in(&tree->topology_rcu);
   writer_active = true;
-  error = build_tree_from_array(&plan->writer, plan->nodes, 0,
-                                plan->total_nodes, &plan->new_root);
+  error = build_tree_from_array(&plan->writer, plan->nodes,
+                                plan->snapshots, 0, plan->total_nodes,
+                                NULL, 1, &plan->actual_depth,
+                                &plan->new_root);
   if (error != 0)
-    goto restore;
-
-  plan->actual_depth =
-      refresh_routing_metadata(&plan->writer, plan->new_root, NULL, 1);
+    goto abort;
+  rcu_writer_set_ptr(&plan->writer, &tree->root, plan->new_root);
 
   size_t count = 0;
   index = 0;
@@ -335,7 +292,7 @@ int centree_balance_prepare(centree tree,
                             plan->total_nodes, &index) ||
       index != plan->total_nodes) {
     error = EFAULT;
-    goto restore;
+    goto abort;
   }
   for (size_t i = 0; i < plan->total_nodes; i++) {
     bool is_leaf = writer_left(&plan->writer, plan->nodes[i]) == NULL &&
@@ -345,7 +302,7 @@ int centree_balance_prepare(centree tree,
         is_leaf != plan->snapshots[i].was_leaf ||
         plan->nodes[i]->lu_parent != plan->snapshots[i].lu_parent) {
       error = EFAULT;
-      goto restore;
+      goto abort;
     }
   }
 
@@ -353,10 +310,9 @@ int centree_balance_prepare(centree tree,
   *out_plan = plan;
   return 0;
 
-restore:
+abort:
   if (writer_active)
     rcu_writer_abort(&tree->topology_rcu, &plan->writer);
-  restore_metadata(plan->nodes, plan->snapshots, plan->total_nodes);
 out:
   free(after);
   free_plan(plan);
@@ -366,8 +322,19 @@ out:
 void centree_balance_publish(struct centree_balance_plan *plan) {
   assert(plan != NULL);
 
-  plan->tree->root = plan->new_root;
-  atomic_store(&plan->tree->depth, plan->actual_depth);
+  /*
+   * Publication runs under centree_root_lock. Metadata is advisory and
+   * atomic, so old-generation RCU readers may safely observe either value.
+   */
+  for (size_t i = 0; i < plan->total_nodes; i++) {
+    atomic_store_explicit(&plan->nodes[i]->value.level,
+                          plan->snapshots[i].prospective_level,
+                          memory_order_release);
+    atomic_store_explicit(&plan->nodes[i]->removed, 0,
+                          memory_order_release);
+  }
+  atomic_store_explicit(&plan->tree->depth, plan->actual_depth,
+                        memory_order_release);
   rcu_writer_publish_deferred(&plan->tree->topology_rcu, &plan->writer,
                               NULL, NULL);
 }
@@ -389,7 +356,6 @@ void centree_balance_abort(struct centree_balance_plan *plan) {
     return;
 
   rcu_writer_abort(&plan->tree->topology_rcu, &plan->writer);
-  restore_metadata(plan->nodes, plan->snapshots, plan->total_nodes);
   free_plan(plan);
 }
 

@@ -27,37 +27,23 @@ static _Thread_local uint64_t tls_epoch;
 static _Thread_local bool tls_inside;
 
 
-/*
- * Try to complete the pending grace period.
- *
- * Called both by:
- *
- *   - writer after publishing
- *   - last old-generation reader
- */
+/* Complete a grace period after the publishing writer observed no readers. */
 static void
-rcu_try_finish(
+rcu_finish(
     struct rcu_ctx *ctx,
     unsigned phase)
 {
-    if (__atomic_load_n(
-            &ctx->readers[phase],
-            __ATOMIC_SEQ_CST) != 0)
-        return;
+    assert(__atomic_load_n(
+               &ctx->readers[phase],
+               __ATOMIC_SEQ_CST) == 0);
+    assert(__atomic_load_n(
+               &ctx->pending_phase,
+               __ATOMIC_SEQ_CST) == (int)phase);
 
-    int expected = (int)phase;
-
-    /*
-     * Exactly one thread claims grace-period completion.
-     */
-    if (!__atomic_compare_exchange_n(
-            &ctx->pending_phase,
-            &expected,
-            RCU_NO_PHASE,
-            false,
-            __ATOMIC_SEQ_CST,
-            __ATOMIC_SEQ_CST))
-        return;
+    __atomic_store_n(
+        &ctx->pending_phase,
+        RCU_NO_PHASE,
+        __ATOMIC_SEQ_CST);
 
     /*
      * Retire the old topology slot before allowing another writer to reuse
@@ -82,7 +68,7 @@ rcu_try_finish(
     }
     ctx->updated_ptrs = NULL;
 
-    /* callback/payload were installed before pending_phase became visible. */
+    /* callback/payload were installed before the epoch was published. */
     rcu_callback_t callback = ctx->callback;
     void *payload = ctx->payload;
 
@@ -112,16 +98,6 @@ rcu_drop_reader(
             __ATOMIC_SEQ_CST);
 
     assert(old != 0);
-
-    /*
-     * We changed:
-     *
-     *     1 -> 0
-     *
-     * so we may be the thread completing the grace period.
-     */
-    if (old == 1)
-        rcu_try_finish(ctx, phase);
 }
 
 
@@ -412,9 +388,9 @@ rcu_writer_publish_deferred(
     ctx->payload = payload;
 
     /*
-     * Keep readers from claiming cleanup before the external publication
-     * lock has been released. A reader racing with the epoch change can only
-     * observe this sentinel and leave cleanup to finish_deferred().
+     * Mark the writer as published but not yet ready for cleanup. This lets
+     * an external publication lock be released before finish_deferred()
+     * starts waiting for readers.
      */
     __atomic_store_n(
         &ctx->pending_phase,
@@ -447,6 +423,7 @@ rcu_writer_finish_deferred(
     assert(__atomic_load_n(
                &ctx->pending_phase,
                __ATOMIC_SEQ_CST) == RCU_DEFERRED_PHASE);
+    assert(!tls_inside || tls_ctx != ctx);
 
     /*
      * Old generation is now draining.
@@ -456,21 +433,13 @@ rcu_writer_finish_deferred(
         (int)writer->old_phase,
         __ATOMIC_SEQ_CST);
 
-    /*
-     * There is an important race:
-     *
-     *     publish epoch
-     *     old last reader exits
-     *     pending_phase = old_phase
-     *
-     * That reader cannot finish the grace period because
-     * pending_phase was not installed yet.
-     *
-     * Therefore writer checks once after installing it.
-     */
-    rcu_try_finish(
-        ctx,
-        writer->old_phase);
+    while (__atomic_load_n(
+               &ctx->readers[writer->old_phase],
+               __ATOMIC_SEQ_CST) != 0)
+        cpu_relax();
+
+    /* Readers only unregister; cleanup always runs in this writer. */
+    rcu_finish(ctx, writer->old_phase);
 
     writer->ctx = NULL;
 }

@@ -64,7 +64,7 @@ struct topology_snapshot {
   size_t count;
   centree_node *inorder;
   centree_node *lu_parents;
-  void **keys;
+  uint64_t *keys;
   uint64_t *value_keys;
   struct slab **slabs;
   bool *leaves;
@@ -276,6 +276,15 @@ static void expect_read(uint64_t key, bool present) {
   }
 }
 
+static void expect_direct_index_hit(uint64_t key) {
+  unsigned char item[TEST_ITEM_SIZE];
+  struct slab_callback callback = {0};
+
+  init_item(item, key, 0);
+  callback.item = item;
+  TEST_CHECK(tnt_index_lookup(&callback, item) != NULL);
+}
+
 static bool wait_for_flag(_Atomic bool *flag, time_t timeout_seconds) {
   struct timespec start;
 
@@ -299,6 +308,8 @@ static void split_midpoint_test_hook(struct slab *parent_slab) {
   centree_node right = tnt_routing_right(parent);
   TEST_CHECK(left != NULL);
   TEST_CHECK(right == NULL);
+  TEST_CHECK(tnt_routing_parent(left) == parent);
+  TEST_CHECK(centree_pivot_load(parent) == parent_slab->key);
   TEST_CHECK(atomic_load_explicit(&parent->child_flag,
                                   memory_order_acquire) == 0);
   paused_split_parent = parent;
@@ -444,7 +455,7 @@ static struct topology_snapshot take_topology_snapshot(centree_node any_node) {
     centree_node node = snapshot.inorder[i];
 
     snapshot.lu_parents[i] = node->lu_parent;
-    snapshot.keys[i] = node->key;
+    snapshot.keys[i] = centree_pivot_load(node);
     snapshot.value_keys[i] = node->value.key;
     snapshot.slabs[i] = node->value.slab;
     snapshot.leaves[i] = tnt_routing_left(node) == NULL &&
@@ -475,7 +486,7 @@ static bool topology_matches_snapshot(const struct topology_snapshot *snapshot,
 
     matches = node == snapshot->inorder[i] &&
               node->lu_parent == snapshot->lu_parents[i] &&
-              node->key == snapshot->keys[i] &&
+              centree_pivot_load(node) == snapshot->keys[i] &&
               node->value.key == snapshot->value_keys[i] &&
               node->value.slab == snapshot->slabs[i] &&
               is_leaf == snapshot->leaves[i];
@@ -587,6 +598,14 @@ static void run_mid_split_rebalance_test(void) {
   TEST_CHECK(tnt_routing_right(paused_split_parent) == NULL);
   parent_lu_parent = paused_split_parent->lu_parent;
   left_lu_parent = paused_left_child->lu_parent;
+
+  /*
+   * At this publication boundary, a left-routed READ reaches the new empty
+   * child and walks lu_parent, while a right-routed READ stops at the old
+   * parent because that child is not published yet. Both must find the item.
+   */
+  expect_direct_index_hit(16);
+  expect_direct_index_hit(48);
 
   for (size_t i = 0; i < 2; i++) {
     TEST_CHECK(pthread_create(&client_threads[i], NULL,

@@ -9,6 +9,8 @@
 #ifndef MEM_ITEM_H
 #define MEM_ITEM_H
 
+#include <stdatomic.h>
+
 /*
  * Very simple bitops for the boot code.
  */
@@ -47,7 +49,8 @@ struct tree_entry {  // This index entry could be made much smaller by, e.g.,
                      // size -> slab* given a slab context
   uint64_t key;
   uint64_t seq;
-  uint64_t level;
+  /* Advisory routing metadata; rebalancing publishes it atomically. */
+  _Atomic(uint64_t) level;
   struct slab *slab;
 };
 

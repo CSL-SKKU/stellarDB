@@ -26,6 +26,11 @@ void tnt_split_phase_enter(void);
 void tnt_split_phase_exit(void);
 struct tree_entry *tnt_worker_lookup(int worker_id, void *item);
 
+/*
+ * Raw center-tree pointers returned below remain memory-valid only because
+ * live node/slab reclamation is currently prohibited; they do not pin an RCU
+ * routing generation.
+ */
 int tnt_centree_node_is_child (centree_node n);
 centree_node tnt_routing_left(centree_node n);
 centree_node tnt_routing_right(centree_node n);
@@ -33,10 +38,16 @@ centree_node tnt_routing_parent(centree_node n);
 uint64_t tnt_get_centree_level(void *n);
 subtree_t *tnt_subtree_create(void);
 void wakeup_subtree_get(void *n);
+/* The caller must not hold centree_root_lock or a slab lock. */
 void tnt_subtree_add(struct slab *s, void *tree, void *filter,
                      uint64_t tmp_key);
+/*
+ * The caller must already hold one split-phase reference and must not hold
+ * centree_root_lock or a slab lock.
+ */
+void tnt_subtree_add_split(struct slab *s, void *tree, void *filter,
+                           uint64_t tmp_key);
 void tnt_subtree_delete(int worker_id, void *item);
-void tnt_subtree_update_key(uint64_t old_key, uint64_t new_key);
 
 tree_entry_t *tnt_parent_subtree_get(void *centnode);
 tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e);

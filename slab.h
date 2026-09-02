@@ -28,7 +28,14 @@ typedef void (*slab_split_test_hook_t)(struct slab *parent);
 /* Test-only synchronization hook; production leaves it unset. */
 void slab_set_split_midpoint_test_hook(slab_split_test_hook_t hook);
 
-/* Header of a slab -- shouldn't contain any pointer as it is persisted on disk.
+/*
+ * Slab descriptor lifetime follows its center-tree node: once published, the
+ * descriptor's address remains valid for the database process lifetime.
+ * Individual resources may be closed during shutdown/maintenance, but the
+ * descriptor itself must not be freed while raw node/tree_entry pointers can
+ * still refer to it.
+ *
+ * Header of a slab -- shouldn't contain any pointer as it is persisted on disk.
  */
 #define NUM_LOAD_BATCH 64
 struct slab {

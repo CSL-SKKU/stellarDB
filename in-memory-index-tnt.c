@@ -330,7 +330,8 @@ void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
     bgq_dequeue(GC);
   }
   //    Enqueue root
-  centree_node root = centree_root->root;
+  centree_read_in(centree_root);
+  centree_node root = centree_read_root(centree_root);
   if (root) {
     bgq_enqueue(GC, root);
   }
@@ -367,13 +368,12 @@ void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
     }
 
     // enqueue children
-    centree_read_in(centree_root);
     centree_node left = centree_read_left(centree_root, node);
     centree_node right = centree_read_right(centree_root, node);
-    centree_read_out(centree_root);
     if (left) bgq_enqueue(GC, left);
     if (right) bgq_enqueue(GC, right);
   }
+  centree_read_out(centree_root);
 
   while (!bgq_is_empty(GC)) {
     bgq_dequeue(GC);
@@ -427,12 +427,19 @@ bool tnt_rebalancing_needed(void) {
   return (double)depth > log2((double)node_count) * REBALANCE_THRESHOLD;
 }
 
-void centree_worker_insert(int worker_id, void *item, tree_entry_t *e) {
+static void centree_worker_insert(int worker_id, void *item, tree_entry_t *e) {
+  struct rcu_writer writer;
   centree_node n;
+
+  writer = rcu_writer_in(&centree_root->topology_rcu);
   W_LOCK(&centree_root_lock);
-  n = centree_insert(centree_root, (void *)e->key, e, tnt_pointer_cmp);
+  n = centree_insert(centree_root, &writer, (void *)e->key, e,
+                     tnt_pointer_cmp);
   e->slab->centree_node = (void *)n;
+  rcu_writer_publish_deferred(&centree_root->topology_rcu, &writer,
+                              NULL, NULL);
   W_UNLOCK(&centree_root_lock);
+  rcu_writer_finish_deferred(&centree_root->topology_rcu, &writer);
 }
 
 void wakeup_subtree_get(void *n) {
@@ -478,19 +485,45 @@ int tnt_centree_node_is_child (centree_node n) {
 }
 
 uint64_t tnt_get_centree_level(void *n) {
-  return ((centree_node)n)->value.level;
+  return atomic_load_explicit(&((centree_node)n)->value.level,
+                              memory_order_acquire);
 }
 
-void tnt_subtree_add(struct slab *s, void *tree, void *filter, uint64_t tmp_key) { tree_entry_t e = { .seq = s->seq,
-  .key = tmp_key,
-  .slab = s,
-};
+static void tnt_subtree_add_common(struct slab *s, void *tree, void *filter,
+                                   uint64_t tmp_key,
+                                   bool split_phase_held) {
+  tree_entry_t e = {
+    .seq = s->seq,
+    .key = tmp_key,
+    .slab = s,
+  };
+
   subtree_set_slab(tree, s);
   s->subtree = tree;
 #if WITH_FILTER
   s->filter = filter;
 #endif
+  if (split_phase_held) {
+    int state = atomic_load_explicit(&centree_phase_state,
+                                     memory_order_acquire);
+
+    assert((state & CENTREE_SPLIT_COUNT_MASK) > 0);
+  } else {
+    tnt_split_phase_enter();
+  }
   centree_worker_insert(0, NULL, &e);
+  if (!split_phase_held)
+    tnt_split_phase_exit();
+}
+
+void tnt_subtree_add(struct slab *s, void *tree, void *filter,
+                     uint64_t tmp_key) {
+  tnt_subtree_add_common(s, tree, filter, tmp_key, false);
+}
+
+void tnt_subtree_add_split(struct slab *s, void *tree, void *filter,
+                           uint64_t tmp_key) {
+  tnt_subtree_add_common(s, tree, filter, tmp_key, true);
 }
 
 void subtree_worker_insert(subtree_t *tree, void *item, index_entry_t *e) {
@@ -511,19 +544,24 @@ int subtree_worker_invalid_utree(subtree_t *tree, void *item) {
 /* ========================================= */
 // TNT
 
-// root lock 안팎 처리를 이 함수가 전부 담당
+/*
+ * Lock-free routing descent. One RCU generation covers root and every child
+ * edge. The returned node remains allocated after read_out() under the
+ * center-tree no-reclamation lifetime contract.
+ */
 static centree_node centree_find_leaf(void *key) {
-  R_LOCK(&centree_root_lock);
-  centree_node n = centree_root->root;
-  while (1) {
-    int cmp = tnt_pointer_cmp(key, n->key);
+  centree_read_in(centree_root);
+  centree_node n = centree_read_root(centree_root);
+  while (n != NULL) {
+    int cmp = tnt_pointer_cmp(
+        key, (void *)(uintptr_t)centree_pivot_load(n));
     centree_node next =
-        (cmp <= 0 ? centree_current_left(centree_root, n)
-                  : centree_current_right(centree_root, n));
+        (centree_route_left(cmp) ? centree_read_left(centree_root, n)
+                                 : centree_read_right(centree_root, n));
     if (!next) break;
     n = next;
   }
-  R_UNLOCK(&centree_root_lock);
+  centree_read_out(centree_root);
   return n;
 }
 
@@ -573,9 +611,10 @@ size_t reserve_slot(struct slab *s) {
 
 tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
   centree t = centree_root;
-  centree_node n = t->root, prev;
+  centree_node n, prev;
 
   R_LOCK(&centree_root_lock);
+  n = centree_current_root(t);
   while (1) {
     struct slab *s = n->value.slab;
     int comp_result;
@@ -628,11 +667,12 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
     prev = n;
     do {
       R_LOCK(&s->tree_lock);
-      comp_result = tnt_pointer_cmp((void *)key, prev->key);
-      if (comp_result <= 0) {
+      comp_result = tnt_pointer_cmp(
+          (void *)key, (void *)(uintptr_t)centree_pivot_load(prev));
+      if (centree_route_left(comp_result)) {
         n = centree_current_left(t, prev);
       } else {
-        assert(comp_result > 0);
+        assert(comp_result >= 0);
         n = centree_current_right(t, prev);
       }
       R_UNLOCK(&s->tree_lock);
@@ -703,10 +743,12 @@ struct tree_entry* centree_lookup_and_reserve(
     // d) slab full -> split된 자식으로 하강 (자식 없으면 기다림)
     prev = n;
     do {
-      int comp = tnt_pointer_cmp((void*)key, prev->key);
+      int comp = tnt_pointer_cmp(
+          (void *)key, (void *)(uintptr_t)centree_pivot_load(prev));
       R_LOCK(&s->tree_lock);
-      n = (comp <= 0 ? centree_current_left(centree_root, prev)
-                     : centree_current_right(centree_root, prev));
+      n = (centree_route_left(comp)
+               ? centree_current_left(centree_root, prev)
+               : centree_current_right(centree_root, prev));
       R_UNLOCK(&s->tree_lock);
 
       if (!n) {
@@ -755,7 +797,8 @@ int tnt_get_nodes_at_level(int level, background_queue *q) {
   background_queue queue;
 
   init_queue(&queue);
-  enqueue_centnode(&queue, centree_root->root);
+  centree_read_in(centree_root);
+  enqueue_centnode(&queue, centree_read_root(centree_root));
   while (!is_empty(&queue)) {
     int level_size = queue.count;
     if (current_level == level) {
@@ -769,44 +812,16 @@ int tnt_get_nodes_at_level(int level, background_queue *q) {
 
     while (level_size-- > 0) {
       centree_node node = dequeue_centnode(&queue);
-      centree_read_in(centree_root);
       centree_node left = centree_read_left(centree_root, node);
       centree_node right = centree_read_right(centree_root, node);
-      centree_read_out(centree_root);
       if (left != NULL) enqueue_centnode(&queue, left);
       if (right != NULL) enqueue_centnode(&queue, right);
     }
     current_level++;
   }
+  centree_read_out(centree_root);
 
   return count;
-}
-
-void tnt_subtree_update_key(uint64_t old_key, uint64_t new_key) {
-  centree t = centree_root;
-  centree_node n = t->root;
-  W_LOCK(&centree_root_lock);
-
-  while (n != NULL) {
-    struct slab *s = n->value.slab;
-    int comp_result;
-    W_LOCK(&s->tree_lock);
-    comp_result = tnt_pointer_cmp((void *)old_key, n->key);
-    if (comp_result == 0) {
-      n->key = (void *)new_key;
-
-      W_UNLOCK(&s->tree_lock);
-      W_UNLOCK(&centree_root_lock);
-      return;
-    } else if (comp_result < 0) {
-      n = centree_current_left(t, n);
-    } else {
-      assert(comp_result > 0);
-      n = centree_current_right(t, n);
-    }
-    W_UNLOCK(&s->tree_lock);
-  }
-  W_UNLOCK(&centree_root_lock);
 }
 
 static __thread int try = 0;
@@ -827,20 +842,6 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   int tmp_try = 0, upward_len = 1;
   int count = 0;
 
-  // Leaf node까지 내려가는 과정
-  //R_LOCK(&centree_root_lock);
-  //while (n != NULL) {
-  //  int comp_result = tnt_pointer_cmp((void *)key, n->key);
-  //  if (comp_result <= 0) {
-  //    if (n->left == NULL) break;  // Leaf node에 도달
-  //    n = n->left;
-  //  } else {
-  //    assert(comp_result > 0);
-  //    if (n->right == NULL) break;  // Leaf node에 도달
-  //    n = n->right;
-  //  }
-  //}
-  //R_UNLOCK(&centree_root_lock);
   n = centree_find_leaf((void*)key);
   add_time_in_payload(cb, TIMING_STAGE_LEAF_FOUND);
 
@@ -905,10 +906,11 @@ int tnt_index_invalid(void *item) {
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
   uint64_t key = *(uint64_t *)item_key;
-  centree_node n = t->root;
+  centree_node n;
   int count = 0;
 
   R_LOCK(&centree_root_lock);
+  n = centree_current_root(t);
   while (n != NULL) {
     struct slab *s = n->value.slab;
     int comp_result;
@@ -929,14 +931,15 @@ int tnt_index_invalid(void *item) {
       }
 #endif
     }
-    comp_result = tnt_pointer_cmp((void *)key, n->key);
+    comp_result = tnt_pointer_cmp(
+        (void *)key, (void *)(uintptr_t)centree_pivot_load(n));
 
     R_UNLOCK(&s->tree_lock);
 
-    if (comp_result <= 0) {
+    if (centree_route_left(comp_result)) {
       n = centree_current_left(t, n);
     } else {
-      assert(comp_result > 0);
+      assert(comp_result >= 0);
       n = centree_current_right(t, n);
     }
   }
@@ -978,12 +981,13 @@ int tnt_rebalancing(void) {
 
   restructuring_phase_enter();
 
-  if (centree_root->root == NULL) {
+  centree_node root = centree_current_root(centree_root);
+  if (root == NULL) {
     result = TNT_REBALANCE_NOOP;
   } else {
     bool topology_noop =
-        centree_current_left(centree_root, centree_root->root) == NULL &&
-        centree_current_right(centree_root, centree_root->root) == NULL;
+        centree_current_left(centree_root, root) == NULL &&
+        centree_current_right(centree_root, root) == NULL;
     int error = centree_balance_prepare(centree_root, &plan);
 
     if (error != 0) {
