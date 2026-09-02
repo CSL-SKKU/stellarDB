@@ -470,39 +470,53 @@ size_t tnt_recover_tree(struct slab **slabs, const struct slab_header *hdrs,
   }
   qsort(refs, n, sizeof(*refs), compare_recover_ref);
 
-  /* History links from the headers; a parent is whoever names you. */
-  for (size_t i = 0; i < n; i++) {
-    for (int side = 0; side < 2; side++) {
-      uint64_t id = hdrs[i].lu_child[side];
-      size_t j;
-
-      if (id == 0)
-        continue;
-      j = recover_lookup(refs, n, id);
-      if (j == (size_t)-1)
-        die("Recovery: slab %lu names child %lu, which is not on disk\n",
-            slabs[i]->seq, id);
-      if (centree_lu_parent(nodes[j]) != NULL)
-        die("Recovery: slab %lu has two parents (%lu and %lu)\n", id,
-            centree_lu_parent(nodes[j])->value.slab->seq, slabs[i]->seq);
-      nodes[i]->lu_child[side] = nodes[j];
-      centree_lu_parent_store(nodes[j], nodes[i]);
-    }
-    if ((hdrs[i].lu_child[0] == 0) != (hdrs[i].lu_child[1] == 0))
-      die("Recovery: slab %lu has exactly one history child\n",
-          slabs[i]->seq);
-  }
-
   root_index = recover_lookup(refs, n, root_id);
   if (root_index == (size_t)-1)
     die("Recovery: ROOT names slab %lu, which is not on disk\n", root_id);
-  if (centree_lu_parent(nodes[root_index]) != NULL)
-    die("Recovery: the ROOT slab %lu has a parent\n", root_id);
 
   /*
-   * In-order over the history tree is the routing in-order. Everything not
-   * reached from ROOT is a leftover of an interrupted split or prune.
+   * Link by walking down from ROOT. Only what a reachable node names counts:
+   * the leftovers of an interrupted prune (the old triple after the commit,
+   * or an uncommitted N before it) still carry headers naming the very same
+   * children, and they are garbage, not a second parent.
    */
+  {
+    size_t *stack = calloc(n, sizeof(*stack));
+    size_t depth = 0;
+
+    if (stack == NULL)
+      die("Recovery: out of memory\n");
+    reachable[root_index] = 1;
+    stack[depth++] = root_index;
+    while (depth > 0) {
+      size_t i = stack[--depth];
+
+      if ((hdrs[i].lu_child[0] == 0) != (hdrs[i].lu_child[1] == 0))
+        die("Recovery: slab %lu has exactly one history child\n",
+            slabs[i]->seq);
+      for (int side = 0; side < 2; side++) {
+        uint64_t id = hdrs[i].lu_child[side];
+        size_t j;
+
+        if (id == 0)
+          continue;
+        j = recover_lookup(refs, n, id);
+        if (j == (size_t)-1)
+          die("Recovery: slab %lu names child %lu, which is not on disk\n",
+              slabs[i]->seq, id);
+        if (reachable[j])
+          die("Recovery: slab %lu is reached twice (again from %lu)\n", id,
+              slabs[i]->seq);
+        nodes[i]->lu_child[side] = nodes[j];
+        centree_lu_parent_store(nodes[j], nodes[i]);
+        reachable[j] = 1;
+        stack[depth++] = j;
+      }
+    }
+    free(stack);
+  }
+
+  /* In-order over the history tree is the routing in-order. */
   recover_inorder(nodes[root_index], order, &nb_order, n);
   if (nb_order > n)
     die("Recovery: history tree visits %zu nodes, %zu exist\n", nb_order, n);
@@ -513,20 +527,13 @@ size_t tnt_recover_tree(struct slab **slabs, const struct slab_header *hdrs,
     if (internal != (int)(i % 2))
       die("Recovery: in-order position %zu is %s\n", i,
           internal ? "internal" : "a leaf");
-  }
-  for (size_t i = 0; i < nb_order; i++) {
-    centree_node node = order[i];
-    struct slab *s = node->value.slab;
-    size_t idx = recover_lookup(refs, n, s->seq);
-
-    reachable[idx] = 1;
-    if (node->lu_child[0] != NULL) {
+    if (internal) {
       /*
        * Internal nodes never take writes, whether or not they are physically
        * full -- a merged node produced by pruning usually is not.
        */
       atomic_store_explicit(&node->child_flag, 1, memory_order_release);
-      atomic_store_explicit(&s->full, 1, memory_order_release);
+      atomic_store_explicit(&node->value.slab->full, 1, memory_order_release);
     }
   }
 

@@ -47,22 +47,36 @@ PRUNE_REINS=1 sandboxed env PRUNE_REINS=1 ./test/test_prune_links 2>&1 | filter 
 report "prune with reinsertion" "${PIPESTATUS[0]}"
 
 echo
-echo "== known-bad: recovery after pruning =="
-# Recovery only runs when a file named slab-1-0-* is present (root_exists() in
-# slab.c), and pruning unlinks the original root slab as soon as its triple is
-# picked. A restart then finds no root, builds an empty database and reports 0
-# recovered entries. See PRUNING_NOTES.md; recovery is deferred by the plan.
+echo "== recovery of a pruned database =="
 DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
 export DBDIR
 sandboxed ./test/test_prune_links >/dev/null 2>&1
 report "prune (populate for recovery)" $?
-if ls "$DBDIR"/slab-1-0-* >/dev/null 2>&1; then
-  echo "  NOTE  the root slab survived this run"
-else
-  echo "  NOTE  the root slab was pruned away, so recovery cannot start"
-fi
+if [ -f "$DBDIR/ROOT" ]; then echo "  NOTE  ROOT -> slab-$(cat "$DBDIR/ROOT")"; fi
 sandboxed ./test/test_prune_links verify 2>&1 | filter | tail -2
-report "read back after recovery (expected to fail today)" "${PIPESTATUS[0]}" 1
+report "read back after recovery" "${PIPESTATUS[0]}"
+unset DBDIR
+
+echo
+echo "== crash points =="
+# Each mode _exit()s at the named point. Recovery must come back to the state
+# before the interrupted operation (or after it, once it committed), delete the
+# leftovers, and keep both trees consistent.
+for point in 2 3; do
+  DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
+  export DBDIR
+  sandboxed ./test/test_prune_links crash-prune-$point >/dev/null 2>&1
+  report "crash-prune-$point stops the process" $? 42
+  sandboxed ./test/test_prune_links verify-crash 2>&1 | filter | grep -E "Recovery:|FAIL|state after"
+  report "recover after crash-prune-$point" "${PIPESTATUS[0]}"
+  unset DBDIR
+done
+DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
+export DBDIR
+sandboxed ./test/test_prune_links crash-split >/dev/null 2>&1
+report "crash-split stops the process" $? 42
+sandboxed ./test/test_prune_links verify-consistent 2>&1 | filter | grep -E "Recovery:|FAIL|state after"
+report "recover after crash-split" "${PIPESTATUS[0]}"
 unset DBDIR
 
 echo

@@ -1291,7 +1291,7 @@ static void queue_for_reinsertion(unsigned *seed) {
   s = order[rand_r(seed) % nb_order]->value.slab;
   free(order);
   if (!s->hot_bits) return;
-  for (size_t p = 0; p < (s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE; p++)
+  for (size_t p = 0; p < slab_data_size(s) / PAGE_SIZE; p++)
     mark_page_hot(s, p);
   if (!atomic_load(&s->queued)) {
     int expected = 0;
@@ -1411,10 +1411,86 @@ static void verify_model(void) {
   if (!bad) printf("  %-34s %lu keys\n", "state after recovery", hi);
 }
 
+/*
+ * The state after the load and overwrite phases, before any prune: the
+ * deleted tenth is gone, the rest of the lower range carries version 3, the
+ * upper range its load value. The crash modes stop after these phases, so a
+ * recovered database has to show exactly this.
+ */
+static void verify_pre_prune_model(void) {
+  uint64_t hi = nb_keys + nb_keys / 2;
+  size_t bad = 0;
+
+  printf("  recovered %lu index entries\n", get_database_size());
+  for (uint64_t k = 0; k < hi; k++) {
+    int want_found = 1;
+    uint64_t want = 0;
+
+    if (k >= nb_keys)
+      want = k * 7 + 1;
+    else if (k % 10 == 0)
+      want_found = 0;
+    else
+      want = k * 7 + 3;
+
+    read_back_quiet(k);
+    if (rb_found == want_found && (!want_found || rb_value == want)) continue;
+    if (bad < 8)
+      check(false, "key %lu: found %d want %d, value %lu want %lu", k, rb_found,
+            want_found, rb_value, want);
+    bad++;
+  }
+  check(bad == 0, "%zu of %lu keys wrong after recovering from a crash", bad,
+        hi);
+  check(count_slab_files() == tnt_get_node_count(),
+        "%zu slab files for %lu nodes: recovery left garbage", count_slab_files(),
+        tnt_get_node_count());
+  validate("after crash recovery");
+  if (!bad) printf("  %-34s %lu keys\n", "state after crash recovery", hi);
+}
+
+/*
+ * After a crash in the middle of the initial load nothing is known about
+ * which writes were acknowledged, so only consistency is checked: recovery
+ * succeeds, nothing unreachable is left behind, both trees agree, and every
+ * readable key carries a value some version of the workload wrote for it.
+ */
+static void verify_consistent_only(void) {
+  uint64_t hi = nb_keys + nb_keys / 2;
+  size_t bad = 0, found = 0;
+
+  printf("  recovered %lu index entries\n", get_database_size());
+  for (uint64_t k = 0; k < hi; k++) {
+    read_back_quiet(k);
+    if (!rb_found) continue;
+    found++;
+    if (rb_value == k * 7 + 1 || rb_value == k * 7 + 2 || rb_value == k * 7 + 3)
+      continue;
+    if (bad < 8)
+      check(false, "key %lu reads %lu, no version of the workload wrote that", k,
+            rb_value);
+    bad++;
+  }
+  check(bad == 0, "%zu keys hold values nobody wrote", bad);
+  check(found > 0, "nothing at all survived the crash");
+  check(count_slab_files() == tnt_get_node_count(),
+        "%zu slab files for %lu nodes: recovery left garbage", count_slab_files(),
+        tnt_get_node_count());
+  validate("after crash recovery");
+  printf("  %-34s %zu keys readable, all consistent\n",
+         "state after crash recovery", found);
+}
+
 int main(int argc, char **argv) {
   int verify_only = argc > 1 && !strcmp(argv[1], "verify");
+  int verify_crash = argc > 1 && !strcmp(argv[1], "verify-crash");
+  int verify_consistent = argc > 1 && !strcmp(argv[1], "verify-consistent");
+  int crash_split = argc > 1 && !strcmp(argv[1], "crash-split");
+  int crash_prune = argc > 1 && !strncmp(argv[1], "crash-prune", 11);
+  int mode_arg = verify_only || verify_crash || verify_consistent ||
+                 crash_split || crash_prune;
 
-  if (argc > 1 && !verify_only) nb_keys = strtoull(argv[1], NULL, 0);
+  if (argc > 1 && !mode_arg) nb_keys = strtoull(argv[1], NULL, 0);
   if (argc > 2) nb_keys = strtoull(argv[2], NULL, 0);
 
   init_default_config(&cfg);
@@ -1431,8 +1507,13 @@ int main(int argc, char **argv) {
   slab_workers_init(1, 4, 2);
   if (cfg.with_reins) fsst_worker_init();
 
-  if (verify_only) {
-    verify_model();
+  if (verify_only || verify_crash || verify_consistent) {
+    if (verify_only)
+      verify_model();
+    else if (verify_crash)
+      verify_pre_prune_model();
+    else
+      verify_consistent_only();
     if (failures) {
       printf("== %lu failures ==\n", failures);
       return 1;
@@ -1440,6 +1521,9 @@ int main(int argc, char **argv) {
     printf("== ok ==\n");
     return 0;
   }
+
+  /* crash-split: die inside the first split, i.e. during the load below. */
+  if (crash_split) slab_set_crash_point(CRASH_SPLIT_BEFORE_COMMIT);
 
   run_upserts(0, nb_keys);
   validate("after splits");
@@ -1470,6 +1554,22 @@ int main(int argc, char **argv) {
   run_ops(0, nb_keys, 10, 0, 0, 1, 0);
   run_ops(0, nb_keys, 10, 0, 3, 0, 1);
   validate("after overwrites");
+
+  /*
+   * crash-prune-<n>: everything above is durable and acknowledged; now die at
+   * crash point n inside the first prune. The verify-crash mode checks that
+   * the recovered database shows exactly the pre-prune state.
+   */
+  if (crash_prune) {
+    int point = atoi(argv[1] + 12); /* after "crash-prune-" */
+
+    check(prune_count_candidates() > 0, "nothing to prune for the crash test");
+    slab_set_crash_point((enum slab_crash_point)point);
+    printf("  crashing at point %d inside a prune\n", point);
+    tnt_prune_once();
+    check(false, "the crash point %d was never reached", point);
+    return failures ? 1 : 0;
+  }
   check_selection("candidates after overwrites");
   check_cold_builds();
   validate("after cold builds");
