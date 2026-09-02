@@ -105,3 +105,39 @@ its `child_flag`, then makes the slab writable again *without* waking anyone (pr
 was parked, not spinning) and finally retires the node and wakes it with `child_flag` still 0 --
 so the `removed` check is the only possible exit. Reverting that check makes the test hang and
 fail. It relies on 100 ms being long enough for the writer to reach `futex_wait`.
+
+## Step 4 — candidate selection
+
+- `indexes/tnt_prune.c`: `prune_select()` evaluates the picking rule locally on the history tree
+  (`leaf -> inner -> outer` with `inner->lu_child[side] == leaf` and
+  `outer->lu_child[!side] == inner`), plus liveness (`child_flag` 1/1/0, nothing retired, the
+  leaf's slab not full) and a conservative fit test. `prune_scan_for_candidate()` /
+  `prune_count_candidates()` are the O(n) fallback discovery; the event-driven trigger is Step 9.
+  Nothing mutates anything yet.
+- `nb_items` is only decremented on invalidation, so it over-estimates the valid entries and the
+  fit test is conservative. The authoritative fit test is `slab_freeze()`'s budget.
+- `struct prune_candidate` and the prototypes live in `in-memory-index-tnt.h`; `tnt_centree()`
+  was added there so the scan can reach the tree.
+
+### What the workload has to look like
+
+A pure ascending (or descending) load produces **no** candidates, and that is correct, not a bug:
+
+- Every split appends the new leaf on the same side, so the chain reads
+  `leaf = inner->lu_child[s]`, `inner = outer->lu_child[s]` -- same side, which the rule rejects
+  because `sib`'s whole subtree sits between `inner` and `outer` in-order.
+- The "left-behind" child of each split *is* on the opposite side and is historically adjacent,
+  but `nb_items(inner) + nb_items(outer)` is then ~2 full slabs, so the fit test rejects it.
+
+Candidates appear once overwrites have drained the internal slabs. `test/prune_links.c` therefore
+runs three overwrite passes and finds 18 candidates out of ~39 leaves, covering both orientations
+and the `D == NULL` (history root) case; those three are asserted.
+
+### Equivalence check
+
+`scan_ili()` in the test is a second implementation written from the AGENTS.md wording: walk the
+routing in-order sequence, take every consecutive internal-leaf-internal triple, keep it when two
+of the three have `lu_parent` pointing inside the triple. The two candidate sets must be equal --
+checked after splits, after a rebalance (routing != history), and after overwrites. That is also
+what catches a selector that wrongly accepted same-side chains, which the ascending phases produce
+in quantity.

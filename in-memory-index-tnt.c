@@ -398,6 +398,8 @@ void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
   }
 }
 
+centree tnt_centree(void) { return centree_root; }
+
 tree_entry_t *centree_worker_lookup(void *key) {
   return centree_lookup(centree_root, key, tnt_pointer_cmp);
 }

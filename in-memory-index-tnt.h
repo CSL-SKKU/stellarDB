@@ -21,6 +21,8 @@ index_entry_t *subtree_worker_lookup_ukey(subtree_t *tree, uint64_t key);
 int subtree_worker_delete(subtree_t *tree, void *item);
 
 void centree_init(void);
+/* The one center tree. NULL before centree_init(). */
+centree tnt_centree(void);
 /*
  * Mutual exclusion between the maintenance operations that restructure the
  * center tree (rebalancing, and pruning once it lands). tnt_rebalancing()
@@ -111,6 +113,32 @@ void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void));
  * before the node's slab lock is taken and its removed flag is read.
  */
 void tnt_set_index_lookup_step_test_hook(void (*hook)(centree_node n));
+
+/*
+ * Pruning (indexes/tnt_prune.c). A candidate is an internal-leaf-internal
+ * triple that is consecutive in-order and adjacent in the history chain:
+ *
+ *   leaf -> inner -> outer -> up, with inner->lu_child[side] == leaf and
+ *   outer->lu_child[!side] == inner
+ *
+ * sib and star are the triple's two external history children, i.e. the only
+ * lu_parent pointers outside the triple that a prune has to rewire.
+ */
+struct prune_candidate {
+  centree_node leaf;  /* L */
+  centree_node inner; /* L->lu_parent, the younger internal node */
+  centree_node outer; /* inner->lu_parent, the older internal node */
+  centree_node up;    /* D, outer->lu_parent; NULL at the history root */
+  centree_node sib;   /* A, inner's other history child */
+  centree_node star;  /* *, outer's other history child */
+  int side;           /* s, the side of leaf under inner */
+  size_t cold_bound;  /* upper bound on the valid entries of outer + inner */
+};
+
+/* Selection only; neither mutates anything. */
+bool prune_select(centree_node leaf, struct prune_candidate *out);
+bool prune_scan_for_candidate(struct prune_candidate *out);
+size_t prune_count_candidates(void);
 
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);

@@ -25,7 +25,7 @@ endif
 
 LDLIBS=-lm -lpthread -lstdc++
 
-INDEXES_OBJ=indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o indexes/tnt_subtree.o indexes/tnt_balance.o
+INDEXES_OBJ=indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o indexes/tnt_subtree.o indexes/tnt_balance.o indexes/tnt_prune.o
 OTHERS_OBJ=config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o workload-bgwork.o workload-production.o workload-locality.o workload-latency.o utils.o rcu.o in-memory-index-tnt.o fsst.o db_bench.o ${INDEXES_OBJ}
 MAIN_OBJ=main.o ${OTHERS_OBJ} 
 
