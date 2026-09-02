@@ -92,7 +92,6 @@ int tnt_get_nodes_at_level(int level, background_queue *q);
 
 void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent);
 void tnt_index_add(struct slab_callback *cb, void *item);
-void tnt_index_add_shy(struct slab_callback *cb, void *item);
 /*
  * On success the returned entry carries one read reference on its slab, taken
  * under the slab lock that found it. The read path passes it to the read

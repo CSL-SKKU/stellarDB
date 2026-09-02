@@ -1173,17 +1173,6 @@ void tnt_index_add(struct slab_callback *cb, void *item) {
   subtree_worker_insert(cb->slab->subtree, item, &new_entry);
 }
 
-/* Same, marking the entry as written by reinsertion. */
-void tnt_index_add_shy(struct slab_callback *cb, void *item) {
-  index_entry_t new_entry;
-  uint64_t hash = get_prefix_for_item(item);
-
-  new_entry.slab = cb->slab;
-  new_entry.slab_idx = cb->slab_idx;
-  subtree_insert_shy(cb->slab->subtree, (unsigned char *)&hash, sizeof(hash),
-                     &new_entry);
-}
-
 int tnt_index_invalid(void *item) {
   centree t = centree_root;
   struct item_metadata *meta = (struct item_metadata *)item;

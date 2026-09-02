@@ -157,12 +157,6 @@ static inline void slab_widen_range(struct slab *s, uint64_t key) {
 }
 
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
-/*
- * Completion of a reinsertion's append. Publishes the entry as shy only if the
- * key is still absent from the destination and the source record is still the
- * authoritative one; otherwise the slot is abandoned. Never frees the callback.
- */
-void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item);
 
 /*
  * Make a slab immutable so a maintenance pass can copy it. Returns the number

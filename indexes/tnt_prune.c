@@ -222,7 +222,6 @@ static uint64_t prune_bad_slots;
 struct prune_src_entry {
   uint64_t key;
   uint32_t slot;
-  uint32_t shy; /* the source entry was written by reinsertion */
 };
 
 struct prune_snapshot {
@@ -244,7 +243,6 @@ static void snapshot_cb(uint64_t key, uint32_t slot, void *data) {
   }
   snap->entries[snap->nb].key = key;
   snap->entries[snap->nb].slot = (uint32_t)GET_SIDX(slot);
-  snap->entries[snap->nb].shy = sidx_is_shy(slot);
   snap->nb++;
 }
 
@@ -452,12 +450,7 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
     if (!replaces) {
       entry.slab = n;
       entry.slab_idx = dst;
-      /* The shy bit travels with the entry; the record carries it too. */
-      if (snap.entries[i].shy)
-        subtree_insert_shy(n->subtree, (unsigned char *)&key, sizeof(key),
-                           &entry);
-      else
-        subtree_insert(n->subtree, (unsigned char *)&key, sizeof(key), &entry);
+      subtree_insert(n->subtree, (unsigned char *)&key, sizeof(key), &entry);
       slab_widen_range(n, key);
       b->count++;
     }
