@@ -37,9 +37,12 @@ static void *fsst_worker(void *pdata) {
        * Pin the source for the whole batch: the read reference keeps its file
        * and subtree alive while this pass reads them. A slab that is already
        * retired is dropped -- its records live in the replacement node now.
+       * So is a slab that is not full: its bytes can still change under the
+       * buffer read below, and its records are already at the leaf anyway.
        */
       R_LOCK(&s->tree_lock);
-      if (atomic_load_explicit(&node->removed, memory_order_acquire)) {
+      if (atomic_load_explicit(&node->removed, memory_order_acquire) ||
+          !atomic_load_explicit(&s->full, memory_order_acquire)) {
         R_UNLOCK(&s->tree_lock);
         atomic_store_explicit(&s->queued, 0, memory_order_relaxed);
         continue;
@@ -156,12 +159,42 @@ static void *fsst_worker(void *pdata) {
               }
             }
             
-            // (4) 비동기 업데이트 호출
+            /*
+             * Authority check: the record we hold must be the one a READ
+             * would return, i.e. the first copy of the key walking up from the
+             * current leaf must be this very slot. This does not trust the
+             * invalid hint, which can be missed.
+             */
+            {
+              index_entry_t *cur = tnt_index_lookup(cb, cb->item);
+              int authoritative = cur != NULL && cur->slab == s &&
+                                  GET_SIDX(cur->slab_idx) == slot_idx;
+
+              tnt_index_lookup_unref(cur);
+              if (!authoritative) goto skip;
+            }
+
+            // (4) 비동기 업데이트 호출: append only, as a shy record
             e = NULL;
             tree = centree_lookup_and_reserve(cb->item, &cb->slab_idx, &e);
             cb->slab = tree->slab;
-
-            remove_and_add_item_async(cb);
+            if (cb->slab_idx == (uint64_t)-1) {
+              /*
+               * In place means the key is already in the leaf: the
+               * authoritative copy is where it belongs, nothing to move. The
+               * reservation path took an update reference for the in-place
+               * write; give it back.
+               */
+              __sync_fetch_and_sub(&cb->slab->update_ref, 1);
+              slab_release_if_idle(cb->slab);
+              goto skip;
+            }
+            item_mark_shy(meta);
+            cb->cb = add_in_tree_for_reinsertion; /* decides at completion */
+            cb->cb_cb = cb_gc;                    /* frees item and cb */
+            cb->io_cb = add_item_async_cb1;
+            cb->lru_entry = NULL;
+            cb->io_cb(cb);
             updated++;
             continue;
           skip:
