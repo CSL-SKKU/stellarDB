@@ -30,6 +30,21 @@ static void *fsst_worker(void *pdata) {
 
       size_t num_words = (((s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE) + 63) / 64;
       struct slab_callback *cb;
+      centree_node node = (centree_node)s->centree_node;
+
+      /*
+       * Pin the source for the whole batch: the read reference keeps its file
+       * and subtree alive while this pass reads them. A slab that is already
+       * retired is dropped -- its records live in the replacement node now.
+       */
+      R_LOCK(&s->tree_lock);
+      if (atomic_load_explicit(&node->removed, memory_order_acquire)) {
+        R_UNLOCK(&s->tree_lock);
+        atomic_store_explicit(&s->queued, 0, memory_order_relaxed);
+        continue;
+      }
+      __sync_fetch_and_add(&s->read_ref, 1);
+      R_UNLOCK(&s->tree_lock);
 
       printf("GC: %lu\n", s->seq);
       size_t nread = pread(s->fd, gc_buf, s->size_on_disk, 0);
@@ -48,6 +63,7 @@ static void *fsst_worker(void *pdata) {
           struct tree_entry *tree;
           index_entry_t *c, *e;
           struct item_metadata *meta;
+          uint32_t src_idx;
 
           // (가) 워드 내 최하위 세트 비트(0~63)를 찾는다.
           int bit_pos = __builtin_ctzll(word);
@@ -95,7 +111,22 @@ static void *fsst_worker(void *pdata) {
             /* empty slot; no need for reinsertion */
             if (item_is_empty(meta)) goto skip;
 
+            /*
+             * The source slab's subtree is freed under its write lock when it
+             * is retired, so consult it under the read lock and only while the
+             * node is live. Retirement mid-batch ends the pass: the records
+             * were already copied into the replacement node.
+             */
+            R_LOCK(&s->tree_lock);
+            if (atomic_load_explicit(&node->removed, memory_order_acquire)) {
+              R_UNLOCK(&s->tree_lock);
+              free(cb->item);
+              free(cb);
+              goto slab_done;
+            }
             c = tnt_index_lookup_utree(s->subtree, cb->item);
+            src_idx = c ? (uint32_t)c->slab_idx : 0;
+            R_UNLOCK(&s->tree_lock);
 
             /* check if c is still indexed */
             if (!c) goto skip;
@@ -103,7 +134,7 @@ static void *fsst_worker(void *pdata) {
             /* inspect invalid/stale marker */
             {
               unsigned char v;
-              const uint32_t p = c->slab_idx;
+              const uint32_t p = src_idx;
               asm("btl %2, %1; setc %0" : "=qm"(v) : "m"(p), "Ir"(31));
               if (v == 1) goto skip;
             }
@@ -142,6 +173,8 @@ static void *fsst_worker(void *pdata) {
         }
 	//}
       }
+slab_done:
+      __sync_fetch_and_sub(&s->read_ref, 1);
       atomic_store_explicit(&s->queued, 0, memory_order_relaxed);
     }
   }

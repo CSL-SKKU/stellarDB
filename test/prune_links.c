@@ -19,6 +19,8 @@
  */
 #include "headers.h"
 
+#include <limits.h>
+#include <linux/futex.h>
 #include <stdbool.h>
 #include <stdarg.h>
 
@@ -261,6 +263,118 @@ static void check_read_restart(uint64_t key) {
   free(item);
 }
 
+/* --------------------------- a blocked writer released by retirement */
+
+/*
+ * A writer whose leaf is frozen parks on the leaf's child_flag waiting for the
+ * split that will never come. Retirement is the second way out: the pruner
+ * sets removed and wakes the waiters, and the writer must restart its descent.
+ *
+ * The sequence below leaves child_flag at 0 throughout, so the removed check
+ * is the *only* thing that can release the writer. It also makes the slab
+ * writable again before the wake-up, which is what lets the restart finish
+ * here without an actual routing splice (that is a later step).
+ */
+static void wake_child_flag(centree_node n) {
+  syscall(SYS_futex, &n->child_flag, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+
+static centree_node leaf_for_key(uint64_t key) {
+  centree_node n = routing_root();
+
+  while (n) {
+    centree_node next = key < centree_pivot_load(n) ? tnt_routing_left(n)
+                                                    : tnt_routing_right(n);
+    if (!next) break;
+    n = next;
+  }
+  return n;
+}
+
+static _Atomic int rb_done;
+static int rb_found;
+static uint64_t rb_value;
+
+static void read_back_done(struct slab_callback *cb, void *item) {
+  struct item_metadata *meta = item;
+
+  (void)cb;
+  rb_found = item != NULL;
+  if (item)
+    rb_value =
+        *(uint64_t *)((unsigned char *)item + sizeof(*meta) + sizeof(uint64_t));
+  atomic_store(&rb_done, 1);
+}
+
+static void read_back(uint64_t key, uint64_t want) {
+  unsigned char *item = make_item(key, 0);
+  struct slab_callback cb = {0};
+
+  cb.cb = read_back_done;
+  cb.item = (char *)item;
+  cb.fsst_idx = -1;
+  rb_found = 0;
+  rb_value = 0;
+  atomic_store(&rb_done, 0);
+  kv_read_async(&cb);
+  while (!atomic_load(&rb_done)) NOP10();
+  check(rb_found, "key %lu is unreadable", key);
+  if (rb_found)
+    check(rb_value == want, "key %lu reads %lu, want %lu", key, rb_value, want);
+  free(item);
+}
+
+static void check_blocked_writer(uint64_t key) {
+  centree_node leaf = leaf_for_key(key);
+  struct req r = {0};
+  struct slab *s;
+  long frozen;
+
+  if (!leaf) {
+    check(false, "no routing leaf for key %lu", key);
+    return;
+  }
+  s = leaf->value.slab;
+  frozen = slab_freeze(s, s->nb_max_items);
+  if (frozen < 0) {
+    check(false, "freeze of leaf slab %lu returned %ld", s->seq, frozen);
+    return;
+  }
+
+  r.item = make_item(key, 0xbeef);
+  r.cb.cb = write_done;
+  r.cb.item = (char *)r.item;
+  r.cb.fsst_idx = -1;
+  atomic_store(&r.done, 0);
+  kv_upsert_async(&r.cb);
+
+  usleep(100000);
+  check(!atomic_load(&r.done),
+        "writer completed although its leaf was frozen and childless");
+
+  /* Writable again, but nobody has been woken: a parked writer stays parked. */
+  atomic_store(&s->last_item, (size_t)frozen);
+  atomic_store(&s->full, 0);
+  usleep(50000);
+  check(!atomic_load(&r.done), "writer was spinning on child_flag, not parked");
+
+  /* Retire and wake, with child_flag still 0. */
+  atomic_store(&leaf->removed, 1);
+  wake_child_flag(leaf);
+
+  for (int i = 0; i < 5000 && !atomic_load(&r.done); i++) usleep(1000);
+  check(atomic_load(&r.done),
+        "writer never restarted after its leaf was retired");
+  atomic_store(&leaf->removed, 0);
+
+  if (atomic_load(&r.done)) {
+    read_back(key, 0xbeef);
+    printf("  %-34s key %lu via slab %lu\n", "blocked writer restarted", key,
+           s->seq);
+  }
+  free(r.item);
+}
+
 int main(int argc, char **argv) {
   if (argc > 1) nb_keys = strtoull(argv[1], NULL, 0);
 
@@ -288,6 +402,9 @@ int main(int argc, char **argv) {
   /* An early key sits in an internal slab, a late one in its leaf. */
   check_read_restart(0);
   check_read_restart(nb_keys + nb_keys / 2 - 1);
+
+  check_blocked_writer(nb_keys / 2);
+  validate("after blocked-writer restart");
 
   if (failures) {
     printf("== %lu failures ==\n", failures);

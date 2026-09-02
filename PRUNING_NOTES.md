@@ -78,3 +78,30 @@ the routing root, so a pruned triple must be spliced out of routing *before* `re
 
 The plan's "a writer arriving after a freeze does not deadlock" test needs the restart-on-removed
 wake-up, which is Step 3. Not written yet.
+
+## Step 3 — blocked writers restart; reinsertion pins its source
+
+- Both writer wait loops (`centree_lookup_and_reserve`, `tnt_subtree_get`) now wait on
+  `child_flag == 0 && !removed` and restart the whole descent when `removed` is set. A pruned
+  leaf never grows children, so retirement is the only other way out of that wait; testing both
+  also covers a wake that races with the flag store. The update reference is already released
+  before the wait (Step 2), so a restart leaks nothing.
+- The writer's upward walk *skips* retired slabs instead of restarting: it only looks for an
+  older copy to invalidate, and that copy was already carried into the replacement node.
+- Reinsertion (`fsst.c`) pins its source slab with `read_ref` for the whole batch, after checking
+  `removed` under `tree_lock`, and consults `s->subtree` under the read lock (it used to read it
+  with no lock at all -- fine while historical slabs were immutable, not fine once retirement
+  frees the subtree). Retirement mid-batch ends the pass. `slab_release_if_idle()` will be called
+  at the unpin site in Step 8.
+- `tnt_index_invalid()` needs no `removed` check: it descends from the routing root, and a retired
+  node is spliced out of routing before `removed` is set, so it is unreachable there.
+  `add_in_tree_for_upsert()`'s `old_s` invalidation is covered by its existing `min == -1` guard,
+  which is why retirement keeps setting `min = -1`.
+
+### Test note
+
+`check_blocked_writer()` in `test/prune_links.c` freezes a live leaf, lets a real UPSERT park on
+its `child_flag`, then makes the slab writable again *without* waking anyone (proving the writer
+was parked, not spinning) and finally retires the node and wakes it with `child_flag` still 0 --
+so the `removed` check is the only possible exit. Reverting that check makes the test hang and
+fail. It relies on 100 ms being long enough for the writer to reach `futex_wait`.

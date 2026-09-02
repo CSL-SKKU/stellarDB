@@ -631,6 +631,7 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
   centree t = centree_root;
   centree_node n, prev;
 
+restart:
   R_LOCK(&centree_root_lock);
   n = centree_current_root(t);
   while (1) {
@@ -704,9 +705,18 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
       R_UNLOCK(&s->tree_lock);
       if (!n) {
         R_UNLOCK(&centree_root_lock);
-        while (atomic_load(&prev->child_flag) == 0) {
+        /*
+         * Retirement is the other way out of this wait: a pruned leaf never
+         * grows children, so the pruner sets removed and wakes the waiters.
+         * Testing removed as well as the flag also covers a wake that races
+         * with the flag store.
+         */
+        while (atomic_load(&prev->child_flag) == 0 &&
+               !atomic_load(&prev->removed)) {
           futex_wait(&prev->child_flag, 0);
         }
+        if (atomic_load(&prev->removed))
+          goto restart;
         R_LOCK(&centree_root_lock);
       }
     } while (!n);
@@ -729,10 +739,13 @@ struct tree_entry* centree_lookup_and_reserve(
   uint64_t key = *(uint64_t *)item_key;
 
   // 4) 최초 하강: 기존 find 함수 재사용
-  centree_node n = centree_find_leaf((void *)key);
+  centree_node n;
 
   // 5) 이후부터는 root 락을 잡고 slab 할당/하강 로직 수행
   centree_node prev;
+
+restart:
+  n = centree_find_leaf((void *)key);
 
   R_LOCK(&centree_root_lock);
   while (1) {
@@ -788,9 +801,20 @@ struct tree_entry* centree_lookup_and_reserve(
 
       if (!n) {
         R_UNLOCK(&centree_root_lock);
-        while (atomic_load_explicit(&prev->child_flag, memory_order_acquire) == 0) {
+        /*
+         * Retirement is the other way out of this wait: a pruned leaf never
+         * grows children, so the pruner sets removed and wakes the waiters.
+         * Testing removed as well as the flag also covers a wake that races
+         * with the flag store. The update reference was already released
+         * above, so restarting leaks nothing.
+         */
+        while (atomic_load_explicit(&prev->child_flag,
+                                    memory_order_acquire) == 0 &&
+               !atomic_load_explicit(&prev->removed, memory_order_acquire)) {
           futex_wait(&prev->child_flag, 0);
         }
+        if (atomic_load_explicit(&prev->removed, memory_order_acquire))
+          goto restart;
         R_LOCK(&centree_root_lock);
       }
     } while (!n);
@@ -799,12 +823,19 @@ struct tree_entry* centree_lookup_and_reserve(
   R_UNLOCK(&centree_root_lock);
 
   // 6) upward lookup: 리프 노드 n에서부터 위로 올라가며 이전 entry 찾기
+  /*
+   * Retired slabs are skipped rather than restarted on: this walk only looks
+   * for the older copy to invalidate, and the copy it would have found was
+   * already carried into the replacement node. Its subtree is freed under the
+   * write lock, so it must not be consulted once removed is set.
+   */
   *out_e = NULL;
   for (centree_node cur = n; cur; cur = centree_lu_parent(cur)) {
     struct slab *s2 = cur->value.slab;
     index_entry_t *e2 = NULL;
     R_LOCK(&s2->tree_lock);
-    if (key <= s2->max && key >= s2->min)
+    if (!atomic_load_explicit(&cur->removed, memory_order_acquire) &&
+        key <= s2->max && key >= s2->min)
     	e2 = subtree_worker_lookup_utree(s2->subtree, item);
     R_UNLOCK(&s2->tree_lock);
     if (e2) {
