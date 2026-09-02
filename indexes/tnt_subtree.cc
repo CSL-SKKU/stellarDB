@@ -85,25 +85,6 @@ void subtree_insert(subtree_t *t, unsigned char *k, size_t len,
   b->insert(make_pair(hash, (uint32_t)e->slab_idx));
 }
 
-void subtree_insert_shy(subtree_t *t, unsigned char *k, size_t len,
-                        struct index_entry *e) {
-  uint64_t hash = *(uint64_t *)k;
-  btree_map<uint64_t, uint32_t> *b =
-      static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
-  b->insert(make_pair(hash, (uint32_t)e->slab_idx | SIDX_SHY_BIT));
-}
-
-int subtree_clear_shy(subtree_t *t, unsigned char *k, size_t len) {
-  uint64_t hash = *(uint64_t *)k;
-  btree_map<uint64_t, uint32_t> *b =
-      static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
-  auto i = b->find(hash);
-  if (i == b->end())
-    return 0;
-  __atomic_and_fetch(&i->second, ~SIDX_SHY_BIT, __ATOMIC_RELAXED);
-  return 1;
-}
-
 int subtree_sample_percent(subtree_t *t,
                            uint64_t *out_keys,
                            size_t sample_cnt) {

@@ -19,11 +19,6 @@ void subtree_set_slab(subtree_t *t, void *slab);
 int subtree_delete(subtree_t *t, unsigned char *k, size_t len);
 void subtree_insert(subtree_t *t, unsigned char *k, size_t len,
                     struct index_entry *e);
-/* Same, with the shy bit set on the stored slot word. */
-void subtree_insert_shy(subtree_t *t, unsigned char *k, size_t len,
-                        struct index_entry *e);
-/* Clears the shy bit; returns 1 if the key was present. Keeps the other bits. */
-int subtree_clear_shy(subtree_t *t, unsigned char *k, size_t len);
 
 int subtree_forall_keys(subtree_t *t, void (*cb)(uint64_t h, int n, void *data),
                          void *data);

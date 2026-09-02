@@ -26,21 +26,9 @@ static inline void set_bit(int nr, size_t *addr) {
   asm("btsl %1,%0" : "+m"(*(size_t *)addr) : "Ir"(nr));
 }
 
-/*
- * The local index stores a 32-bit slot word per key: the slot index in the low
- * bits, the invalid hint in bit 31, and the shy bit in bit 30 (the entry was
- * written by reinsertion and yields to any client write of the same key).
- */
-#define SIDX_INVALID_BIT (1u << 31)
-#define SIDX_SHY_BIT (1u << 30)
-#define GET_SIDX(x) \
-  ((size_t)((uint32_t)(x) & ~(SIDX_INVALID_BIT | SIDX_SHY_BIT)))
-static inline int sidx_is_invalid(size_t word) {
-  return ((uint32_t)word & SIDX_INVALID_BIT) != 0;
-}
-static inline int sidx_is_shy(size_t word) {
-  return ((uint32_t)word & SIDX_SHY_BIT) != 0;
-}
+//#define SET_INVAL(x) set_bit(63, &x)
+//#define TEST_INVAL(x) test_bit(63, &x)
+#define GET_SIDX(x) ((size_t)((uint32_t)(x) & ~(1u << 31)))
 
 struct slab;
 struct index_entry {  // This index entry could be made much smaller by, e.g.,
