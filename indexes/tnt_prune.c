@@ -30,6 +30,7 @@
 #include "../headers.h"
 #include "tnt_centree.h"
 
+#include <errno.h>
 #include <stdbool.h>
 
 /* Slack kept free in the merged slab. Step 9 makes this configurable. */
@@ -190,4 +191,286 @@ size_t prune_count_candidates(void) {
 
   free(leaves);
   return count;
+}
+
+/* ===================================================================== *
+ * Building the replacement node N
+ *
+ * N is assembled entirely off to the side: a fresh slab file, a fresh
+ * subtree and an unpublished center-tree node. Nothing points at it until
+ * the history link and the routing splice, so a build that fails or is
+ * rejected is simply discarded (I-1).
+ *
+ * Sources are merged newest first -- leaf, then inner, then outer -- and a
+ * key already present in N is skipped. That is the same result as merging
+ * oldest first and letting later sources override (precedence
+ * leaf > inner > outer, §2.4), without ever writing a slot twice.
+ *
+ * Records are copied byte-exact, whole slot: a tombstone occupies only part
+ * of its slot, and copying the slot keeps it intact.
+ * ===================================================================== */
+
+struct prune_src_entry {
+  uint64_t key;
+  uint32_t slot;
+};
+
+struct prune_snapshot {
+  struct prune_src_entry *entries;
+  size_t nb;
+  size_t capacity;
+  int overflow;
+};
+
+static void snapshot_cb(uint64_t key, uint32_t slot, void *data) {
+  struct prune_snapshot *snap = data;
+
+  /* bit 31 is the invalid hint: the entry is stale, drop it. */
+  if (slot & (1u << 31))
+    return;
+  if (snap->nb == snap->capacity) {
+    snap->overflow = 1;
+    return;
+  }
+  snap->entries[snap->nb].key = key;
+  snap->entries[snap->nb].slot = (uint32_t)GET_SIDX(slot);
+  snap->nb++;
+}
+
+static int compare_by_slot(const void *a, const void *b) {
+  const struct prune_src_entry *x = a, *y = b;
+
+  if (x->slot < y->slot) return -1;
+  if (x->slot > y->slot) return 1;
+  return 0;
+}
+
+static char *slot_in_buffer(struct prune_build *b, size_t slot) {
+  struct slab *n = b->slab;
+  size_t items_per_page = PAGE_SIZE / n->item_size;
+
+  return b->buffer + (slot / items_per_page) * PAGE_SIZE +
+         (slot % items_per_page) * n->item_size;
+}
+
+static size_t pages_for(struct slab *n, size_t slots) {
+  size_t items_per_page = PAGE_SIZE / n->item_size;
+
+  return (slots + items_per_page - 1) / items_per_page;
+}
+
+int prune_build_begin(const struct prune_candidate *c,
+                      struct prune_build *out) {
+  struct slab *leaf_slab = c->leaf->value.slab;
+  tree_entry_t value = {0};
+  size_t pages;
+
+  memset(out, 0, sizeof(*out));
+
+  /*
+   * Room for what selection said could survive. The freeze budget in the
+   * next step is derived from what is left of this, so the buffer size is
+   * also the hard cap on the merged slab.
+   */
+  out->capacity = c->cold_bound + leaf_slab->nb_items + prune_fit_margin;
+  if (out->capacity > leaf_slab->nb_max_items)
+    out->capacity = leaf_slab->nb_max_items;
+
+  /*
+   * The throwaway build borrows outer's level and pivot; the real one takes
+   * them from the routing node N replaces.
+   */
+  out->slab = create_slab(NULL,
+                          atomic_load_explicit(&c->outer->value.level,
+                                               memory_order_acquire),
+                          centree_pivot_load(c->outer), 0, NULL);
+  if (out->slab == NULL || out->slab->fd < 0) {
+    free(out->slab);
+    memset(out, 0, sizeof(*out));
+    return -EIO;
+  }
+  out->slab->subtree = tnt_subtree_create();
+  subtree_set_slab(out->slab->subtree, out->slab);
+
+  pages = pages_for(out->slab, out->capacity);
+  if (pages == 0)
+    pages = 1;
+  out->buffer = aligned_alloc(PAGE_SIZE, pages * PAGE_SIZE);
+  if (out->buffer == NULL) {
+    prune_build_discard(out);
+    return -ENOMEM;
+  }
+  /* Unused slots stay zeroed, which is what item_is_empty() reads. */
+  memset(out->buffer, 0, pages * PAGE_SIZE);
+
+  value.key = centree_pivot_load(c->outer);
+  value.seq = out->slab->seq;
+  value.slab = out->slab;
+  out->node = centree_node_new((void *)(uintptr_t)value.key, &value);
+  atomic_store_explicit(&out->node->value.level,
+                        atomic_load_explicit(&c->outer->value.level,
+                                             memory_order_acquire),
+                        memory_order_release);
+  out->slab->centree_node = out->node;
+  return 0;
+}
+
+int prune_build_add_source(struct prune_build *b, centree_node source) {
+  struct slab *src = source->value.slab;
+  struct slab *n = b->slab;
+  struct prune_snapshot snap = {0};
+  size_t items_per_page = PAGE_SIZE / src->item_size;
+  size_t cached_page = (size_t)-1;
+  char *page = NULL;
+  int error = 0;
+
+  snap.capacity = src->nb_max_items;
+  snap.entries = malloc(snap.capacity * sizeof(*snap.entries));
+  page = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
+  if (snap.entries == NULL || page == NULL) {
+    error = -ENOMEM;
+    goto out;
+  }
+
+  /*
+   * Snapshot under the source's lock (I-5), copy without it: an internal
+   * slab is immutable except for the invalid hint, and an entry is published
+   * in the subtree only once its page write has completed, so what the
+   * snapshot names is already on the device. An entry invalidated after the
+   * snapshot is copied anyway; it lands in N as a stale entry, shadowed by
+   * the newer copy nearer the leaf (§7).
+   */
+  R_LOCK(&src->tree_lock);
+  if (retired(source)) {
+    R_UNLOCK(&src->tree_lock);
+    error = -ECANCELED;
+    goto out;
+  }
+  subtree_forall_entries(src->subtree, snapshot_cb, &snap);
+  R_UNLOCK(&src->tree_lock);
+  if (snap.overflow) {
+    error = -E2BIG;
+    goto out;
+  }
+
+  /* Slot order, so each source page is read at most once. */
+  qsort(snap.entries, snap.nb, sizeof(*snap.entries), compare_by_slot);
+
+  for (size_t i = 0; i < snap.nb; i++) {
+    uint64_t key = snap.entries[i].key;
+    size_t slot = snap.entries[i].slot;
+    size_t page_idx = slot / items_per_page;
+    index_entry_t existing;
+    index_entry_t entry;
+    struct item_metadata *meta;
+    char *record;
+
+    /* A newer source already placed this key: precedence leaf > inner > outer. */
+    if (subtree_find(n->subtree, (unsigned char *)&key, sizeof(key),
+                     &existing))
+      continue;
+    if (slot >= src->nb_max_items) {
+      error = -EINVAL;
+      goto out;
+    }
+    if (b->count == b->capacity) {
+      error = -ENOSPC;
+      goto out;
+    }
+
+    if (page_idx != cached_page) {
+      ssize_t got = pread(src->fd, page, PAGE_SIZE,
+                          (off_t)page_idx * PAGE_SIZE);
+
+      if (got != (ssize_t)PAGE_SIZE) {
+        error = -EIO;
+        goto out;
+      }
+      cached_page = page_idx;
+    }
+
+    record = page + (slot % items_per_page) * src->item_size;
+    meta = (struct item_metadata *)record;
+    if (item_is_legacy(meta) || item_is_empty(meta) ||
+        *(uint64_t *)(record + sizeof(*meta)) != key)
+      die("Pruning found slab %lu slot %lu not holding indexed key %lu\n",
+          src->seq, slot, key);
+
+    memcpy(slot_in_buffer(b, b->count), record, n->item_size);
+    entry.slab = n;
+    entry.slab_idx = b->count;
+    subtree_insert(n->subtree, (unsigned char *)&key, sizeof(key), &entry);
+    slab_widen_range(n, key);
+    b->count++;
+  }
+
+out:
+  free(snap.entries);
+  free(page);
+  return error;
+}
+
+int prune_build_finish(struct prune_build *b) {
+  struct slab *n = b->slab;
+  size_t pages = pages_for(n, b->count);
+
+  if (pages > 0) {
+    ssize_t written = pwrite(n->fd, b->buffer, pages * PAGE_SIZE, 0);
+
+    if (written != (ssize_t)(pages * PAGE_SIZE))
+      return -EIO;
+  }
+  if (fsync(n->fd) != 0)
+    return -EIO;
+
+  /*
+   * full = 1 on an internal node is deliberate (§7): every writer descent
+   * tries reserve_slot() on the nodes it passes, and N is immutable.
+   */
+  n->nb_items = b->count;
+  atomic_store_explicit(&n->last_item, b->count, memory_order_release);
+  atomic_store_explicit(&n->full, 1, memory_order_release);
+  atomic_store_explicit(&b->node->child_flag, 1, memory_order_release);
+  return 0;
+}
+
+int prune_build_cold(const struct prune_candidate *c,
+                     struct prune_build *out) {
+  int error = prune_build_begin(c, out);
+
+  if (error)
+    return error;
+  /* Newest first: inner overrides outer. The leaf joins after its freeze. */
+  error = prune_build_add_source(out, c->inner);
+  if (!error)
+    error = prune_build_add_source(out, c->outer);
+  if (!error)
+    error = prune_build_finish(out);
+  return error;
+}
+
+void prune_build_discard(struct prune_build *b) {
+  if (b->slab != NULL) {
+    char proc[64], path[512];
+    int len;
+
+    /* The file was never referenced by anything else. */
+    snprintf(proc, sizeof(proc), "/proc/self/fd/%d", b->slab->fd);
+    len = readlink(proc, path, sizeof(path) - 1);
+    if (len > 0) {
+      path[len] = 0;
+      unlink(path);
+    }
+    close(b->slab->fd);
+    if (b->slab->subtree != NULL)
+      subtree_free(b->slab->subtree);
+    if (cfg.with_reins)
+      free(b->slab->hot_bits);
+    free(b->slab->batched_callbacks);
+    free(b->slab);
+  }
+  /* Unpublished, so unlike a live node this one may be freed (I-4). */
+  free(b->node);
+  free(b->buffer);
+  memset(b, 0, sizeof(*b));
 }

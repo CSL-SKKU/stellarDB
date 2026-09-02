@@ -136,6 +136,21 @@ int subtree_forall_keys(subtree_t *t, void (*cb)(uint64_t h, int n, void *data),
   }
   return n;
 }
+int subtree_forall_entries(subtree_t *t,
+                           void (*cb)(uint64_t key, uint32_t slot, void *data),
+                           void *data) {
+  btree_map<uint64_t, uint32_t> *b =
+      static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
+  int n = 0;
+  auto i = b->begin();
+  while (i != b->end()) {
+    cb(i->first, i->second, data);
+    n++;
+    i++;
+  }
+  return n;
+}
+
 int subtree_forall_invalid(subtree_t *t, void *data, void (*cb)(void *slab, uint64_t slab_idx)) {
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);

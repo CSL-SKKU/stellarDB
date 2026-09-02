@@ -147,6 +147,10 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
  */
 long slab_freeze(struct slab *s, size_t budget);
 
+/* A fresh slab file, or (rebuild != 0) a descriptor over an existing one. */
+struct slab *create_slab(struct slab_context *ctx, uint64_t level, uint64_t key,
+                         int rebuild, char *name);
+
 struct slab *resize_slab(struct slab *s);
 
 void *read_item(struct slab *s, size_t idx);

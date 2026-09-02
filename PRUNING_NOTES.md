@@ -141,3 +141,53 @@ of the three have `lu_parent` pointing inside the triple. The two candidate sets
 checked after splits, after a rebalance (routing != history), and after overwrites. That is also
 what catches a selector that wrongly accepted same-side chains, which the ascending phases produce
 in quantity.
+
+## Step 5 — building the merged slab N
+
+- `prune_build_begin` / `add_source` / `finish` / `discard` in `indexes/tnt_prune.c` assemble N
+  entirely off to the side: a fresh slab file, a fresh subtree, an unpublished node. Nothing
+  points at it until the history link, so a rejected build is just discarded (I-1). Since the node
+  is unpublished, it *may* be freed -- I-4 is about published nodes.
+- Sources are merged **newest first** (inner, then outer; the leaf joins in Step 6) and a key
+  already in N is skipped. Same result as the plan's "oldest first, later sources override"
+  (precedence leaf > inner > outer) without writing a slot twice.
+- Records are copied whole-slot and byte-exact, which is what keeps tombstones intact.
+- Entries are snapshotted under the source's `tree_lock` and copied without it. Safe because an
+  internal slab is immutable apart from the invalid hint, and an entry appears in the subtree only
+  after its page write has completed -- so what the snapshot names is already on the device. An
+  entry invalidated after the snapshot is copied anyway and lands in N as a stale entry, shadowed
+  by the newer copy nearer the leaf (§7).
+- The snapshot is sorted by source slot, so each source page is `pread` at most once. N is
+  assembled in one page-aligned buffer sized to what selection said could survive, then written
+  with a single `pwrite` of the used pages and `fsync`ed. Unused slots stay zeroed, which is what
+  `item_is_empty()` reads.
+- `full = 1` on N is deliberate (§7): every writer descent calls `reserve_slot()` on the nodes it
+  passes, and N is immutable.
+- `subtree_forall_entries()` was added to `tnt_subtree.cc` (the existing iterators give keys or
+  slots, never both). `create_slab()` is now declared in `slab.h`.
+
+### Verification and what it does not cover
+
+`test/prune_links.c` builds N for every `leaf -> inner -> outer` chain whose two internal slabs
+could fit in one slab -- prunable or not, because the merge does not care -- and checks N against
+an expected set derived straight from the sources: same key set, byte-identical records,
+tombstone flags preserved, every key inside N's `[min, max]`, counters consistent, plus the empty-N
+case via begin+finish with no sources. Last run: 27 builds, 17 non-empty, 2034 entries of which
+1554 tombstones.
+
+Two counters worth watching, both 0 on every run so far:
+
+- **stale-but-unmarked**: entries that survived into N but whose value differs from what a normal
+  READ returns, i.e. the invalid hint was missed. 0 means invalidation is reliable in this
+  workload.
+- **duplicated across sources**: keys valid in *both* internal slabs. 0 means the source
+  precedence rule is a safety net this workload never triggers -- it only matters when an
+  invalidation was missed. Worth remembering: precedence is therefore effectively untested by the
+  real workload, and only the newest-first structure of the code enforces it.
+
+### Workload note
+
+Selection and the merge want opposite things, which is why the test does both jobs separately:
+enough overwrite passes and the internal slabs are 100% stale (18 candidates, every N empty);
+too few and they are too full to fit (0 candidates). Two 90% passes plus deletes on the untouched
+tenth gives real candidates *and* rich sources for the merge.

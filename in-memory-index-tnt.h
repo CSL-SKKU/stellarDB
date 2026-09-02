@@ -140,6 +140,32 @@ bool prune_select(centree_node leaf, struct prune_candidate *out);
 bool prune_scan_for_candidate(struct prune_candidate *out);
 size_t prune_count_candidates(void);
 
+/*
+ * The replacement node N under construction. Nothing points at it until the
+ * history link and routing splice, so an unfinished build can simply be
+ * discarded.
+ */
+struct prune_build {
+  struct slab *slab;  /* N */
+  centree_node node;  /* N's node, unpublished */
+  char *buffer;       /* page-aligned image of the pages N will use */
+  size_t capacity;    /* slots the buffer holds */
+  size_t count;       /* slots filled so far */
+};
+
+/*
+ * begin -> add_source (newest first) -> finish. Every step returns 0 or a
+ * negative errno; begin() zeroes *out on failure, and any other failure
+ * leaves the build discardable.
+ */
+int prune_build_begin(const struct prune_candidate *c, struct prune_build *out);
+int prune_build_add_source(struct prune_build *b, centree_node source);
+int prune_build_finish(struct prune_build *b);
+/* Both source slabs, oldest last. Equivalent to begin + add + add + finish. */
+int prune_build_cold(const struct prune_candidate *c, struct prune_build *out);
+/* Unlinks N's file and frees the build. Only valid while unpublished. */
+void prune_build_discard(struct prune_build *b);
+
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);
 int bgq_count(enum fsst_mode m);
