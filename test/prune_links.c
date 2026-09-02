@@ -505,40 +505,33 @@ static int read_slot(struct slab *s, size_t slot, unsigned char *out) {
 static size_t cold_tombstones, cold_read_mismatches, cold_entries,
     cold_dup_keys;
 
-static void check_one_cold_build(const struct prune_candidate *c) {
-  struct prune_build build;
-  struct slab *n;
-  size_t want = 0;
-  int error;
-
-  error = prune_build_cold(c, &build);
-  if (error) {
-    check(false, "prune_build_cold failed with %d", error);
-    prune_build_discard(&build);
-    return;
-  }
-  n = build.slab;
-
-  /* Expected set. */
-  exp_cap = c->inner->value.slab->nb_max_items +
-            c->outer->value.slab->nb_max_items;
+/* The merge the sources imply, newest first, deduped by key. */
+static void build_expected(centree_node *srcs, int nb_srcs) {
+  exp_cap = 0;
+  for (int i = 0; i < nb_srcs; i++)
+    exp_cap += srcs[i]->value.slab->nb_max_items;
+  free(exp_list);
   exp_list = calloc(exp_cap, sizeof(*exp_list));
   nb_exp = 0;
-  exp_src = c->inner->value.slab;
-  exp_rank = 0;
-  subtree_forall_entries(exp_src->subtree, exp_cb, NULL);
-  exp_src = c->outer->value.slab;
-  exp_rank = 1;
-  subtree_forall_entries(exp_src->subtree, exp_cb, NULL);
+  for (int i = 0; i < nb_srcs; i++) {
+    exp_src = srcs[i]->value.slab;
+    exp_rank = i;
+    subtree_forall_entries(exp_src->subtree, exp_cb, NULL);
+  }
   qsort(exp_list, nb_exp, sizeof(*exp_list), cmp_exp);
+}
 
-  /* What N holds. */
+static void collect_got(struct slab *n) {
   got_cap = n->nb_max_items;
+  free(got_list);
   got_list = calloc(got_cap, sizeof(*got_list));
   nb_got = 0;
   subtree_forall_entries(n->subtree, got_cb, NULL);
+}
 
-  /* Dedup the expected set in place (first of each key wins) and compare. */
+/* N must hold exactly the expected merge, byte for byte. */
+static void verify_merged(struct slab *n, const char *when) {
+  size_t want = 0;
   for (size_t i = 0; i < nb_exp; i++) {
     unsigned char from_src[4096], from_n[4096];
     struct item_metadata *ms, *mn;
@@ -593,23 +586,39 @@ static void check_one_cold_build(const struct prune_candidate *c) {
     }
     cold_entries++;
   }
-  check(want == nb_got, "N holds %zu entries, expected %zu", nb_got, want);
-  check(n->nb_items == build.count && build.count == nb_got,
-        "N's counters disagree (nb_items %zu, count %zu, entries %zu)",
-        n->nb_items, build.count, nb_got);
-  check(atomic_load(&n->full) == 1, "N is not marked full");
+  check(want == nb_got, "[%s] N holds %zu entries, expected %zu", when, nb_got,
+        want);
+  check(n->nb_items == nb_got, "[%s] N's nb_items is %zu, entries %zu", when,
+        n->nb_items, nb_got);
+  check(atomic_load(&n->full) == 1, "[%s] N is not marked full", when);
+}
+
+static void check_one_cold_build(const struct prune_candidate *c) {
+  struct prune_build build;
+  centree_node srcs[2];
+  int error = prune_build_cold(c, &build);
+
+  if (error) {
+    check(false, "prune_build_cold failed with %d", error);
+    prune_build_discard(&build);
+    return;
+  }
+  srcs[0] = c->inner;
+  srcs[1] = c->outer;
+  build_expected(srcs, 2);
+  collect_got(build.slab);
+  verify_merged(build.slab, "cold");
+  check(build.count == nb_got, "N's count is %zu, entries %zu", build.count,
+        nb_got);
   check(atomic_load(&build.node->child_flag) == 1,
         "N's node is not marked fully split");
-
-  free(exp_list);
-  free(got_list);
   prune_build_discard(&build);
   check(build.slab == NULL, "discard left the build populated");
 }
 
 static void check_empty_build(const struct prune_candidate *c) {
   struct prune_build build;
-  int error = prune_build_begin(c, &build);
+  int error = prune_build_begin(c, c->outer, &build);
 
   if (error) {
     check(false, "prune_build_begin failed with %d", error);
@@ -763,6 +772,118 @@ static void check_blocked_writer(uint64_t key) {
   free(r.item);
 }
 
+/* ------------------------------------------- reads must not change */
+
+static int *snap_found;
+static uint64_t *snap_value;
+static uint64_t snap_hi;
+
+static void snapshot_reads(uint64_t hi) {
+  snap_hi = hi;
+  free(snap_found);
+  free(snap_value);
+  snap_found = calloc(hi, sizeof(*snap_found));
+  snap_value = calloc(hi, sizeof(*snap_value));
+  for (uint64_t k = 0; k < hi; k++) {
+    read_back_quiet(k);
+    snap_found[k] = rb_found;
+    snap_value[k] = rb_value;
+  }
+}
+
+static void verify_reads(const char *when) {
+  size_t bad = 0;
+
+  for (uint64_t k = 0; k < snap_hi; k++) {
+    read_back_quiet(k);
+    if (rb_found == snap_found[k] && (!rb_found || rb_value == snap_value[k]))
+      continue;
+    if (bad < 5)
+      check(false, "[%s] key %lu: found %d->%d, value %lu->%lu", when, k,
+            snap_found[k], rb_found, snap_value[k], rb_value);
+    bad++;
+  }
+  check(bad == 0, "[%s] %zu of %lu keys changed", when, bad, snap_hi);
+  if (!bad) printf("  %-34s %lu keys unchanged\n", when, snap_hi);
+}
+
+/* ------------------------------------- freeze, hot copy, history link */
+
+/*
+ * Runs one real prune up to the history link and stops there -- the routing
+ * splice is the next step. In this state the two trees deliberately disagree:
+ * N is in the history chain, while the triple is still in the routing tree, so
+ * validate() must not run after this. Reads must be unaffected either way,
+ * because N holds every valid entry of the three and nothing is retired yet.
+ */
+static void check_prune_link(void) {
+  size_t cap = tnt_get_node_count() + 8;
+  centree_node *order = calloc(cap, sizeof(*order));
+  centree_node srcs[3];
+  struct prune_candidate best;
+  struct prune_build build;
+  size_t nb_order = 0;
+  bool have = false;
+  int error;
+
+  collect_routing(routing_root(), order, cap, &nb_order);
+  for (size_t i = 0; i < nb_order; i += 2) {
+    struct prune_candidate c;
+
+    if (!prune_select(order[i], &c)) continue;
+    /* Prefer a triple that actually has something to carry over. */
+    if (!have || c.cold_bound > best.cold_bound) {
+      best = c;
+      have = true;
+    }
+  }
+  free(order);
+  if (!have) {
+    check(false, "no candidate to prune");
+    return;
+  }
+
+  snapshot_reads(nb_keys + nb_keys / 2);
+
+  /* The real caller holds this until the routing splice has published. */
+  tnt_maintenance_lock();
+  error = prune_freeze_and_link(&best, &build);
+  tnt_maintenance_unlock();
+  check(error == 0, "prune_freeze_and_link failed with %d", error);
+  if (error) return;
+
+  /* The three history rewires, and nothing else. */
+  check(centree_lu_parent(build.node) == best.up, "N->lu_parent is wrong");
+  check(build.node->lu_child[best.side] == best.star,
+        "N->lu_child[side] is not star");
+  check(build.node->lu_child[!best.side] == best.sib,
+        "N->lu_child[!side] is not sib");
+  check(centree_lu_parent(best.sib) == build.node, "sib still points at inner");
+  check(centree_lu_parent(best.star) == build.node,
+        "star still points at outer");
+  if (best.up)
+    check(best.up->lu_child[CENTREE_LU_LEFT] == build.node ||
+              best.up->lu_child[CENTREE_LU_RIGHT] == build.node,
+          "D does not have N as a history child");
+  check(centree_lu_parent(best.leaf) == best.inner,
+        "the leaf's own lu_parent was touched");
+  check(atomic_load(&best.leaf->value.slab->full) == 1,
+        "the leaf was not frozen");
+
+  /* N holds the merge of all three, the leaf winning. */
+  srcs[0] = best.leaf;
+  srcs[1] = best.inner;
+  srcs[2] = best.outer;
+  build_expected(srcs, 3);
+  collect_got(build.slab);
+  verify_merged(build.slab, "after link");
+  printf("  %-34s slab %lu, %zu entries (cold<=%zu)\n", "history link", 
+         build.slab->seq, build.count, best.cold_bound);
+
+  verify_reads("reads across the history link");
+  /* N is live in the history chain now: the build must not be discarded. */
+}
+
 int main(int argc, char **argv) {
   if (argc > 1) nb_keys = strtoull(argv[1], NULL, 0);
 
@@ -816,6 +937,9 @@ int main(int argc, char **argv) {
 
   check_blocked_writer(nb_keys / 2);
   validate("after blocked-writer restart");
+
+  /* Leaves the two trees disagreeing on purpose; keep it last. */
+  check_prune_link();
 
   /* The rule has two orientations and a history-root case; cover all three. */
   check(cov_candidates > 0, "no prunable triple was ever selected");

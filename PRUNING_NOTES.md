@@ -191,3 +191,41 @@ Selection and the merge want opposite things, which is why the test does both jo
 enough overwrite passes and the internal slabs are 100% stale (18 candidates, every N empty);
 too few and they are too full to fit (0 candidates). Two 90% passes plus deletes on the untouched
 tenth gives real candidates *and* rich sources for the merge.
+
+## Step 6 — freeze the leaf, copy it, link the history chain
+
+- `prune_freeze_and_link()`: determine P/Q, stage and write the cold part, freeze the leaf, copy
+  the leaf into N, `fsync`, then install the three history pointers. The caller must hold
+  `tnt_maintenance_lock()` from here until the routing splice has published.
+- P is the leaf's routing parent and is always one of the two internal nodes -- the triple is
+  consecutive in-order and a leaf's routing parent is one of its in-order neighbours. N takes the
+  routing position of the *other* one (Q) and therefore Q's pivot, level and file key. If P is
+  neither, the candidate is dropped with `-EAGAIN` rather than guessed at.
+- The cold pages are written *before* the freeze, so the window in which writers to the leaf's
+  range are parked covers only the leaf's own entries plus one `pwrite`/`fsync`.
+- `prune_build_flush()` writes only the pages staged since the last flush, which is what keeps the
+  post-freeze write small.
+- After the freeze the leaf's subtree is stable: a writer publishes its entry before dropping
+  `update_ref`, and the freeze drains `update_ref`. Entries can still be *invalidated* later (by a
+  writer that restarts after the splice and supersedes one); such an entry is copied into N anyway
+  and is shadowed by the newer copy nearer the leaf.
+- `lu_child[side] = star`, `lu_child[!side] = sib` is correct in both orientations: in-order the
+  triple reads `sib-subtree, inner, leaf, outer, star-subtree` for side 1 and
+  `star-subtree, outer, leaf, inner, sib-subtree` for side 0, and in both cases N inherits sib on
+  the left and star on the right. Worked through explicitly because getting it backwards would
+  reverse the in-order sequence and only show up as a lookup miss much later.
+- Exactly three history pointers are written (N's parent, D's child slot) plus the two external
+  `lu_parent` stores (I-12).
+
+### The intermediate state is deliberately inconsistent
+
+Between the history link and the routing splice, N is in the history chain while the triple is
+still in the routing tree. So:
+
+- `test/prune_links.c` must not call `validate()` after `check_prune_link()` -- routing in-order
+  and history in-order legitimately differ there.
+- Reads are unaffected in either direction, because N holds every valid entry of the three and
+  nothing is retired yet. The test proves this by snapshotting all 30000 keys before the link and
+  re-reading them after: every one unchanged.
+- Writers whose key routes to the frozen leaf are parked until the splice. That is the accepted
+  latency hiccup, and it is why `check_prune_link()` has to be the last thing the test does.

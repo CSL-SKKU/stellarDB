@@ -151,20 +151,43 @@ struct prune_build {
   char *buffer;       /* page-aligned image of the pages N will use */
   size_t capacity;    /* slots the buffer holds */
   size_t count;       /* slots filled so far */
+  size_t dirty_lo;    /* pages staged but not written yet, [lo, hi) */
+  size_t dirty_hi;
 };
 
 /*
  * begin -> add_source (newest first) -> finish. Every step returns 0 or a
  * negative errno; begin() zeroes *out on failure, and any other failure
- * leaves the build discardable.
+ * leaves the build discardable. `pivot_from` is the node whose routing
+ * position N will take: its pivot, level and file key. `override` lets a
+ * higher-precedence source replace a record already staged, which is what the
+ * leaf needs since it joins after the two internal slabs.
  */
-int prune_build_begin(const struct prune_candidate *c, struct prune_build *out);
-int prune_build_add_source(struct prune_build *b, centree_node source);
+int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
+                      struct prune_build *out);
+int prune_build_add_source(struct prune_build *b, centree_node source,
+                           int override);
+/* Writes the staged pages out; keeps the build open. */
+int prune_build_flush(struct prune_build *b);
 int prune_build_finish(struct prune_build *b);
 /* Both source slabs, oldest last. Equivalent to begin + add + add + finish. */
 int prune_build_cold(const struct prune_candidate *c, struct prune_build *out);
 /* Unlinks N's file and frees the build. Only valid while unpublished. */
 void prune_build_discard(struct prune_build *b);
+
+/*
+ * Freeze the leaf, copy it into N, and splice N into the history chain.
+ * Returns 0 with *b holding the finished N, or a negative errno with nothing
+ * changed (-EAGAIN: the routing shape was not what selection saw;
+ * -EBUSY/-ENOSPC from the freeze). After the freeze succeeds there is no abort
+ * path: only the routing splice can release the writers waiting on the frozen
+ * leaf.
+ *
+ * The caller must hold tnt_maintenance_lock() from here until the routing
+ * splice has published, so that P and Q cannot be rewired underneath.
+ */
+int prune_freeze_and_link(const struct prune_candidate *c,
+                          struct prune_build *b);
 
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);

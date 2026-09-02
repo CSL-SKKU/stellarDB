@@ -259,13 +259,17 @@ static size_t pages_for(struct slab *n, size_t slots) {
   return (slots + items_per_page - 1) / items_per_page;
 }
 
-int prune_build_begin(const struct prune_candidate *c,
+int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
                       struct prune_build *out) {
   struct slab *leaf_slab = c->leaf->value.slab;
+  uint64_t level = atomic_load_explicit(&pivot_from->value.level,
+                                        memory_order_acquire);
+  uint64_t pivot = centree_pivot_load(pivot_from);
   tree_entry_t value = {0};
   size_t pages;
 
   memset(out, 0, sizeof(*out));
+  out->dirty_lo = (size_t)-1;
 
   /*
    * Room for what selection said could survive. The freeze budget in the
@@ -276,14 +280,8 @@ int prune_build_begin(const struct prune_candidate *c,
   if (out->capacity > leaf_slab->nb_max_items)
     out->capacity = leaf_slab->nb_max_items;
 
-  /*
-   * The throwaway build borrows outer's level and pivot; the real one takes
-   * them from the routing node N replaces.
-   */
-  out->slab = create_slab(NULL,
-                          atomic_load_explicit(&c->outer->value.level,
-                                               memory_order_acquire),
-                          centree_pivot_load(c->outer), 0, NULL);
+  /* N routes exactly as pivot_from did. */
+  out->slab = create_slab(NULL, level, pivot, 0, NULL);
   if (out->slab == NULL || out->slab->fd < 0) {
     free(out->slab);
     memset(out, 0, sizeof(*out));
@@ -303,19 +301,27 @@ int prune_build_begin(const struct prune_candidate *c,
   /* Unused slots stay zeroed, which is what item_is_empty() reads. */
   memset(out->buffer, 0, pages * PAGE_SIZE);
 
-  value.key = centree_pivot_load(c->outer);
+  value.key = pivot;
   value.seq = out->slab->seq;
   value.slab = out->slab;
   out->node = centree_node_new((void *)(uintptr_t)value.key, &value);
-  atomic_store_explicit(&out->node->value.level,
-                        atomic_load_explicit(&c->outer->value.level,
-                                             memory_order_acquire),
-                        memory_order_release);
+  atomic_store_explicit(&out->node->value.level, level, memory_order_release);
   out->slab->centree_node = out->node;
   return 0;
 }
 
-int prune_build_add_source(struct prune_build *b, centree_node source) {
+static void mark_dirty(struct prune_build *b, size_t slot) {
+  size_t items_per_page = PAGE_SIZE / b->slab->item_size;
+  size_t page = slot / items_per_page;
+
+  if (page < b->dirty_lo)
+    b->dirty_lo = page;
+  if (page + 1 > b->dirty_hi)
+    b->dirty_hi = page + 1;
+}
+
+int prune_build_add_source(struct prune_build *b, centree_node source,
+                           int override) {
   struct slab *src = source->value.slab;
   struct slab *n = b->slab;
   struct prune_snapshot snap = {0};
@@ -364,19 +370,27 @@ int prune_build_add_source(struct prune_build *b, centree_node source) {
     index_entry_t entry;
     struct item_metadata *meta;
     char *record;
+    size_t dst;
+    int replaces;
 
-    /* A newer source already placed this key: precedence leaf > inner > outer. */
-    if (subtree_find(n->subtree, (unsigned char *)&key, sizeof(key),
-                     &existing))
+    /*
+     * Precedence leaf > inner > outer. Sources arrive newest first, so a key
+     * already staged wins -- unless this source outranks what is there, which
+     * is the leaf joining after the two internal slabs.
+     */
+    replaces = subtree_find(n->subtree, (unsigned char *)&key, sizeof(key),
+                            &existing);
+    if (replaces && !override)
       continue;
     if (slot >= src->nb_max_items) {
       error = -EINVAL;
       goto out;
     }
-    if (b->count == b->capacity) {
+    if (!replaces && b->count == b->capacity) {
       error = -ENOSPC;
       goto out;
     }
+    dst = replaces ? GET_SIDX(existing.slab_idx) : b->count;
 
     if (page_idx != cached_page) {
       ssize_t got = pread(src->fd, page, PAGE_SIZE,
@@ -396,12 +410,15 @@ int prune_build_add_source(struct prune_build *b, centree_node source) {
       die("Pruning found slab %lu slot %lu not holding indexed key %lu\n",
           src->seq, slot, key);
 
-    memcpy(slot_in_buffer(b, b->count), record, n->item_size);
-    entry.slab = n;
-    entry.slab_idx = b->count;
-    subtree_insert(n->subtree, (unsigned char *)&key, sizeof(key), &entry);
-    slab_widen_range(n, key);
-    b->count++;
+    memcpy(slot_in_buffer(b, dst), record, n->item_size);
+    mark_dirty(b, dst);
+    if (!replaces) {
+      entry.slab = n;
+      entry.slab_idx = dst;
+      subtree_insert(n->subtree, (unsigned char *)&key, sizeof(key), &entry);
+      slab_widen_range(n, key);
+      b->count++;
+    }
   }
 
 out:
@@ -410,16 +427,28 @@ out:
   return error;
 }
 
+int prune_build_flush(struct prune_build *b) {
+  size_t offset, length;
+  ssize_t written;
+
+  if (b->dirty_lo >= b->dirty_hi)
+    return 0;
+  offset = b->dirty_lo * PAGE_SIZE;
+  length = (b->dirty_hi - b->dirty_lo) * PAGE_SIZE;
+  written = pwrite(b->slab->fd, b->buffer + offset, length, (off_t)offset);
+  if (written != (ssize_t)length)
+    return -EIO;
+  b->dirty_lo = (size_t)-1;
+  b->dirty_hi = 0;
+  return 0;
+}
+
 int prune_build_finish(struct prune_build *b) {
   struct slab *n = b->slab;
-  size_t pages = pages_for(n, b->count);
+  int error = prune_build_flush(b);
 
-  if (pages > 0) {
-    ssize_t written = pwrite(n->fd, b->buffer, pages * PAGE_SIZE, 0);
-
-    if (written != (ssize_t)(pages * PAGE_SIZE))
-      return -EIO;
-  }
+  if (error)
+    return error;
   if (fsync(n->fd) != 0)
     return -EIO;
 
@@ -436,14 +465,14 @@ int prune_build_finish(struct prune_build *b) {
 
 int prune_build_cold(const struct prune_candidate *c,
                      struct prune_build *out) {
-  int error = prune_build_begin(c, out);
+  int error = prune_build_begin(c, c->outer, out);
 
   if (error)
     return error;
   /* Newest first: inner overrides outer. The leaf joins after its freeze. */
-  error = prune_build_add_source(out, c->inner);
+  error = prune_build_add_source(out, c->inner, 0);
   if (!error)
-    error = prune_build_add_source(out, c->outer);
+    error = prune_build_add_source(out, c->outer, 0);
   if (!error)
     error = prune_build_finish(out);
   return error;
@@ -473,4 +502,109 @@ void prune_build_discard(struct prune_build *b) {
   free(b->node);
   free(b->buffer);
   memset(b, 0, sizeof(*b));
+}
+
+/* ===================================================================== *
+ * Freeze, hot copy, history link
+ *
+ * From the freeze on, writers whose key routes to the leaf are parked: the
+ * leaf can no longer take a slot and will never grow children. Only the
+ * routing splice releases them, which is why there is no abort path past a
+ * successful freeze (I-9) and why the hot copy is kept as small as possible
+ * -- the two internal slabs are already staged and written by then.
+ *
+ * The history link runs before the routing splice (I-2). Until the splice,
+ * readers may follow either `sib -> inner -> outer -> D` or `sib -> N -> D`;
+ * both are complete, because N holds every valid entry of the three and
+ * nothing has been retired yet.
+ * ===================================================================== */
+
+static void prune_link_history(const struct prune_candidate *c,
+                               centree_node n) {
+  /*
+   * N first: it is fully built, and nothing points at it yet (I-1).
+   *
+   * In-order, the triple reads "sib-subtree, inner, leaf, outer,
+   * star-subtree" (or its mirror), so N inherits sib on the side the leaf sat
+   * on under inner and star on the other -- which is exactly
+   * lu_child[side] = star, lu_child[!side] = sib in both orientations.
+   */
+  centree_lu_parent_store(n, c->up);
+  n->lu_child[c->side] = c->star;
+  n->lu_child[!c->side] = c->sib;
+
+  if (c->up != NULL) {
+    int t = c->up->lu_child[CENTREE_LU_LEFT] == c->outer ? CENTREE_LU_LEFT
+                                                         : CENTREE_LU_RIGHT;
+
+    if (c->up->lu_child[t] != c->outer)
+      die("Pruning: outer is not a history child of its own lu_parent\n");
+    c->up->lu_child[t] = n;
+  }
+
+  /* The two external rewires: the whole history cost of a prune (I-12). */
+  centree_lu_parent_store(c->sib, n);
+  centree_lu_parent_store(c->star, n);
+}
+
+int prune_freeze_and_link(const struct prune_candidate *c,
+                          struct prune_build *b) {
+  struct slab *leaf_slab = c->leaf->value.slab;
+  centree_node p, q;
+  long frozen;
+  int error;
+
+  memset(b, 0, sizeof(*b));
+
+  /*
+   * P is the leaf's routing parent, always one of the two internal nodes: the
+   * triple is consecutive in-order, and a leaf's routing parent is one of its
+   * in-order neighbours. N takes the routing position of the other one, Q, so
+   * it inherits Q's pivot and level. Both are fixed for the rest of the
+   * prune: internals are only rewired by rebalancing (excluded through
+   * maintenance_lock) or by another prune (there is one pruner), and the leaf
+   * cannot split once frozen.
+   */
+  p = tnt_routing_parent(c->leaf);
+  if (p != c->inner && p != c->outer)
+    return -EAGAIN;
+  q = (p == c->inner) ? c->outer : c->inner;
+
+  error = prune_build_begin(c, q, b);
+  if (error)
+    return error;
+  error = prune_build_add_source(b, c->inner, 0);
+  if (!error)
+    error = prune_build_add_source(b, c->outer, 0);
+  /* Get the cold pages onto the device before the freeze window opens. */
+  if (!error)
+    error = prune_build_flush(b);
+  if (error) {
+    prune_build_discard(b);
+    return error;
+  }
+
+  frozen = slab_freeze(leaf_slab, b->capacity - b->count);
+  if (frozen < 0) {
+    prune_build_discard(b);
+    return (int)frozen;
+  }
+
+  /*
+   * The leaf's subtree is stable now: a writer publishes its entry before it
+   * drops update_ref, and the freeze drained update_ref. Entries can still be
+   * *invalidated* from here on -- by a writer that restarts after the splice
+   * and supersedes one of them -- and such an entry is copied into N anyway,
+   * shadowed by the newer copy nearer the leaf.
+   */
+  error = prune_build_add_source(b, c->leaf, 1);
+  if (!error)
+    error = prune_build_finish(b);
+  if (error)
+    die("Pruning could not finish the merged slab after freezing slab %lu "
+        "(%d); the frozen leaf has no way back\n",
+        leaf_slab->seq, error);
+
+  prune_link_history(c, b->node);
+  return 0;
 }
