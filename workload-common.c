@@ -44,7 +44,6 @@ void add_in_tree(struct slab_callback *cb, void *item) {
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
   uint64_t key = *(uint64_t *)item_key;
-  uint64_t cur;
 
   W_LOCK(&s->tree_lock);
   tnt_index_add(cb, item);
@@ -61,23 +60,9 @@ void add_in_tree(struct slab_callback *cb, void *item) {
 
   __sync_fetch_and_sub(&s->update_ref, 1);
 
-  // if (s->last_item == s->nb_max_items)
-  // s->imm = 1;
-
-  cur = __sync_fetch_and_add(&s->read_ref, 0);
-  if (s->min == -1 && 
-    !__sync_fetch_and_or(&s->update_ref, 0)
-    && cur == 0) {
-    char path[128], spath[128];
-    int len;
-    sprintf(path, "/proc/self/fd/%d", s->fd);
-    if ((len = readlink(path, spath, 512)) < 0) die("READLINK\n");
-    spath[len] = 0;
-    close(s->fd);
-    truncate(spath, 0);
-  }
-
   W_UNLOCK(&s->tree_lock);
+
+  slab_release_if_idle(s);
 
   __sync_fetch_and_add(&nb_totals, 1);
 

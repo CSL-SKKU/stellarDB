@@ -321,24 +321,8 @@ void read_item_async_cb(struct slab_callback *callback) {
   uint64_t cur;
 
   cur = __sync_sub_and_fetch(&s->read_ref, 1);
-
-  R_LOCK(&s->tree_lock);
-  if (s->min == -1 && 
-    !__sync_fetch_and_or(&s->update_ref, 0)
-    && cur == 0) {
-    char path[128], spath[128];
-    int len;
-    sprintf(path, "/proc/self/fd/%d", s->fd);
-    if ((len = readlink(path, spath, 512)) < 0) {
-	    printf("already removed\n");
-	    goto skip;
-    }
-    spath[len] = 0;
-    close(s->fd);
-    truncate(spath, 0);
-  }
-skip:
-  R_UNLOCK(&s->tree_lock);
+  (void)cur;
+  slab_release_if_idle(s);
   
   add_time_in_payload(callback, TIMING_STAGE_IO_COMPLETE);
   struct item_metadata *meta =
@@ -548,6 +532,68 @@ long slab_freeze(struct slab *s, size_t budget) {
   }
 }
 
+void slab_retire(struct slab *s) {
+  /*
+   * The node is marked removed before this runs (the routing splice does it),
+   * and every reader of s->subtree checks that flag under tree_lock, so the
+   * local index can go here (I-5).
+   *
+   * min/max are reset because the older range checks in the writer descent and
+   * in add_in_tree_for_upsert() consult them without looking at `removed`:
+   * min = -1, max = 0 rejects every key. It is not how retirement is
+   * detected -- an empty live slab looks the same (I-6).
+   */
+  W_LOCK(&s->tree_lock);
+  s->min = (uint64_t)-1;
+  s->max = 0;
+  if (s->subtree != NULL) {
+    subtree_free(s->subtree);
+    s->subtree = NULL;
+  }
+#if WITH_FILTER
+  if (s->filter != NULL) {
+    filter_delete(s->filter);
+    s->filter = NULL;
+  }
+#endif
+  W_UNLOCK(&s->tree_lock);
+
+  slab_release_if_idle(s);
+}
+
+void slab_release_if_idle(struct slab *s) {
+  centree_node node = (centree_node)s->centree_node;
+  char proc[64], path[512];
+  int expected = 0;
+  int len;
+
+  if (node == NULL ||
+      !atomic_load_explicit(&node->removed, memory_order_acquire))
+    return;
+  /*
+   * No new reference can appear on a retired slab: readers and the
+   * reinsertion worker check `removed` under tree_lock before taking one, and
+   * the writer descent's transient update reference never touches the file or
+   * the local index. So once both counts are zero they stay zero, and the
+   * last dropper gets here.
+   */
+  if (__sync_fetch_and_or(&s->update_ref, 0) != 0 ||
+      __sync_fetch_and_or(&s->read_ref, 0) != 0)
+    return;
+  if (!atomic_compare_exchange_strong(&s->released, &expected, 1))
+    return;
+
+  snprintf(proc, sizeof(proc), "/proc/self/fd/%d", s->fd);
+  len = readlink(proc, path, sizeof(path) - 1);
+  /* fd = -1 makes a straggling read fail instead of hitting a reused fd. */
+  close(s->fd);
+  s->fd = -1;
+  if (len > 0) {
+    path[len] = 0;
+    unlink(path);
+  }
+}
+
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   struct slab *s = cb->slab;
   struct slab *old_s = cb->fsst_slab;
@@ -556,7 +602,6 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   char *item_key = &item[sizeof(*meta)];
   uint64_t key = *(uint64_t *)item_key;
   int removed = 0, alrdy = 0;
-  uint64_t cur;
   index_entry_t *e = NULL;
 
   add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
@@ -618,23 +663,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
 
 skip:
   __sync_fetch_and_sub(&s->update_ref, 1);
-
-  R_LOCK(&s->tree_lock);
-
-  cur = __sync_fetch_and_add(&s->read_ref, 0);
-
-  if (s->min == -1 && 
-    __sync_fetch_and_or(&s->update_ref, 0) == 0 
-    && cur == 0) {
-    char path[128], spath[128];
-    int len;
-    sprintf(path, "/proc/self/fd/%d", s->fd);
-    if ((len = readlink(path, spath, 512)) < 0) die("READLINK\n");
-    spath[len] = 0;
-    close(s->fd);
-    truncate(spath, 0);
-  }
-  R_UNLOCK(&s->tree_lock);
+  slab_release_if_idle(s);
 
   if (cb->cb_cb == add_in_tree_for_upsert) {
     free(cb->item);

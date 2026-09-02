@@ -709,3 +709,13 @@ void prune_splice_routing(const struct prune_candidate *c,
   /* Sets child_flag and wakes: the parked writers restart (step 3). */
   wakeup_subtree_get(c->leaf);
 }
+
+/* ===================================================================== *
+ * Retire
+ * ===================================================================== */
+
+void prune_retire(const struct prune_candidate *c) {
+  slab_retire(c->leaf->value.slab);
+  slab_retire(c->inner->value.slab);
+  slab_retire(c->outer->value.slab);
+}

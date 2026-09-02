@@ -269,3 +269,44 @@ The stress phase first reported ~28 of 530k reads disagreeing. Every one was key
 `0xbeef`: `check_blocked_writer()` resurrects the key it uses, and 10000 is in the deleted tenth,
 so the model was wrong, not the DB. Reproduced identically with pruning *and* rebalancing disabled,
 which is what identified it. Fixed by having that check use a key the later write phase rewrites.
+
+## Step 8 — retire and release
+
+- `slab_retire()` (`slab.c`) frees a retired slab's local index and filter under `tree_lock`, and
+  resets `min = -1, max = 0`. The reset is what keeps the *older* range checks safe -- the writer
+  descent and `add_in_tree_for_upsert()`'s invalidation consult `min`/`max` without looking at
+  `removed`, and `key <= 0 && key >= UINT64_MAX` is false for every key. It is not how retirement
+  is detected (I-6).
+- `slab_release_if_idle()` closes and unlinks the file once both reference counts are zero, guarded
+  by a CAS on `released` so it is idempotent. `fd = -1` afterwards, so a straggling read fails
+  instead of hitting a reused descriptor.
+- The nodes, slab descriptors and `hot_bits` are deliberately never freed (I-4).
+- The three old copies of `if (min == -1 && refs == 0) { close; truncate }` are replaced by calls to
+  `slab_release_if_idle()`. That also removes a latent hazard: the old condition could fire for a
+  *live* empty slab (`min` is `-1` until the first entry is published, and
+  `add_in_tree_for_upsert()`'s duplicate paths skip the widening), which would have closed and
+  truncated a slab still in use. The new condition requires `node->removed`.
+- **The writer descent's transient reference matters here.** A writer takes `update_ref` before it
+  looks at `full`, so it can hold a reference on a slab that is retired a moment later. That
+  reference is dropped in the descent loop, not in an I/O completion, so `slab_release_if_idle()`
+  is called there too -- otherwise the pruner's own call would find `update_ref != 0` and the file
+  would never be released. The transient holder never touches `fd` or `subtree`, so closing the
+  file underneath it is harmless.
+- No new reference can appear on a retired slab: readers and the reinsertion worker check `removed`
+  under `tree_lock` before taking one. So once both counts hit zero they stay zero.
+
+### Verification
+
+`test/prune_links.c` runs a full prune with one of the retired slabs pinned as if a read were in
+flight: the two idle files are gone and their `fd`s are -1 immediately, while the pinned one keeps
+its file and descriptor until the reference is dropped, and disappears on the very next
+`slab_release_if_idle()`. The suite then asserts **slab file count == node count** after the prune
+sweep and again after the stress run -- so the space is really reclaimed, not just unlinked from
+the index. `PRUNE_REINS=1` repeats the stress phase with the background reinsertion worker running
+and slabs handed to it while the pruner works (9 prunes, ~495k reads, ~76k writes, no
+disagreements).
+
+### One anomaly, again the test
+
+The file-count assertion first reported three extra files. That was `check_prune_link()`, which
+deliberately stops mid-prune and did not retire its triple; it now retires at the end.

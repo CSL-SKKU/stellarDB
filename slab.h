@@ -147,6 +147,21 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
  */
 long slab_freeze(struct slab *s, size_t budget);
 
+/*
+ * Give up a retired slab's memory: its node must already be marked removed.
+ * Frees the local index (and filter) and makes the legacy range checks reject
+ * every key. The descriptor, the node and hot_bits are deliberately kept --
+ * they are held raw across async I/O and by the reinsertion queue.
+ */
+void slab_retire(struct slab *s);
+
+/*
+ * Close and unlink a retired slab's file once nobody is using it. Idempotent
+ * and cheap for live slabs, which is why every last-reference dropper can
+ * call it.
+ */
+void slab_release_if_idle(struct slab *s);
+
 /* A fresh slab file, or (rebuild != 0) a descriptor over an existing one. */
 struct slab *create_slab(struct slab_context *ctx, uint64_t level, uint64_t key,
                          int rebuild, char *name);

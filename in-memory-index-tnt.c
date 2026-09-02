@@ -674,6 +674,8 @@ restart:
     // ── 3) slab full 이거나 예약 실패 → 트리 아래로 ──
     /* Released before descending or waiting on child_flag. */
     __sync_fetch_and_sub(&s->update_ref, 1);
+    /* This can be the last reference on a slab retired a moment ago. */
+    slab_release_if_idle(s);
 
     //R_LOCK(&s->tree_lock);
     //if (s->full == 0) {
@@ -798,6 +800,8 @@ restart:
     // d) slab full -> split된 자식으로 하강 (자식 없으면 기다림)
     /* Released before descending or waiting on child_flag. */
     __sync_fetch_and_sub(&s->update_ref, 1);
+    /* This can be the last reference on a slab retired a moment ago. */
+    slab_release_if_idle(s);
 
     prev = n;
     do {

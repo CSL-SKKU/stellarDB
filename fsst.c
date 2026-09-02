@@ -175,6 +175,7 @@ static void *fsst_worker(void *pdata) {
       }
 slab_done:
       __sync_fetch_and_sub(&s->read_ref, 1);
+      slab_release_if_idle(s);
       atomic_store_explicit(&s->queued, 0, memory_order_relaxed);
     }
   }

@@ -971,6 +971,8 @@ static void check_prune_link(void) {
   printf("  %-34s slab %lu took over from %lu/%lu/%lu\n", "routing splice",
          build.slab->seq, best.inner->value.slab->seq,
          best.leaf->value.slab->seq, best.outer->value.slab->seq);
+  /* Retire too, so the file accounting stays exact. */
+  prune_retire(&best);
   free(before);
   free(want);
   free(after);
@@ -989,7 +991,10 @@ static void check_prune_all(void) {
     if (!prune_scan_for_candidate(&c)) break;
     tnt_maintenance_lock();
     error = prune_freeze_and_link(&c, &b);
-    if (!error) prune_splice_routing(&c, &b);
+    if (!error) {
+      prune_splice_routing(&c, &b);
+      prune_retire(&c);
+    }
     tnt_maintenance_unlock();
     if (error) {
       /* Nothing changed, and the scan would hand back the same candidate. */
@@ -1026,6 +1031,118 @@ static void check_writes_after_prune(void) {
   if (!bad)
     printf("  %-34s %lu keys rewritten and read back\n", "writes after prune",
            nb_keys - nb_keys / 10);
+}
+
+/* -------------------------------------------------- retire and release */
+
+static int slab_path(struct slab *s, char *out, size_t len) {
+  char proc[64];
+  int n;
+
+  if (s->fd < 0) return 0;
+  snprintf(proc, sizeof(proc), "/proc/self/fd/%d", s->fd);
+  n = readlink(proc, out, len - 1);
+  if (n <= 0) return 0;
+  out[n] = 0;
+  return 1;
+}
+
+static size_t count_slab_files(void) {
+  struct dirent *entry;
+  DIR *dir = opendir("/scratch0/kvell");
+  size_t n = 0;
+
+  if (!dir) return 0;
+  while ((entry = readdir(dir)) != NULL)
+    if (!strncmp(entry->d_name, "slab-", 5)) n++;
+  closedir(dir);
+  return n;
+}
+
+/*
+ * A full prune including retirement, with one of the retired slabs pinned as
+ * if a read were still in flight: its file must survive until the reference
+ * goes away, and disappear right afterwards.
+ */
+static void check_retire(void) {
+  size_t cap = tnt_get_node_count() + 8;
+  centree_node *order = calloc(cap, sizeof(*order));
+  struct prune_candidate best;
+  struct prune_build build;
+  char paths[3][512];
+  int has_path[3];
+  struct slab *slabs[3];
+  size_t nb_order = 0, files_before;
+  bool have = false;
+  int error;
+
+  collect_routing(routing_root(), order, cap, &nb_order);
+  for (size_t i = 0; i < nb_order; i += 2) {
+    struct prune_candidate c;
+
+    if (!prune_select(order[i], &c)) continue;
+    best = c;
+    have = true;
+    break;
+  }
+  free(order);
+  if (!have) {
+    check(false, "no candidate left to retire");
+    return;
+  }
+
+  files_before = count_slab_files();
+  slabs[0] = best.leaf->value.slab;
+  slabs[1] = best.inner->value.slab;
+  slabs[2] = best.outer->value.slab;
+  for (int i = 0; i < 3; i++)
+    has_path[i] = slab_path(slabs[i], paths[i], sizeof(paths[i]));
+  check(has_path[0] && has_path[1] && has_path[2],
+        "could not resolve the triple's file names");
+
+  /* Pretend a read is still in flight on the inner slab. */
+  __sync_fetch_and_add(&slabs[1]->read_ref, 1);
+
+  tnt_maintenance_lock();
+  error = prune_freeze_and_link(&best, &build);
+  if (!error) {
+    prune_splice_routing(&best, &build);
+    prune_retire(&best);
+  }
+  tnt_maintenance_unlock();
+  check(error == 0, "the prune failed with %d", error);
+  if (error) {
+    __sync_fetch_and_sub(&slabs[1]->read_ref, 1);
+    return;
+  }
+
+  for (int i = 0; i < 3; i++) {
+    check(slabs[i]->subtree == NULL, "slab %lu kept its local index",
+          slabs[i]->seq);
+    check(slabs[i]->min == (uint64_t)-1 && slabs[i]->max == 0,
+          "slab %lu kept its range", slabs[i]->seq);
+  }
+  check(slabs[0]->fd == -1 && slabs[2]->fd == -1,
+        "an idle retired slab kept its file open");
+  check(access(paths[0], F_OK) != 0 && access(paths[2], F_OK) != 0,
+        "an idle retired slab's file is still there");
+  /* The pinned one must still be intact. */
+  check(slabs[1]->fd != -1, "the pinned slab was closed");
+  check(access(paths[1], F_OK) == 0, "the pinned slab's file was unlinked");
+
+  __sync_fetch_and_sub(&slabs[1]->read_ref, 1);
+  slab_release_if_idle(slabs[1]);
+  check(slabs[1]->fd == -1, "the last reference did not close the file");
+  check(access(paths[1], F_OK) != 0, "the last reference did not unlink it");
+
+  /* Three files gone, one added. */
+  check(count_slab_files() == files_before - 2,
+        "%zu slab files, expected %zu", count_slab_files(), files_before - 2);
+  check(access(paths[0], F_OK) != 0, "leaf file reappeared");
+  validate("after retire");
+  verify_reads("reads across the retire");
+  printf("  %-34s %zu files -> %zu, one pinned until its reader left\n",
+         "retire and release", files_before, count_slab_files());
 }
 
 /* ------------------------------------------- prunes under live traffic */
@@ -1115,6 +1232,35 @@ static void *stress_writer(void *arg) {
   return NULL;
 }
 
+/*
+ * Hand a live slab to the reinsertion worker, so its pass overlaps the
+ * pruner: it may end up scanning a slab that gets retired underneath it,
+ * which it must notice instead of reading a closed or reused file.
+ */
+static void queue_for_reinsertion(unsigned *seed) {
+  size_t cap = tnt_get_node_count() + 8;
+  centree_node *order = calloc(cap, sizeof(*order));
+  size_t nb_order = 0;
+  struct slab *s;
+
+  collect_routing(routing_root(), order, cap, &nb_order);
+  if (nb_order == 0) {
+    free(order);
+    return;
+  }
+  s = order[rand_r(seed) % nb_order]->value.slab;
+  free(order);
+  if (!s->hot_bits) return;
+  for (size_t p = 0; p < (s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE; p++)
+    mark_page_hot(s, p);
+  if (!atomic_load(&s->queued)) {
+    int expected = 0;
+
+    if (atomic_compare_exchange_strong(&s->queued, &expected, 1))
+      bgq_enqueue(GC, s);
+  }
+}
+
 static int prune_one(void) {
   struct prune_candidate c;
   struct prune_build b;
@@ -1123,7 +1269,10 @@ static int prune_one(void) {
   if (!prune_scan_for_candidate(&c)) return 0;
   tnt_maintenance_lock();
   error = prune_freeze_and_link(&c, &b);
-  if (!error) prune_splice_routing(&c, &b);
+  if (!error) {
+    prune_splice_routing(&c, &b);
+    prune_retire(&c);
+  }
   tnt_maintenance_unlock();
   return error ? -1 : 1;
 }
@@ -1138,8 +1287,12 @@ static void check_concurrent_prune(void) {
   for (size_t i = 0; i < 2; i++)
     pthread_create(&writers[i], NULL, stress_writer, (void *)i);
 
+  unsigned seed = 20250902;
+
   for (int round = 0; round < 400; round++) {
     int r = getenv("PRUNE_STRESS_NOPRUNE") ? 0 : prune_one();
+
+    if (cfg.with_reins && round % 10 == 3) queue_for_reinsertion(&seed);
 
     if (r > 0) prunes++;
     else if (r < 0) rejects++;
@@ -1174,12 +1327,15 @@ int main(int argc, char **argv) {
   cfg.kv_size = TEST_KV_SIZE;
   cfg.max_file_size = TEST_MAX_FILE_SIZE;
   cfg.page_cache_size = PAGE_SIZE * 8192; /* 32 MB */
-  cfg.with_reins = 0;
+  /* PRUNE_REINS=1 runs the background reinsertion worker alongside. */
+  cfg.with_reins = getenv("PRUNE_REINS") ? 1 : 0;
   cfg.with_rebal = 0;
   cfg.nb_items_in_db = nb_keys;
 
-  printf("== history links (%lu keys) ==\n", nb_keys);
+  printf("== history links (%lu keys, reins=%d) ==\n", nb_keys,
+         cfg.with_reins);
   slab_workers_init(1, 4, 2);
+  if (cfg.with_reins) fsst_worker_init();
 
   run_upserts(0, nb_keys);
   validate("after splits");
@@ -1226,9 +1382,16 @@ int main(int argc, char **argv) {
   validate("after blocked-writer restart");
 
   check_prune_link();
+  check_retire();
   check_prune_all();
+  check(count_slab_files() == tnt_get_node_count(),
+        "%zu slab files for %lu nodes", count_slab_files(),
+        tnt_get_node_count());
   check_writes_after_prune();
   check_concurrent_prune();
+  check(count_slab_files() == tnt_get_node_count(),
+        "%zu slab files for %lu nodes after the stress run", count_slab_files(),
+        tnt_get_node_count());
 
   /* The rule has two orientations and a history-root case; cover all three. */
   check(cov_candidates > 0, "no prunable triple was ever selected");

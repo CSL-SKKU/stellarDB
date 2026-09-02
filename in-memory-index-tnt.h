@@ -204,6 +204,14 @@ int prune_freeze_and_link(const struct prune_candidate *c,
 void prune_splice_routing(const struct prune_candidate *c,
                           struct prune_build *b);
 
+/*
+ * Hand back what the triple was holding: local indexes now, files as soon as
+ * the last reader or writer lets go. The nodes, the slab descriptors and
+ * hot_bits stay allocated on purpose -- they are held raw across async I/O
+ * and by the reinsertion queue.
+ */
+void prune_retire(const struct prune_candidate *c);
+
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);
 int bgq_count(enum fsst_mode m);
