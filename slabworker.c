@@ -273,28 +273,20 @@ void kv_read_async_no_lookup(struct slab_callback *callback, struct slab *s,
   return enqueue_slab_callback(ctx, READ_NO_LOOKUP, callback);
 }
 
-/*
- * A client may hand back a record it just read, and READ returns a pointer
- * into the page, so a reinserted copy's shy flag could ride into a real write.
- * Client writes are never shy: strip it at the entry points.
- */
 void kv_add_async(struct slab_callback *callback) {
   struct slab_context *ctx = get_slab_context(callback->item);
-  item_clear_shy((struct item_metadata *)callback->item);
   callback->ctx = ctx;
   enqueue_slab_callback(ctx, ADD, callback);
 }
 
 void kv_upsert_async(struct slab_callback *callback) {
   struct slab_context *ctx = get_slab_context(callback->item);
-  item_clear_shy((struct item_metadata *)callback->item);
   callback->ctx = ctx;
   return enqueue_slab_callback(ctx, UPSERT, callback);
 }
 
 void kv_remove_async(struct slab_callback *callback) {
   struct slab_context *ctx = get_slab_context(callback->item);
-  item_clear_shy((struct item_metadata *)callback->item);
   callback->ctx = ctx;
   return enqueue_slab_callback(ctx, DELETE, callback);
 }
