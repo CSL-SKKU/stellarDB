@@ -387,3 +387,144 @@ why it is rare (once in ~6 runs with `-r`). This is very likely the defect AGENT
 it is reported, not fixed. The pruner now skips such a slot with a warning and keeps the database
 running instead of dying; `prune_bad_slot_count()` counts them. The key was already lost when the
 slot was overwritten.
+
+---
+
+# Step 10 — the AGENTS.md section
+
+The text below is written to replace AGENTS.md's "Pruning implementation" (and to amend its
+locking-model section). It lives here because AGENTS.md is outside this worktree.
+
+## Pruning implementation
+
+Pruning replaces three center-tree nodes -- an internal node, a leaf and an internal node that are
+consecutive in the in-order sequence *and* adjacent in the history chain -- with one new immutable
+node `N` holding only their valid entries. It is the only operation that ever changes `lu_parent`,
+and it changes exactly two `lu_parent` pointers outside the triple.
+
+Names, following the plan: `leaf` (L), `inner` = `L->lu_parent`, `outer` = `inner->lu_parent`,
+`up` (D) = `outer->lu_parent` (may be NULL), `sib` (A) = inner's other history child,
+`star` (*) = outer's other history child, `side` (s) with `inner->lu_child[side] == leaf`.
+`P` is the leaf's **routing** parent, always one of `{inner, outer}`; `Q` is the other one and is
+always a routing ancestor of `P`.
+
+### Selection (`indexes/tnt_prune.c`, `prune_select`)
+
+A triple is prunable iff `outer->lu_child[!side] == inner` (opposite sides -- same-side placement
+puts `sib`'s whole subtree between them in-order), both internal nodes are fully split
+(`child_flag == 1`), nothing in the triple is retired, the leaf is a live appendable leaf
+(`child_flag == 0` and its slab not `full`), and
+`nb_items(inner) + nb_items(outer) + nb_items(leaf) + prune_margin <= nb_max_items`.
+`nb_items` over-estimates the valid entries, so this test is conservative; `slab_freeze()`'s
+budget is the authoritative one. `--prune-min-age` additionally skips a triple whose leaf is among
+the newest N slabs.
+
+### Order of operations (one prune)
+
+Everything below runs under `tnt_maintenance_lock()`, which excludes the rebalancer:
+
+1. **Build `N` cold.** Fresh slab file, fresh subtree, unpublished node, taking `Q`'s pivot, level
+   and file key. Sources are merged newest first (`inner`, then `outer`) and a key already staged
+   is skipped, which implements precedence `leaf > inner > outer`. Records are copied whole-slot
+   and byte-exact, so tombstones survive untouched. Entries are snapshotted under the source's
+   `tree_lock`; the copying happens outside it. The staged pages are written before the freeze.
+2. **Freeze the leaf.** `slab_freeze(leaf, nb_max_items - cold_count)` CASes `last_item` to
+   `nb_max_items`, publishes `full` with an exchange, then waits for `update_ref` to drain.
+   `-EBUSY` means a writer already took the final slot and owns the split; `-ENOSPC` means the
+   slots do not fit. Both leave everything untouched, and the candidate is simply dropped.
+3. **Copy the leaf into `N`**, `fsync`, finalize `N` (`last_item = nb_items = count`, `full = 1`,
+   `child_flag = 1`). No abort path from step 2 on: a frozen childless leaf is a dead end for
+   writers and only the splice releases them.
+4. **History link**, in this order: `N`'s own `lu_parent`/`lu_child`, then `D`'s child slot, then
+   `sib->lu_parent = N` and `star->lu_parent = N`.
+5. **Routing splice.** Under the RCU writer, with no lock held: replace `P` by its other child
+   `S`, then give `N` `Q`'s children, parent and pivot. `Q`'s children are read *after* the first
+   splice, so the `G == Q` case picks up `S`. Publish under `centree_root_lock` (write), then
+   drain the old generation.
+6. **Retire.** Set `removed` on the three nodes, then `child_flag = 1` on the leaf and wake its
+   waiters. Free the three local indexes under `tree_lock` and reset `min/max`; close and unlink
+   each file once its reference counts reach zero.
+
+Why that order: history before routing, because after the splice the leaf's key range is served by
+an in-order neighbour whose `lu_parent` chain must already reach `N`; routing before retirement,
+because a reader or writer that restarts on `removed` has to find the new topology.
+
+### What the rest of the code has to do
+
+- **Reads** (`tnt_index_lookup`) check `removed` under the slab's `tree_lock` before consulting the
+  subtree and **restart the whole descent** if it is set -- walking past a retired node would miss
+  entries that now live in `N`. The read reference is taken under that same lock, so a retired slab
+  can never gain a new reader.
+- **Writers** wait on `child_flag == 0 && !removed` and restart when retired: a pruned leaf never
+  grows children. They release `update_ref` before descending or waiting. Their upward walk
+  *skips* retired slabs -- it only looks for an older copy to invalidate.
+- **Reinsertion** pins its source with `read_ref` after checking `removed` under `tree_lock`, and
+  consults the source subtree under that lock.
+- `min = -1, max = 0` on a retired slab keeps the older range checks (writer descent,
+  `add_in_tree_for_upsert`'s invalidation) rejecting every key. It is *not* how retirement is
+  detected: an empty live slab looks identical. Use `centree_node.removed`.
+
+### Locking and lifetime
+
+    maintenance_lock -> (CENTREE_RESTRUCTURING) -> RCU writer -> centree_root_lock
+
+The pruner does **not** take `CENTREE_RESTRUCTURING`: it only needs the rebalancer excluded and
+the RCU writer for the splice, so concurrent splits are unaffected except while it holds the
+writer. `lu_parent` is atomic (`centree_lu_parent`/`_store`); `lu_child[2]` are plain, written only
+by the splitter before publication and by the single pruner.
+
+Pruned `centree_node`s, `struct slab` descriptors and `hot_bits` are **never freed**. That is the
+reclamation strategy, not a leak: descriptors are held raw across async I/O and by the reinsertion
+queue. Only the local index, the filter and the file are given back.
+
+### Things that look wrong but are intended
+
+- `N` is internal and not full, yet `full = 1`: every writer descent calls `reserve_slot()` on the
+  nodes it passes, and `N` is immutable.
+- `N` may contain stale entries whose invalid hint was missed. They are shadowed by the newer copy
+  nearer the leaf, and only make future candidate counts conservative.
+- `depth` and `value.level` go stale after a prune; they are advisory and the rebalancer
+  recomputes them.
+
+### Verification
+
+    test/run_prune_tests.sh
+
+Covers both triple orientations and the `D == NULL` (history root) case, a rebalanced area where
+routing != history, an empty `N`, freeze rejections, the freeze/split race, a writer parked on the
+frozen leaf, retirement with a pinned reader, slab-file count == node count, repeated prunes up the
+chain, rebalancing interleaved with pruning, and ~500k reads plus ~78k writes against an exact
+model while the pruner (and optionally the reinsertion worker) runs.
+
+## Deferred, reported but not fixed
+
+- **Recovery does not survive pruning.** `root_exists()` (`slab.c`) decides whether to recover by
+  looking for a file named `slab-1-0-*`, and pruning unlinks the original root slab as soon as its
+  triple is selected -- which is common, since the root is the oldest and stalest node. A restart
+  then finds no root, creates a fresh empty database and reports 0 recovered entries, silently
+  losing everything; worse, `create_sequence` restarts at 1, so the new files can collide with the
+  surviving ones. `test/run_prune_tests.sh` characterizes this as a known-bad case. Recovery also
+  walks the *routing* parent chain, which is only equivalent to the history chain before any
+  rebalance or prune, and `rebuild_slabs` keys files by routing key and fails on duplicates. Making
+  recovery pruning-aware needs a supersedes marker (or a commit record) and recovery-side handling;
+  the plan defers all of it.
+- **A crash between the history link and retirement** leaves `N` and all three originals on disk,
+  which is the same recovery problem in its acute form.
+- **`ADD` after a prune** may not detect a duplicate whose only copy is in a retired slab during
+  the retire window: the writer walk skips retired slabs. `ADD` is already known-bad.
+- **Reinsertion writes at the source's slot index** (pre-existing). `fsst.c` leaves
+  `cb->fsst_slab`/`cb->fsst_idx` pointing at the *source* before calling
+  `centree_lookup_and_reserve()`, which suppresses `slabworker.c`'s correction
+  (`if (e && callback->fsst_slab == NULL)`), and `remove_and_add_item_async()`'s in-place branch
+  then writes the record into the *destination* slab at the source's slot index, overwriting
+  whatever record that slot held. Needs a key that reinsertion is copying forward to already exist
+  in the current leaf, so it is rare (once in ~6 runs with `-r`). The pruner detects the resulting
+  index/file disagreement and skips the slot with a warning rather than dying;
+  `prune_bad_slot_count()` counts them.
+- **The maintenance trigger.** Pruning runs on the restructuring worker and inherits its gate
+  (distributor utilization >= 80% and I/O-worker utilization <= 50%), which never opens in a
+  disk-busy benchmark -- so no background prune fires there at all. Sensible for rebalancing;
+  questionable for pruning, which is about space rather than index depth.
+- **Skewed workloads yield no candidates**, by design: the immediate history ancestors of a live
+  leaf are young and mostly still authoritative under skew, so the fit test rejects everything. A
+  uniform overwrite workload prunes readily (24 prunes in a 1M-request run).

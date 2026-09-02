@@ -679,6 +679,8 @@ static void check_cold_builds(void) {
     struct prune_candidate c;
 
     if (!chain_candidate(order[i], &c)) continue;
+    cov_side[c.side]++;
+    if (!c.up) cov_history_root++;
     if (built == 0) check_empty_build(&c);
     check_one_cold_build(&c);
     if (c.cold_bound > 0) rich++;
@@ -841,8 +843,13 @@ static void check_prune_link(void) {
     struct prune_candidate c;
 
     if (!prune_select(order[i], &c)) continue;
-    /* Prefer a triple that actually has something to carry over. */
-    if (!have || c.cold_bound > best.cold_bound) {
+    /*
+     * Prefer the triple whose outer is the history root, so the D == NULL
+     * branch of the history link runs; failing that, one with something to
+     * carry over.
+     */
+    if (!have || (!c.up && best.up) ||
+        (!c.up == !best.up && c.cold_bound > best.cold_bound)) {
       best = c;
       have = true;
     }
@@ -1334,8 +1341,45 @@ static void check_concurrent_prune(void) {
          (size_t)atomic_load(&stress_reads), (size_t)atomic_load(&stress_writes));
 }
 
+/*
+ * The state a completed run leaves behind: the deleted tenth is gone, every
+ * other key below nb_keys carries the value the last write phase gave it, and
+ * the upper range still carries its load value. Used by the "verify" mode to
+ * re-open an existing database, which is the only recovery check this suite
+ * makes.
+ */
+static void verify_model(void) {
+  uint64_t hi = nb_keys + nb_keys / 2;
+  size_t bad = 0;
+
+  printf("  recovered %lu index entries\n", get_database_size());
+  for (uint64_t k = 0; k < hi; k++) {
+    int want_found = 1;
+    uint64_t want = 0;
+
+    if (k >= nb_keys)
+      want = k * 7 + 1;
+    else if (k % 10 == 0)
+      want_found = 0;
+    else
+      want = k * 7 + 9;
+
+    read_back_quiet(k);
+    if (rb_found == want_found && (!want_found || rb_value == want)) continue;
+    if (bad < 8)
+      check(false, "key %lu: found %d want %d, value %lu want %lu", k, rb_found,
+            want_found, rb_value, want);
+    bad++;
+  }
+  check(bad == 0, "%zu of %lu keys wrong after recovery", bad, hi);
+  if (!bad) printf("  %-34s %lu keys\n", "state after recovery", hi);
+}
+
 int main(int argc, char **argv) {
-  if (argc > 1) nb_keys = strtoull(argv[1], NULL, 0);
+  int verify_only = argc > 1 && !strcmp(argv[1], "verify");
+
+  if (argc > 1 && !verify_only) nb_keys = strtoull(argv[1], NULL, 0);
+  if (argc > 2) nb_keys = strtoull(argv[2], NULL, 0);
 
   init_default_config(&cfg);
   cfg.kv_size = TEST_KV_SIZE;
@@ -1350,6 +1394,16 @@ int main(int argc, char **argv) {
          cfg.with_reins);
   slab_workers_init(1, 4, 2);
   if (cfg.with_reins) fsst_worker_init();
+
+  if (verify_only) {
+    verify_model();
+    if (failures) {
+      printf("== %lu failures ==\n", failures);
+      return 1;
+    }
+    printf("== ok ==\n");
+    return 0;
+  }
 
   run_upserts(0, nb_keys);
   validate("after splits");
@@ -1413,7 +1467,7 @@ int main(int argc, char **argv) {
   check(cov_side[0] > 0 && cov_side[1] > 0,
         "only one orientation was covered (side0 %zu, side1 %zu)", cov_side[0],
         cov_side[1]);
-  check(cov_history_root > 0, "no candidate with D == NULL was covered");
+  check(cov_history_root > 0, "the D == NULL case was never seen");
 
   if (failures) {
     printf("== %lu failures ==\n", failures);
