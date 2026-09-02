@@ -34,10 +34,13 @@ MAIN_OBJ=main.o ${OTHERS_OBJ}
 all: makefile.dep main 
 
 test: test/test_main test/test_reins test/test_rebalance test/test_rebalance_api \
-	test/test_prune_links
+	test/test_prune_links test/test_prune_freeze
 
 test/test_prune_links: test/prune_links.o ${OTHERS_OBJ}
 	${CC} test/prune_links.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_prune_links
+
+test/test_prune_freeze: test/prune_freeze.o ${OTHERS_OBJ}
+	${CC} test/prune_freeze.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_prune_freeze
 
 test/test_rebalance: test/rebalance.o indexes/tnt_balance.o rcu.o
 	${CC} test/rebalance.o indexes/tnt_balance.o rcu.o ${CFLAGS} ${LDLIBS} -o test/test_rebalance
@@ -67,4 +70,4 @@ main: $(MAIN_OBJ)
 clean:
 	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins \
 		test/test_rebalance test/test_rebalance_api test/test_prune_links \
-		makefile.dep
+		test/test_prune_freeze makefile.dep

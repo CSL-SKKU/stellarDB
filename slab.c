@@ -507,6 +507,47 @@ void add_item_async(struct slab_callback *callback) {
   callback->io_cb(callback);
 }
 
+/*
+ * Freeze a slab: no writer will ever reserve another slot in it, and every
+ * write to a slot reserved before the freeze has completed.
+ *
+ * Returns the number of slots writers ever reserved, or
+ *   -EBUSY   a writer already took the final slot, so it owns this slab's
+ *            split; the slab is about to grow children.
+ *   -ENOSPC  those slots do not fit in the caller's budget.
+ * Both failures leave the slab untouched.
+ *
+ * The CAS to nb_max_items is what makes freeze and split mutually exclusive:
+ * reserve_slot() hands out the final slot with the same CAS on last_item, so
+ * whichever side wins it decides. After the CAS, reserve_slot() always takes
+ * its "old >= nb_max_items" exit.
+ *
+ * full is then published with an exchange, i.e. a full barrier, and the
+ * caller waits for update_ref to drain. Writers increment update_ref before
+ * they read full (centree_lookup_and_reserve/tnt_subtree_get), so the pair is
+ * a Dekker handshake: either the drain sees the writer's reference and waits
+ * for it, or the writer sees full and gives up on this slab. Draining also
+ * waits for in-flight page writes to slots reserved before the freeze.
+ */
+long slab_freeze(struct slab *s, size_t budget) {
+  for (;;) {
+    size_t old = atomic_load_explicit(&s->last_item, memory_order_acquire);
+
+    if (old >= s->nb_max_items)
+      return -EBUSY;
+    if (old > budget)
+      return -ENOSPC;
+    if (atomic_compare_exchange_strong_explicit(
+            &s->last_item, &old, s->nb_max_items, memory_order_acq_rel,
+            memory_order_acquire)) {
+      atomic_exchange_explicit(&s->full, 1, memory_order_seq_cst);
+      while (__sync_fetch_and_or(&s->update_ref, 0) != 0)
+        NOP10();
+      return (long)old;
+    }
+  }
+}
+
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   struct slab *s = cb->slab;
   struct slab *old_s = cb->fsst_slab;

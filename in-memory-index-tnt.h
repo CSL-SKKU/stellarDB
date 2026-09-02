@@ -59,6 +59,11 @@ void tnt_subtree_delete(int worker_id, void *item);
 
 tree_entry_t *tnt_parent_subtree_get(void *centnode);
 tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e);
+/*
+ * Reserve one slot, or (size_t)-1 when the slab is full. Interlocks with
+ * slab_freeze() through last_item.
+ */
+size_t reserve_slot(struct slab *s);
 struct tree_entry* centree_lookup_and_reserve(
   void *item,
   uint64_t *out_idx,

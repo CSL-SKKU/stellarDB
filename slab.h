@@ -140,6 +140,13 @@ static inline void slab_widen_range(struct slab *s, uint64_t key) {
 
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
 
+/*
+ * Make a slab immutable so a maintenance pass can copy it. Returns the number
+ * of slots writers ever reserved, or -EBUSY / -ENOSPC (see slab.c). Only the
+ * single pruner may call it.
+ */
+long slab_freeze(struct slab *s, size_t budget);
+
 struct slab *resize_slab(struct slab *s);
 
 void *read_item(struct slab *s, size_t idx);

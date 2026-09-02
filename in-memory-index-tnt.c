@@ -637,10 +637,17 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
     struct slab *s = n->value.slab;
     int comp_result;
 
+    /*
+     * Taken before full or last_item is consulted: slab_freeze() publishes
+     * full and then drains update_ref, so either it waits for this writer or
+     * this writer sees full and moves on. Kept on the way out, released by
+     * the write completion.
+     */
+    __sync_fetch_and_add(&s->update_ref, 1);
+
     // ── 1) full 아닌 slab에서만 in-place 업데이트 허용 ──
     if (!atomic_load_explicit(&s->full, memory_order_acquire)
       && old_e && s == old_e->slab) {
-      __sync_fetch_and_add(&s->update_ref, 1);
       *idx = (uint64_t)-1;
       break;
     }
@@ -648,13 +655,14 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e) {
     // ── 2) 슬롯 예약 (full 이면 reserve_slot()이 -1 리턴) ──
     size_t slot = reserve_slot(s);
     if (slot != (size_t)-1) {
-      __sync_fetch_and_add(&s->update_ref, 1);
       __sync_fetch_and_add(&s->nb_items, 1);
       *idx = slot;
       break;
     }
 
     // ── 3) slab full 이거나 예약 실패 → 트리 아래로 ──
+    /* Released before descending or waiting on child_flag. */
+    __sync_fetch_and_sub(&s->update_ref, 1);
 
     //R_LOCK(&s->tree_lock);
     //if (s->full == 0) {
@@ -731,6 +739,14 @@ struct tree_entry* centree_lookup_and_reserve(
     struct slab *s = n->value.slab;
     index_entry_t *found = NULL;
 
+    /*
+     * Taken before full or last_item is consulted: slab_freeze() publishes
+     * full and then drains update_ref, so either it waits for this writer or
+     * this writer sees full and moves on. Kept on the way out, released by
+     * the write completion.
+     */
+    __sync_fetch_and_add(&s->update_ref, 1);
+
     // a) slab 내부 lookup
     R_LOCK(&s->tree_lock);
     if (key <= s->max && key >= s->min)
@@ -740,7 +756,6 @@ struct tree_entry* centree_lookup_and_reserve(
     // b) in-place update 조건
     if (!atomic_load_explicit(&s->full, memory_order_acquire) && found) {
       R_UNLOCK(&centree_root_lock);
-      __sync_fetch_and_add(&s->update_ref, 1);
       *out_idx = (uint64_t)-1;
       *out_e = found;
       return &n->value;
@@ -749,7 +764,6 @@ struct tree_entry* centree_lookup_and_reserve(
     // c) 새 슬롯 예약 시도
     size_t slot = reserve_slot(s);
     if (slot != (size_t)-1) {
-      __sync_fetch_and_add(&s->update_ref, 1);
       __sync_fetch_and_add(&s->nb_items, 1);
 
       slab_widen_range(s, key);
@@ -759,6 +773,9 @@ struct tree_entry* centree_lookup_and_reserve(
     }
 
     // d) slab full -> split된 자식으로 하강 (자식 없으면 기다림)
+    /* Released before descending or waiting on child_flag. */
+    __sync_fetch_and_sub(&s->update_ref, 1);
+
     prev = n;
     do {
       int comp = tnt_pointer_cmp(

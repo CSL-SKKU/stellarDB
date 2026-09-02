@@ -131,6 +131,19 @@ static void validate(const char *when) {
   for (size_t i = 0; i < nb_routing; i++) {
     centree_node n = routing[i];
     bool leaf = !tnt_routing_left(n) && !tnt_routing_right(n);
+    struct slab *s = n->value.slab;
+
+    /*
+     * Every request has completed, so both reference counts must be back to
+     * zero. A writer that descends past a slab has to drop the update
+     * reference it took before the full check (I-8), and this is what catches
+     * a missed drop.
+     */
+    check(__sync_fetch_and_or(&s->update_ref, 0) == 0,
+          "[%s] slab seq %lu leaked %lu update refs", when, s->seq,
+          s->update_ref);
+    check(__sync_fetch_and_or(&s->read_ref, 0) == 0,
+          "[%s] slab seq %lu leaked %lu read refs", when, s->seq, s->read_ref);
 
     check(leaf == (i % 2 == 0),
           "[%s] in-order position %zu is %s, expected %s", when, i,
