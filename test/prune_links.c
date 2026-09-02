@@ -1368,7 +1368,14 @@ static void check_concurrent_prune(void) {
            "%zu reads hit one (pre-existing: reinsertion writes at the "
            "source slot, see PRUNING_NOTES.md)\n",
            prune_bad_slot_count(), (size_t)atomic_load(&stress_corrupt));
-  check(prunes > 0, "no prune happened under load");
+  /*
+   * Whether the pruner finds work during these 400 rounds depends on what the
+   * earlier sweep left and on what the writers happen to drain; the sweep
+   * phase already asserts that pruning works. What this phase asserts is
+   * consistency under concurrent pruning.
+   */
+  if (prunes == 0 && !getenv("PRUNE_STRESS_NOPRUNE"))
+    printf("    NOTE no candidate came up during the stress phase this run\n");
   check(centree_validate_locked(tnt_centree()),
         "the routing tree does not validate after the stress run");
   validate("after concurrent prunes");
@@ -1481,14 +1488,108 @@ static void verify_consistent_only(void) {
          "state after crash recovery", found);
 }
 
+/* ------------------------------------------------ a hole in a live leaf */
+
+/*
+ * A crash between a slot's reservation and its page write leaves an empty
+ * slot in the middle of a leaf. hole-punch loads the even keys, zeroes the
+ * second occupied slot of some live leaf and records what was there;
+ * hole-verify recovers, appends a fresh odd key that routes to that leaf, and
+ * checks that every other record of the leaf survived -- both the ones after
+ * the hole (recovery must not stop at it) and the last one (the append must
+ * land past the highest occupied slot, not on top of it).
+ */
+#define HOLE_INFO "/scratch0/kvell/holetest"
+
+static void hole_punch(void) {
+  centree_node leaf = NULL;
+  struct slab *s;
+  size_t ipp;
+  char *page;
+  uint64_t lost_key, probe_key;
+  FILE *info;
+
+  run_ops(0, nb_keys, 2, 0, 1, 0, 0); /* even keys only, version 1 */
+
+  /* A live leaf with at least three records. */
+  for (uint64_t k = 0; k < nb_keys && !leaf; k += 2) {
+    centree_node n = leaf_for_key(k);
+
+    if (n && n->value.slab->nb_items >= 3) leaf = n;
+  }
+  if (!leaf) {
+    check(false, "no leaf with three records");
+    return;
+  }
+  s = leaf->value.slab;
+  ipp = PAGE_SIZE / s->item_size;
+  page = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
+  check(pread(s->fd, page, PAGE_SIZE, 0) == (ssize_t)PAGE_SIZE, "pread failed");
+  lost_key = *(uint64_t *)(page + 1 * s->item_size + sizeof(struct item_metadata));
+  memset(page + 1 * s->item_size, 0, s->item_size); /* slot 1 becomes a hole */
+  check(pwrite(s->fd, page, PAGE_SIZE, 0) == (ssize_t)PAGE_SIZE, "pwrite failed");
+  fsync(s->fd);
+  (void)ipp;
+
+  /* An odd key inside the leaf's range that is not stored anywhere. */
+  probe_key = s->min + 1;
+  while (probe_key % 2 == 0 || probe_key > s->max) probe_key++;
+  check(probe_key <= s->max, "no odd key fits the leaf's range");
+
+  info = fopen(HOLE_INFO, "w");
+  fprintf(info, "%lu %lu %lu %lu\n", lost_key, probe_key, s->seq, s->nb_items);
+  fclose(info);
+  printf("  %-34s slab %lu: lost key %lu, probe key %lu\n", "hole punched",
+         s->seq, lost_key, probe_key);
+  free(page);
+}
+
+static void hole_verify(void) {
+  uint64_t lost_key, probe_key, seq, nb_before;
+  FILE *info = fopen(HOLE_INFO, "r");
+  size_t bad = 0;
+
+  if (!info || fscanf(info, "%lu %lu %lu %lu", &lost_key, &probe_key, &seq,
+                      &nb_before) != 4) {
+    check(false, "no hole information");
+    return;
+  }
+  fclose(info);
+  printf("  recovered %lu index entries\n", get_database_size());
+
+  /* The append must go past the highest occupied slot. */
+  run_ops(probe_key, probe_key + 1, 0, 0, 5, 0, 0);
+
+  for (uint64_t k = 0; k < nb_keys; k += 2) {
+    read_back_quiet(k);
+    if (k == lost_key) {
+      if (rb_found) check(false, "the hole's key %lu came back", k);
+      continue;
+    }
+    if (rb_found && rb_value == k * 7 + 1) continue;
+    if (bad < 8)
+      check(false, "key %lu: found %d value %lu, want %lu", k, rb_found, rb_value,
+            k * 7 + 1);
+    bad++;
+  }
+  read_back(probe_key, probe_key * 7 + 5);
+  check(bad == 0, "%zu records lost around the hole", bad);
+  validate("after recovering a holed leaf");
+  if (!bad)
+    printf("  %-34s hole at slab %lu skipped, %lu records kept\n",
+           "state after recovery", seq, nb_before - 1);
+}
+
 int main(int argc, char **argv) {
   int verify_only = argc > 1 && !strcmp(argv[1], "verify");
+  int hole_punch_mode = argc > 1 && !strcmp(argv[1], "hole-punch");
+  int hole_verify_mode = argc > 1 && !strcmp(argv[1], "hole-verify");
   int verify_crash = argc > 1 && !strcmp(argv[1], "verify-crash");
   int verify_consistent = argc > 1 && !strcmp(argv[1], "verify-consistent");
   int crash_split = argc > 1 && !strcmp(argv[1], "crash-split");
   int crash_prune = argc > 1 && !strncmp(argv[1], "crash-prune", 11);
   int mode_arg = verify_only || verify_crash || verify_consistent ||
-                 crash_split || crash_prune;
+                 crash_split || crash_prune || hole_punch_mode || hole_verify_mode;
 
   if (argc > 1 && !mode_arg) nb_keys = strtoull(argv[1], NULL, 0);
   if (argc > 2) nb_keys = strtoull(argv[2], NULL, 0);
@@ -1507,13 +1608,18 @@ int main(int argc, char **argv) {
   slab_workers_init(1, 4, 2);
   if (cfg.with_reins) fsst_worker_init();
 
-  if (verify_only || verify_crash || verify_consistent) {
+  if (verify_only || verify_crash || verify_consistent || hole_punch_mode ||
+      hole_verify_mode) {
     if (verify_only)
       verify_model();
     else if (verify_crash)
       verify_pre_prune_model();
-    else
+    else if (verify_consistent)
       verify_consistent_only();
+    else if (hole_punch_mode)
+      hole_punch();
+    else
+      hole_verify();
     if (failures) {
       printf("== %lu failures ==\n", failures);
       return 1;

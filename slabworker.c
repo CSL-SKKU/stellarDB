@@ -635,6 +635,11 @@ int add_existing_item(struct slab *s, size_t idx, void *item,
 
   if (item_is_legacy(meta))
     die("Legacy item metadata found while rebuilding slab %lu\n", s->seq);
+  /*
+   * An empty slot is skipped, not a stop sign: a crash between a slot's
+   * reservation and its page write leaves a hole in the middle of a live
+   * leaf, and everything after it is still real data.
+   */
   if (item_is_empty(meta))
     return 0;
 
@@ -655,17 +660,7 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
 
   meta->rdt = 0;
   __sync_fetch_and_add(&s->nb_items, 1);
-  size_t old = atomic_load_explicit(&s->last_item, memory_order_relaxed);
-  while (old < s->nb_max_items) {
-    if (atomic_compare_exchange_weak_explicit(
-      &s->last_item,
-      &old,           // expected value
-      old + 1,        // desired value
-      memory_order_acquire,
-      memory_order_relaxed)) {
-      break;
-    }
-  }
+  /* last_item is set by the caller from the highest occupied slot, not by count. */
   cb->slab_idx = idx;
 
   __sync_add_and_fetch(&nb_totals, 1);
@@ -688,11 +683,13 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
   return 1;
 }
 
-void process_existing_chunk(struct slab *s, char *data, size_t start, 
-                            size_t length, struct slab_callback *cb) {
+/* Returns one past the highest occupied slot in the chunk, or 0 if none. */
+size_t process_existing_chunk(struct slab *s, char *data, size_t start,
+                              size_t length, struct slab_callback *cb) {
   static __thread declare_periodic_count;
   size_t nb_items_per_page = PAGE_SIZE / s->item_size;
   size_t nb_pages = length / PAGE_SIZE;
+  size_t highest = 0;
 
   for (size_t p = 0; p < nb_pages; p++) {
     size_t page_num =
@@ -700,14 +697,15 @@ void process_existing_chunk(struct slab *s, char *data, size_t start,
     size_t base_idx = page_num * nb_items_per_page;
     size_t current = p * PAGE_SIZE;
     for (size_t i = 0; i < nb_items_per_page; i++) {
-      if (add_existing_item(s, base_idx, &data[current], cb) == 0)
-        return;
+      if (add_existing_item(s, base_idx, &data[current], cb) != 0)
+        highest = base_idx + 1;
       base_idx++;
       current += s->item_size;
       periodic_count(
           1000, "[REBUILD WORKER] Init - Recovered %lu items", s->nb_items);
     }
   }
+  return highest;
 }
 
 #define GRANULARITY_REBUILD (2 * 1024 * 1024)  // We rebuild 2MB by 2MB
@@ -731,7 +729,11 @@ void rebuild_index(struct slab *s, uint64_t key, char *buf) {
   callback = malloc(sizeof(*callback));
   callback->slab = s;
 
+  size_t highest = 0;
+
   while (1) {
+    size_t h;
+
     end = start + GRANULARITY_REBUILD;
     if (end > slab_data_size(s)) end = slab_data_size(s); /* not the header */
     if (((end - start) % PAGE_SIZE) != 0) end = end - (end % PAGE_SIZE);
@@ -742,12 +744,17 @@ void rebuild_index(struct slab *s, uint64_t key, char *buf) {
     if (r != end - start)
       perr("pread failed! Read %d instead of %lu (offset %lu)\n", r,
            end - start, start);
-    process_existing_chunk(s, buf, start, end - start, callback);
+    h = process_existing_chunk(s, buf, start, end - start, callback);
+    if (h > highest) highest = h;
     start = end;
   }
 
-  if (atomic_load_explicit(&s->last_item, 
-	  memory_order_relaxed) == s->nb_max_items)
+  /*
+   * Slots are handed out past the highest occupied one, so a hole left by a
+   * crash stays empty for good instead of being reused over live data.
+   */
+  atomic_store_explicit(&s->last_item, highest, memory_order_release);
+  if (highest == s->nb_max_items)
     atomic_store_explicit(&s->full, 1, memory_order_release);
 
   free(callback);

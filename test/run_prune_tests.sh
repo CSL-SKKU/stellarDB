@@ -80,6 +80,16 @@ report "recover after crash-split" "${PIPESTATUS[0]}"
 unset DBDIR
 
 echo
+echo "== a hole in a live leaf =="
+DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
+export DBDIR
+sandboxed ./test/test_prune_links hole-punch 2>&1 | filter | grep -E "hole|FAIL"
+report "hole-punch" "${PIPESTATUS[0]}"
+sandboxed ./test/test_prune_links hole-verify 2>&1 | filter | grep -E "Recovery:|FAIL|state after"
+report "recover past the hole, append lands after it" "${PIPESTATUS[0]}"
+unset DBDIR
+
+echo
 echo "== rebalancing must still be correct =="
 ./test/test_rebalance >/dev/null 2>&1;     report "rebalance structural" $?
 ./test/test_rebalance_api >/dev/null 2>&1; report "rebalance runtime API" $?
