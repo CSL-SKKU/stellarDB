@@ -385,16 +385,11 @@ again:
           uint64_t tree_depth = tnt_get_depth();
 
           if (cnt == (size_t)(cfg.epoch/20)
-            &&  s->upward_maxlen >= (tree_depth/3)) {
-            int expected = 0;
-
-            /* CAS, so two I/O workers cannot both enqueue the slab. */
-            if (atomic_compare_exchange_strong_explicit(
-                    &s->queued, &expected, 1, memory_order_acq_rel,
-                    memory_order_acquire)) {
+            &&  s->upward_maxlen >= (tree_depth/3)
+            && !atomic_load_explicit(&s->queued, memory_order_acquire)) {
               printf("Reinsert: %lu\n", s->seq);
-              bgq_enqueue(GC, s);
-            }
+              atomic_store_explicit(&s->queued, 1, memory_order_relaxed);
+            bgq_enqueue(GC, s);
           }
 	}
         read_item_async(callback);

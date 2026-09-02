@@ -232,8 +232,6 @@ void *read_item(struct slab *s, size_t idx);
 void read_item_async(struct slab_callback *callback);
 void scan_item_async(struct slab_callback *callback);
 void add_item_async(struct slab_callback *callback);
-/* First stage of an append; reinsertion drives it with its own completion. */
-void add_item_async_cb1(struct slab_callback *callback);
 void upsert_item_async(struct slab_callback *callback);
 void remove_item_async(struct slab_callback *callback);
 void remove_and_add_item_async(struct slab_callback *callback);
