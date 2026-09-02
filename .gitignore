@@ -58,3 +58,6 @@ perf.data*
 /twice_build.sh
 /scripts/restructuring*.sh
 /test/index_test.sh
+
+# Working notes kept locally; AGENTS.md carries the summary.
+/PRUNING_NOTES.md
