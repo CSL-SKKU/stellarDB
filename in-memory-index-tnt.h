@@ -21,6 +21,14 @@ index_entry_t *subtree_worker_lookup_ukey(subtree_t *tree, uint64_t key);
 int subtree_worker_delete(subtree_t *tree, void *item);
 
 void centree_init(void);
+/*
+ * Mutual exclusion between the maintenance operations that restructure the
+ * center tree (rebalancing, and pruning once it lands). tnt_rebalancing()
+ * takes it internally. Lock order:
+ *   maintenance_lock -> CENTREE_RESTRUCTURING -> RCU writer -> centree_root_lock
+ */
+void tnt_maintenance_lock(void);
+void tnt_maintenance_unlock(void);
 /* Split/restructure phase exclusion; these do not guard topology pointers. */
 void tnt_split_phase_enter(void);
 void tnt_split_phase_exit(void);

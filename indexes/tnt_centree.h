@@ -54,7 +54,16 @@ typedef struct centree_node_t {
   struct rcu_ptr left;
   struct rcu_ptr right;
   struct rcu_ptr parent;
-  struct centree_node_t* lu_parent;
+  /*
+   * History links, used by the upward (authoritative version) lookup.
+   * lu_parent is assigned once when a split creates the node and is mutated
+   * only by pruning, while walkers read it without holding any lock: hence the
+   * atomic. lu_child[] are its back-pointers (CENTREE_LU_LEFT/RIGHT), written
+   * only by the splitter before publication and by the single pruner, so they
+   * stay plain.
+   */
+  _Atomic(struct centree_node_t *) lu_parent;
+  struct centree_node_t* lu_child[2];
   _Atomic int child_flag;
   /* Advisory maintenance metadata; never used to choose a routing edge. */
   _Atomic(unsigned char) removed;
@@ -139,6 +148,23 @@ static inline void centree_pivot_store(centree_node node, uint64_t pivot) {
   atomic_store_explicit(&node->key, pivot, memory_order_release);
 }
 
+#define CENTREE_LU_LEFT 0
+#define CENTREE_LU_RIGHT 1
+
+/*
+ * History-link access. lu_parent is the only link that pruning rewires while
+ * readers are walking it without a lock, so loads acquire and stores are
+ * seq_cst.
+ */
+static inline centree_node centree_lu_parent(centree_node node) {
+  return atomic_load_explicit(&node->lu_parent, memory_order_acquire);
+}
+
+static inline void centree_lu_parent_store(centree_node node,
+                                           centree_node parent) {
+  atomic_store_explicit(&node->lu_parent, parent, memory_order_seq_cst);
+}
+
 typedef struct bgq_node_t {
   union {
     struct centree_node_t* data;
@@ -173,6 +199,17 @@ tree_entry_t* centree_traverse_useq(centree t, int seq);
  */
 centree_node centree_insert(centree t, struct rcu_writer *writer, void* key,
                             tree_entry_t* value, compare_func compare);
+/*
+ * Allocate an unlinked node. Pruning builds its replacement node before any
+ * pointer to it exists; the node obeys the same no-reclamation rule as the
+ * ones centree_insert creates.
+ */
+centree_node centree_node_new(void* key, tree_entry_t* value);
+/*
+ * node_count is advisory (it feeds the rebalance trigger). Pruning replaces
+ * three nodes with one, so it has to give two back.
+ */
+void centree_node_count_sub(centree t, uint64_t count);
 // void centree_delete(centree t, void* key, compare_func compare);
 
 void centree_print(centree t);

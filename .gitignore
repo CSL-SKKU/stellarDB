@@ -33,6 +33,7 @@
 /ttt*
 /test/rebal_*
 /test/reins_*
+/test/test_*
 
 # Benchmark outputs and local data
 /bgwork/

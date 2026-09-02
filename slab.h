@@ -71,6 +71,8 @@ struct slab {
   size_t size_on_disk;
   uint64_t update_ref;
   uint64_t read_ref;
+  /* Set once when a retired slab's file is closed and unlinked. */
+  _Atomic int released;
 
   unsigned char nb_batched;
   struct slab_callback **batched_callbacks;

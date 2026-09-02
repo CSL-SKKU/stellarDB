@@ -106,6 +106,7 @@ struct slab *create_slab(struct slab_context *ctx, uint64_t level,
 
   atomic_init(&s->full, 0);
   atomic_init(&s->last_item, 0);
+  atomic_init(&s->released, 0);
 
   if (cfg.with_reins) {
     atomic_init(&s->queued, 0);

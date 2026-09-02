@@ -241,6 +241,11 @@ centree_node get_next_node(background_queue *queue, centree_node target) {
 
 static centree centree_root;
 static pthread_lock_t centree_root_lock;
+/*
+ * Statically initialized: tnt_rebalancing() is reachable (and returns
+ * -EINVAL) before centree_init() runs.
+ */
+static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int centree_phase_state;
 static void (*rebalance_precommit_test_hook)(void);
 static void (*rebalance_postpublish_test_hook)(void);
@@ -308,6 +313,14 @@ static void restructuring_phase_exit(void) {
 
   assert(old == CENTREE_RESTRUCTURING);
   futex_wake(&centree_phase_state, INT_MAX);
+}
+
+void tnt_maintenance_lock(void) {
+  pthread_mutex_lock(&maintenance_lock);
+}
+
+void tnt_maintenance_unlock(void) {
+  pthread_mutex_unlock(&maintenance_lock);
 }
 
 void tnt_set_rebalance_precommit_test_hook(void (*hook)(void)) {
@@ -765,7 +778,7 @@ struct tree_entry* centree_lookup_and_reserve(
 
   // 6) upward lookup: 리프 노드 n에서부터 위로 올라가며 이전 entry 찾기
   *out_e = NULL;
-  for (centree_node cur = n; cur; cur = cur->lu_parent) {
+  for (centree_node cur = n; cur; cur = centree_lu_parent(cur)) {
     struct slab *s2 = cur->value.slab;
     index_entry_t *e2 = NULL;
     R_LOCK(&s2->tree_lock);
@@ -879,7 +892,7 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
 
     // 부모 노드로 이동
     upward_len++;
-    n = n->lu_parent;  // parent 필드를 추가하고, 부모 노드로 이동
+    n = centree_lu_parent(n);  // 부모(history) 노드로 이동
   }
   add_time_in_payload(cb, TIMING_STAGE_INDEX_LOOKUP_DONE);
   // printf("%d", try);
@@ -979,6 +992,7 @@ int tnt_rebalancing(void) {
   if (centree_root == NULL)
     return -EINVAL;
 
+  tnt_maintenance_lock();
   restructuring_phase_enter();
 
   centree_node root = centree_current_root(centree_root);
@@ -1007,5 +1021,6 @@ int tnt_rebalancing(void) {
   }
 
   restructuring_phase_exit();
+  tnt_maintenance_unlock();
   return result;
 }

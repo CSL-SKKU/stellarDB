@@ -112,9 +112,23 @@ node new_node(void *key, tree_entry_t *value) {
   atomic_init(&result->key, (uint64_t)(uintptr_t)key);
   result->value = *value;
   centree_node_init_links(result, NULL, NULL, NULL);
-  result->lu_parent = NULL;
+  atomic_init(&result->lu_parent, NULL);
+  result->lu_child[CENTREE_LU_LEFT] = NULL;
+  result->lu_child[CENTREE_LU_RIGHT] = NULL;
   atomic_store(&result->child_flag, 0);
   return result;
+}
+
+centree_node centree_node_new(void *key, tree_entry_t *value) {
+  return new_node(key, value);
+}
+
+void centree_node_count_sub(centree t, uint64_t count) {
+  uint64_t old = atomic_fetch_sub_explicit(&t->node_count, count,
+                                           memory_order_release);
+
+  assert(old >= count);
+  (void)old;
 }
 
 node lookup_node(centree t, void *key, compare_func compare) {
@@ -169,7 +183,10 @@ node centree_insert(centree t, struct rcu_writer *writer, void *key,
         if (left == NULL) {
           value->level = level;
           inserted_node->value = *value;
-          inserted_node->lu_parent = n;
+          centree_lu_parent_store(inserted_node, n);
+          /* A routing leaf is a history leaf, so the slot must be free. */
+          assert(n->lu_child[CENTREE_LU_LEFT] == NULL);
+          n->lu_child[CENTREE_LU_LEFT] = inserted_node;
           rcu_writer_set_ptr(writer, &inserted_node->parent, n);
           rcu_writer_set_ptr(writer, &n->left, inserted_node);
           break;
@@ -183,7 +200,10 @@ node centree_insert(centree t, struct rcu_writer *writer, void *key,
         if (right == NULL) {
           value->level = level;
           inserted_node->value = *value;
-          inserted_node->lu_parent = n;
+          centree_lu_parent_store(inserted_node, n);
+          /* A routing leaf is a history leaf, so the slot must be free. */
+          assert(n->lu_child[CENTREE_LU_RIGHT] == NULL);
+          n->lu_child[CENTREE_LU_RIGHT] = inserted_node;
           rcu_writer_set_ptr(writer, &inserted_node->parent, n);
           rcu_writer_set_ptr(writer, &n->right, inserted_node);
           break;

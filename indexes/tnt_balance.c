@@ -263,7 +263,7 @@ int centree_balance_prepare(centree tree,
   }
 
   for (size_t i = 0; i < plan->total_nodes; i++) {
-    plan->snapshots[i].lu_parent = plan->nodes[i]->lu_parent;
+    plan->snapshots[i].lu_parent = centree_lu_parent(plan->nodes[i]);
     plan->snapshots[i].was_leaf =
         centree_current_left(tree, plan->nodes[i]) == NULL;
 
@@ -300,7 +300,7 @@ int centree_balance_prepare(centree tree,
 
     if (after[i] != plan->nodes[i] ||
         is_leaf != plan->snapshots[i].was_leaf ||
-        plan->nodes[i]->lu_parent != plan->snapshots[i].lu_parent) {
+        centree_lu_parent(plan->nodes[i]) != plan->snapshots[i].lu_parent) {
       error = EFAULT;
       goto abort;
     }
