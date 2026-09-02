@@ -293,4 +293,12 @@ void centree_balance_abort(struct centree_balance_plan *plan);
 /* Returns zero on success/no-op, otherwise an errno value. */
 int centree_balance(centree tree);
 
+/*
+ * Recovery: build the routing tree over an in-order sequence of unlinked nodes
+ * (leaf, internal, leaf, ...), balanced the way rebalancing balances. The tree
+ * must be unpublished and quiescent; both RCU slots are initialized directly.
+ * Returns 0 or an errno value.
+ */
+int centree_build_from_inorder(centree tree, centree_node *nodes, size_t n);
+
 #endif

@@ -73,19 +73,24 @@ struct slab *create_slab(struct slab_context *ctx, uint64_t level,
   struct stat sb;
   char path[512];
   struct slab *s = calloc(1, sizeof(*s));
-  uint64_t cur_seq = -1;
+  uint64_t cur_seq = 0;
   int flag = O_RDWR | O_DIRECT;
 
   // not rebuild
   if (!rebuild)
     flag = flag | O_CREAT;
 
-  //size_t disk = slab_worker_id / (get_nb_workers() / get_nb_disks());
-  cur_seq = __sync_add_and_fetch(&create_sequence, 1);
-  if (rebuild)
+  /*
+   * A fresh slab consumes an id and is named after it. A rebuilt one keeps
+   * the id its header carries; the caller stores it in seq, so no id is
+   * consumed here.
+   */
+  if (rebuild) {
     sprintf(path, "/scratch0/kvell/%s", name);
-  else
-    sprintf(path, PATH, 0LU, cur_seq, level, key);
+  } else {
+    cur_seq = __sync_add_and_fetch(&create_sequence, 1);
+    sprintf(path, PATH, 0LU, cur_seq);
+  }
 
   s->fd = open(path, flag, 0777);
 
@@ -93,16 +98,23 @@ struct slab *create_slab(struct slab_context *ctx, uint64_t level,
       perr("Cannot allocate slab %s", path);
   } 
 
+  /*
+   * cfg.max_file_size is the data size; the header page comes on top of it,
+   * so the slot count a configuration implies is unchanged by the header.
+   */
   fstat(s->fd, &sb);
   s->size_on_disk = sb.st_size;
-  if (!rebuild && s->size_on_disk < cfg.max_file_size) {
-    fallocate(s->fd, 0, 0, cfg.max_file_size);
-    s->size_on_disk = cfg.max_file_size;
+  if (!rebuild && s->size_on_disk < cfg.max_file_size + PAGE_SIZE) {
+    fallocate(s->fd, 0, 0, cfg.max_file_size + PAGE_SIZE);
+    s->size_on_disk = cfg.max_file_size + PAGE_SIZE;
   }
+  if (s->size_on_disk < 2 * PAGE_SIZE || s->size_on_disk % PAGE_SIZE != 0)
+    die("Slab %s has size %lu; need at least a data page and the header page\n",
+        path, s->size_on_disk);
 
-
+  /* The last page is the header, not slots. */
   size_t nb_items_per_page = PAGE_SIZE / cfg.kv_size;
-  s->nb_max_items = s->size_on_disk / PAGE_SIZE * nb_items_per_page;
+  s->nb_max_items = slab_data_size(s) / PAGE_SIZE * nb_items_per_page;
   s->item_size = cfg.kv_size;
 
   s->min = -1;
@@ -131,89 +143,284 @@ struct slab *create_slab(struct slab_context *ctx, uint64_t level,
 
   INIT_LOCK(&s->tree_lock, NULL);
 
+  /*
+   * A fresh slab is on disk with a valid header before anything can refer to
+   * it. It has no children yet; the header is rewritten when it splits.
+   */
+  if (!rebuild && slab_write_header_raw(s, key, level, 0, 0) != 0)
+    perr("Cannot write the header of slab %s", path);
+
   return s;
+}
+
+/* ------------------------------------------------------------------ */
+/* Header page, ROOT file                                              */
+
+static __thread char *header_page;
+
+static char *header_page_buffer(void) {
+  if (header_page == NULL)
+    header_page = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
+  return header_page;
+}
+
+int slab_write_header_raw(struct slab *s, uint64_t key, uint64_t level,
+                          uint64_t left_id, uint64_t right_id) {
+  char *page = header_page_buffer();
+  struct slab_header *h = (struct slab_header *)page;
+  ssize_t written;
+
+  if (page == NULL)
+    return -ENOMEM;
+  memset(page, 0, PAGE_SIZE);
+  h->magic = SLAB_HEADER_MAGIC;
+  h->id = s->seq;
+  h->key = key;
+  h->level = level;
+  h->lu_child[0] = left_id;
+  h->lu_child[1] = right_id;
+  written = pwrite(s->fd, page, PAGE_SIZE, (off_t)slab_data_size(s));
+  return written == (ssize_t)PAGE_SIZE ? 0 : -EIO;
+}
+
+int slab_write_header(struct slab *s) {
+  centree_node n = (centree_node)s->centree_node;
+  uint64_t child[2] = {0, 0};
+
+  if (n == NULL)
+    return -EINVAL;
+  for (int i = 0; i < 2; i++)
+    if (n->lu_child[i] != NULL)
+      child[i] = n->lu_child[i]->value.slab->seq;
+  return slab_write_header_raw(
+      s, centree_pivot_load(n),
+      atomic_load_explicit(&n->value.level, memory_order_acquire), child[0],
+      child[1]);
+}
+
+int slab_read_header(int fd, size_t size_on_disk, struct slab_header *out) {
+  char *page = header_page_buffer();
+
+  if (page == NULL)
+    return -ENOMEM;
+  if (size_on_disk < 2 * PAGE_SIZE || size_on_disk % PAGE_SIZE != 0)
+    return -EINVAL;
+  if (pread(fd, page, PAGE_SIZE, (off_t)(size_on_disk - PAGE_SIZE)) !=
+      (ssize_t)PAGE_SIZE)
+    return -EIO;
+  memcpy(out, page, sizeof(*out));
+  return out->magic == SLAB_HEADER_MAGIC ? 0 : -EBADMSG;
 }
 
 /*
- * Double the size of a slab on disk
+ * Every operation on the database directory goes through a descriptor opened
+ * with open(): that is the one call tests interpose to redirect
+ * /scratch0/kvell, and rename/unlink on absolute paths would escape it.
+ */
+static int kvell_dirfd(void) {
+  char path[128];
+
+  snprintf(path, sizeof(path), "/scratch%lu/kvell", 0LU);
+  return open(path, O_RDONLY | O_DIRECTORY);
+}
+
+int slab_root_write(uint64_t id) {
+  char text[32];
+  int dirfd, fd, len, error = 0;
+
+  dirfd = kvell_dirfd();
+  if (dirfd < 0)
+    return -errno;
+  len = snprintf(text, sizeof(text), "%lu\n", id);
+  fd = openat(dirfd, "ROOT.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0) {
+    error = -errno;
+    goto out;
+  }
+  if (write(fd, text, len) != len || fsync(fd) != 0) {
+    close(fd);
+    error = -EIO;
+    goto out;
+  }
+  close(fd);
+  /* rename is atomic: readers see the old id or the new one, never neither. */
+  if (renameat(dirfd, "ROOT.tmp", dirfd, "ROOT") != 0)
+    error = -errno;
+out:
+  close(dirfd);
+  return error;
+}
+
+int slab_root_read(uint64_t *id) {
+  char text[32];
+  int dirfd, fd, len;
+
+  dirfd = kvell_dirfd();
+  if (dirfd < 0)
+    return -errno;
+  fd = openat(dirfd, "ROOT", O_RDONLY);
+  close(dirfd);
+  if (fd < 0)
+    return -errno;
+  len = read(fd, text, sizeof(text) - 1);
+  close(fd);
+  if (len <= 0)
+    return -EIO;
+  text[len] = 0;
+  *id = strtoull(text, NULL, 10);
+  return *id == 0 ? -EBADMSG : 0;
+}
+
+void slab_set_create_sequence(uint64_t next) {
+  __sync_lock_test_and_set(&create_sequence, (int)next);
+}
+
+static enum slab_crash_point crash_point;
+
+void slab_set_crash_point(enum slab_crash_point point) { crash_point = point; }
+
+void slab_maybe_crash(enum slab_crash_point point) {
+  if (crash_point == point) {
+    fprintf(stderr, "test crash point %d reached, exiting hard\n", point);
+    _exit(42);
+  }
+}
+
+/*
+ * Slabs are never resized: the header sits in the last page, reinsertion's
+ * buffer is sized once, and nb_max_items is baked into the freeze/split CAS.
  */
 struct slab *resize_slab(struct slab *s) {
-  if (s->size_on_disk < 10000000000LU) {
-    s->size_on_disk *= 2;
-    if (fallocate(s->fd, 0, 0, s->size_on_disk))
-      perr("Cannot resize slab (item size %lu) new size %lu\n", s->item_size,
-           s->size_on_disk);
-    s->nb_max_items *= 2;
-  } else {
-    size_t nb_items_per_page = PAGE_SIZE / s->item_size;
-    s->size_on_disk += 10000000000LU;
-    if (fallocate(s->fd, 0, 0, s->size_on_disk))
-      perr("Cannot resize slab (item size %lu) new size %lu\n", s->item_size,
-           s->size_on_disk);
-    s->nb_max_items = s->size_on_disk / PAGE_SIZE * nb_items_per_page;
-  }
+  die("Slab %lu: resizing is not supported\n", s->seq);
   return s;
 }
 
-int rebuild_slabs(int filenum, struct dirent **file_list) {
-  int ret = 0;
-  for (int i = 0; i < filenum; i++) {
-    if (file_list[i]->d_type == DT_REG) {  // If it's a regular file
-      char *filename = file_list[i]->d_name;
-      uint64_t level, key, old_key, seq;
-      int keynum;
-      if ((keynum = sscanf(filename, "slab-%lu-%lu-%lu-%lu", &seq, &level, &old_key, &key)) >= 2) {
-        struct slab *s;
-        s = create_slab(NULL, level, old_key, 1, filename);
-        // Process the slab file
-        //process_slab_file(level, key);
-#if WITH_FILTER
-        tnt_subtree_add(s, tnt_subtree_create(), 
-                  (void *)filter_create(200000), old_key);
-#else
-        tnt_subtree_add(s, tnt_subtree_create(), 
-                  NULL, old_key);
-#endif
-        if (keynum == 4) {
-          centree_pivot_store(s->centree_node, key);
-          s->key = key;
-        }
-        ret++;
-      } else {
-        free(file_list[i]);
-        file_list[i] = NULL;
-      }
-    }
-    else {
-      free(file_list[i]);
-      file_list[i] = NULL;
-    }
-    //free(file_list[i]);
-  }
-  return ret;
+static struct slab **recovered;
+static size_t nb_recovered;
+
+size_t slab_recovered(struct slab ***out) {
+  *out = recovered;
+  return nb_recovered;
 }
 
-static int root_exists() {
-    const char *dir_path = "/scratch0/kvell";
-    const char *prefix = "slab-1-0-";
-    
-    DIR *dir = opendir(dir_path);
-    if (dir == NULL) {
-        perror("Unable to open directory");
-        return -1;  // 디렉터리를 열 수 없는 경우
+static void discard_recovered(struct slab *s, const char *name,
+                              const char *why) {
+  int dirfd;
+
+  fprintf(stderr, "Recovery: deleting %s (%s)\n", name, why);
+  if (s != NULL) {
+    close(s->fd);
+    if (s->subtree != NULL)
+      subtree_free(s->subtree);
+    free(s->centree_node); /* never published, so it may be freed */
+    free(s->hot_bits);
+    free(s);
+  }
+  dirfd = kvell_dirfd();
+  if (dirfd >= 0) {
+    unlinkat(dirfd, name, 0);
+    close(dirfd);
+  }
+}
+
+int rebuild_slabs(int filenum, struct dirent **file_list) {
+  struct slab_header *hdrs = calloc(filenum > 0 ? filenum : 1, sizeof(*hdrs));
+  char **names = calloc(filenum > 0 ? filenum : 1, sizeof(*names));
+  unsigned char *reachable;
+  uint64_t root_id, max_id = 0;
+  size_t live = 0, kept = 0;
+
+  recovered = calloc(filenum > 0 ? filenum : 1, sizeof(*recovered));
+  if (hdrs == NULL || names == NULL || recovered == NULL)
+    die("Recovery: out of memory\n");
+
+  /* 1. One descriptor per file with a valid header; drop everything else. */
+  for (int i = 0; i < filenum; i++) {
+    char *name = file_list[i]->d_name;
+    struct slab_header hdr;
+    struct stat sb;
+    char path[512];
+    int fd, dup = 0;
+
+    if (file_list[i]->d_type != DT_REG || strncmp(name, "slab-", 5) != 0)
+      continue;
+    snprintf(path, sizeof(path), "/scratch0/kvell/%s", name);
+    fd = open(path, O_RDONLY); /* absolute: open() is the redirected call */
+    if (fd < 0 || fstat(fd, &sb) != 0 ||
+        slab_read_header(fd, (size_t)sb.st_size, &hdr) != 0) {
+      if (fd >= 0)
+        close(fd);
+      discard_recovered(NULL, name, "no valid header");
+      continue;
     }
-    
-    struct dirent *entry;
-    while ((entry = readdir(dir)) != NULL) {
-        // 파일 이름이 "slab-0-"로 시작하는지 확인
-        if (strncmp(entry->d_name, prefix, strlen(prefix)) == 0) {
-            closedir(dir);
-            return 1;  // 해당 파일을 찾은 경우
-        }
+    close(fd);
+    for (size_t j = 0; j < live && !dup; j++)
+      dup = hdrs[j].id == hdr.id;
+    if (dup) {
+      discard_recovered(NULL, name, "duplicate id");
+      continue;
     }
-    
-    closedir(dir);
-    return 0;  // 해당 파일을 찾지 못한 경우
+
+    recovered[live] = create_slab(NULL, hdr.level, hdr.key, 1, name);
+    recovered[live]->seq = hdr.id;
+    recovered[live]->subtree = tnt_subtree_create();
+    subtree_set_slab(recovered[live]->subtree, recovered[live]);
+#if WITH_FILTER
+    recovered[live]->filter = filter_create(200000);
+#endif
+    hdrs[live] = hdr;
+    names[live] = name;
+    if (hdr.id > max_id)
+      max_id = hdr.id;
+    live++;
+  }
+  if (live == 0)
+    die("Recovery: ROOT exists but no slab file has a valid header\n");
+  if (slab_root_read(&root_id) != 0)
+    die("Recovery: cannot read ROOT\n");
+
+  /* 2. Both trees from the headers. */
+  reachable = calloc(live, sizeof(*reachable));
+  tnt_recover_tree(recovered, hdrs, live, root_id, reachable);
+
+  /* 3. Garbage: leftovers of an interrupted split or prune. */
+  for (size_t i = 0; i < live; i++) {
+    if (reachable[i])
+      recovered[kept++] = recovered[i];
+    else
+      discard_recovered(recovered[i], names[i], "not reachable from ROOT");
+  }
+  nb_recovered = kept;
+  slab_set_create_sequence(max_id);
+
+  free(reachable);
+  free(hdrs);
+  free(names);
+  return (int)kept;
+}
+
+/* ROOT present: recover. Slab files without ROOT: unrecoverable layout. */
+static int root_exists(void) {
+  uint64_t id;
+  DIR *dir;
+  struct dirent *entry;
+
+  if (slab_root_read(&id) == 0)
+    return 1;
+  dir = opendir("/scratch0/kvell");
+  if (dir == NULL) {
+    perror("Unable to open directory");
+    return -1;
+  }
+  while ((entry = readdir(dir)) != NULL) {
+    if (strncmp(entry->d_name, "slab-", 5) == 0) {
+      closedir(dir);
+      die("Slab files present in /scratch0/kvell but no ROOT file: the "
+          "layout predates headers or ROOT was lost; not recoverable\n");
+    }
+  }
+  closedir(dir);
+  return 0;
 }
 
 int create_root_slab() {
@@ -225,6 +432,9 @@ int create_root_slab() {
     return 0;
 
   s = create_slab(NULL, 0, 0, 0, NULL);
+  /* The first slab is the history root until a prune replaces it. */
+  if (slab_root_write(s->seq) != 0)
+    perr("Cannot write the ROOT file");
 
 #if WITH_FILTER
   tnt_subtree_add(s, tnt_subtree_create(), filter_create(200000), 0);
@@ -234,8 +444,7 @@ int create_root_slab() {
   return 1;
 }
 
-static void create_and_add_split_child(uint64_t level, uint64_t key) {
-  struct slab *child = create_slab(NULL, level, key, 0, NULL);
+static void add_split_child(struct slab *child, uint64_t key) {
   void *filter = NULL;
 
 #if WITH_FILTER
@@ -274,28 +483,28 @@ struct slab *close_and_create_slab(struct slab *s) {
   W_LOCK(&s->tree_lock);
   s->key = new_key;
   W_UNLOCK(&s->tree_lock);
-  char path[128], spath[128];
-  int len;
-  sprintf(path, "/proc/self/fd/%d", s->fd);
-  if ((len = readlink(path, spath, sizeof(spath) - 1)) < 0) {
+
+  /*
+   * Durable order: both children exist on disk (headers, no data) before the
+   * parent's header names them and records the pivot -- that write is the
+   * commit -- and only then are the children published to readers and
+   * writers. A crash before the commit leaves two unreachable, empty files
+   * that recovery deletes; a crash after it leaves a valid split.
+   */
+  struct slab *left = create_slab(NULL, new_level, new_key - 1, 0, NULL);
+  struct slab *right = create_slab(NULL, new_level, new_key + 1, 0, NULL);
+
+  slab_maybe_crash(CRASH_SPLIT_BEFORE_COMMIT);
+  if (slab_write_header_raw(s, new_key,
+                            tnt_get_centree_level(s->centree_node), left->seq,
+                            right->seq) != 0) {
     tnt_split_phase_exit();
-    perr("Can't find file\n");
-  }
-  spath[len] = 0;
-  strncpy(path, spath, len);
-  int suffix_len = snprintf(path + len, sizeof(path) - len, "-%lu", s->key);
-  if (suffix_len < 0 || (size_t)suffix_len >= sizeof(path) - (size_t)len) {
-    tnt_split_phase_exit();
-    die("Cannot append pivot to slab %lu filename", s->seq);
-  }
-  if (rename(spath, path) != 0) {
-    tnt_split_phase_exit();
-    perr("Cannot rename slab %lu for pivot %lu", s->seq, new_key);
+    perr("Cannot commit the split of slab %lu", s->seq);
   }
 
-  create_and_add_split_child(new_level, new_key - 1);
+  add_split_child(left, new_key - 1);
   run_split_midpoint_test_hook(s);
-  create_and_add_split_child(new_level, new_key + 1);
+  add_split_child(right, new_key + 1);
   wakeup_subtree_get(s->centree_node);
   tnt_split_phase_exit();
 

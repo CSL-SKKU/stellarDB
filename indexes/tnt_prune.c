@@ -642,6 +642,25 @@ int prune_freeze_and_link(const struct prune_candidate *c,
         leaf_slab->seq, error);
 
   prune_link_history(c, b->node);
+
+  /*
+   * Durable commit. N's header names its history children and carries Q's
+   * pivot; until D's header (or ROOT) names N, N is unreachable on disk and a
+   * crash just leaves a file for recovery to delete. D's header write is the
+   * point after which the three old files are logically gone. Both are single
+   * aligned page writes on O_DIRECT descriptors, like the data pages.
+   */
+  if (slab_write_header(b->slab) != 0)
+    die("Pruning cannot write the header of slab %lu\n", b->slab->seq);
+  slab_maybe_crash(CRASH_PRUNE_AFTER_N_HEADER);
+  if (c->up != NULL) {
+    if (slab_write_header(c->up->value.slab) != 0)
+      die("Pruning cannot commit slab %lu into slab %lu\n", b->slab->seq,
+          c->up->value.slab->seq);
+  } else if (slab_root_write(b->slab->seq) != 0) {
+    die("Pruning cannot make slab %lu the history root\n", b->slab->seq);
+  }
+  slab_maybe_crash(CRASH_PRUNE_AFTER_COMMIT);
   return 0;
 }
 

@@ -29,6 +29,24 @@ typedef void (*slab_split_test_hook_t)(struct slab *parent);
 void slab_set_split_midpoint_test_hook(slab_split_test_hook_t hook);
 
 /*
+ * On-disk header, the last page of every slab file. It carries what recovery
+ * needs and nothing else: the slab's id (its file is named slab-<id>), its
+ * routing key (the pivot for an internal node, the creation key for a leaf),
+ * and the ids of its two history children. lu_parent is not stored -- a node's
+ * parent is whichever node lists it as a child. The rest of the page is
+ * reserved. The history root's id lives in the ROOT file, replaced atomically
+ * by rename.
+ */
+#define SLAB_HEADER_MAGIC 0x3152414c4c455453ULL /* "STELLAR1" */
+struct slab_header {
+  uint64_t magic;
+  uint64_t id;
+  uint64_t key;
+  uint64_t level;       /* advisory */
+  uint64_t lu_child[2]; /* 0 = none */
+};
+
+/*
  * Slab descriptor lifetime follows its center-tree node: once published, the
  * descriptor's address remains valid for the database process lifetime.
  * Individual resources may be closed during shutdown/maintenance, but the
@@ -164,9 +182,43 @@ void slab_release_if_idle(struct slab *s);
 
 uint64_t slab_create_sequence(void);
 
-/* A fresh slab file, or (rebuild != 0) a descriptor over an existing one. */
+/*
+ * A fresh slab file (header written, id assigned), or (rebuild != 0) a
+ * descriptor over an existing one -- then the caller sets seq from the header
+ * and no id is consumed.
+ */
 struct slab *create_slab(struct slab_context *ctx, uint64_t level, uint64_t key,
                          int rebuild, char *name);
+
+/* Bytes of the file that hold slots; the header page sits after them. */
+static inline size_t slab_data_size(const struct slab *s) {
+  return s->size_on_disk - PAGE_SIZE;
+}
+
+/*
+ * Write the header from the slab's in-memory state (its node's pivot, level and
+ * history children). One aligned page write: the durable commit of a split
+ * (parent names its children) or of a prune (D names N). Returns 0 or -errno.
+ */
+int slab_write_header(struct slab *s);
+/* Same, from explicit values; used before the slab has a center-tree node. */
+int slab_write_header_raw(struct slab *s, uint64_t key, uint64_t level,
+                          uint64_t left_id, uint64_t right_id);
+int slab_read_header(int fd, size_t size_on_disk, struct slab_header *out);
+/* ROOT file: the history root's id. write = temp + rename. */
+int slab_root_write(uint64_t id);
+int slab_root_read(uint64_t *id);
+void slab_set_create_sequence(uint64_t next);
+
+/* Test-only: _exit() at a chosen point of a split or a prune. */
+enum slab_crash_point {
+  CRASH_NONE = 0,
+  CRASH_SPLIT_BEFORE_COMMIT,  /* children created, parent header not written */
+  CRASH_PRUNE_AFTER_N_HEADER, /* N complete and named, D not yet updated */
+  CRASH_PRUNE_AFTER_COMMIT,   /* D (or ROOT) names N, old files still there */
+};
+void slab_set_crash_point(enum slab_crash_point point);
+void slab_maybe_crash(enum slab_crash_point point);
 
 struct slab *resize_slab(struct slab *s);
 
@@ -181,6 +233,12 @@ void remove_and_add_item_async(struct slab_callback *callback);
 off_t item_page_num(struct slab *s, size_t idx);
 void mark_page_hot(struct slab *s, size_t page_idx);
 
+/*
+ * Recovery: read every slab header, rebuild both trees, delete the files that
+ * are not reachable from ROOT. Returns the number of live slabs, exposed
+ * through slab_recovered() for the per-slab index scans.
+ */
 int rebuild_slabs(int filenum, struct dirent **file_list);
+size_t slab_recovered(struct slab ***out);
 int create_root_slab(void);
 #endif

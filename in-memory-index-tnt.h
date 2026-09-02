@@ -23,6 +23,18 @@ int subtree_worker_delete(subtree_t *tree, void *item);
 void centree_init(void);
 /* The one center tree. NULL before centree_init(). */
 centree tnt_centree(void);
+
+/*
+ * Recovery: given every slab found on disk with its header, build the history
+ * tree from the headers' children, derive lu_parent, and build the routing
+ * tree over the history in-order sequence. reachable[i] is set for slabs that
+ * belong to the tree rooted at root_id; the others are garbage for the caller
+ * to delete. Returns the number of reachable slabs, or dies on a corrupt
+ * graph (dangling child, two parents, non-alternating in-order).
+ */
+struct slab_header;
+size_t tnt_recover_tree(struct slab **slabs, const struct slab_header *hdrs,
+                        size_t n, uint64_t root_id, unsigned char *reachable);
 /* Publication lock; see the comment on the definition. */
 void tnt_root_wlock(void);
 void tnt_root_wunlock(void);

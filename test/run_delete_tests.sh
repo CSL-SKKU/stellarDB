@@ -71,31 +71,15 @@ for _ in $(seq "$rounds"); do
   export DBDIR
   sandboxed ./test/test_delete_e2e populate 5000 >/dev/null 2>&1
   sandboxed ./test/test_delete_e2e verify   5000 >/dev/null 2>&1 || bad=$((bad+1))
-  dup=$(for f in $(ls "$DBDIR"); do
-          echo "$f" | awk -F- '{if (NF==5) print $5; else print $4}'
-        done | sort | uniq -d | tr '\n' ' ')
-  [ -n "$dup" ] && echo "    duplicate slab keys on disk: $dup"
   rm -rf "$DBDIR"; unset DBDIR
 done
 echo "  INFO  recovery after a delete workload: $bad / $rounds runs failed"
-echo "        (intermittent -- ~15% of runs; raise RECOVERY_ROUNDS to see it)"
+echo "        (used to be intermittent, ~15%, when recovery resolved files by"
+echo "         routing key; pivots now live in the slab header)"
 
-# A pivot of 0 / UINT64_MAX-1 / UINT64_MAX can only come from a split that read
-# an unpublished key range (min still (uint64_t)-1, max still 0). Count the
-# slab files whose name records such a pivot.
-extreme_pivots() { ls "$1" | grep -cE -- "-(0|1844674407370955161[45])\$"; }
-
-for mode in upsertburst populate insert; do
-  bad=0
-  for _ in $(seq "$rounds"); do
-    DBDIR=$(mktemp -d /tmp/stellar-delete-XXXXXX)
-    export DBDIR
-    sandboxed ./test/test_delete_e2e "$mode" 5000 >/dev/null 2>&1
-    [ "$(extreme_pivots "$DBDIR")" != 0 ] && bad=$((bad+1))
-    rm -rf "$DBDIR"; unset DBDIR
-  done
-  echo "  INFO  $mode: $bad / $rounds runs split on an unpublished key range"
-done
+# Splits on an unpublished key range (pivot 0 / UINT64_MAX-1 / UINT64_MAX) used
+# to be visible in the file names. Pivots are in the header page now, so that
+# survey moved to test_delete_e2e's own "slab survey" output.
 
 bad=0
 for _ in $(seq "$rounds"); do
@@ -109,30 +93,28 @@ echo "  INFO  recovery after an insert-only workload: $bad / $rounds runs failed
 echo "        (also intermittent -- ADD-only bursts degenerate too, just less"
 echo "         often, so this is a weaker control than a clean one)"
 
-# Characterization of the recovery aliasing crash. A degenerate split can give
-# several slabs the same routing key; recovery used to resolve file -> slab by
-# key, so several rebuild threads rebuilt one slab's B-tree at once. Inject the
-# duplicate directly instead of waiting for the ~15% natural case, and place the
-# copies at consecutive seqs so different threads claim them in the same
-# instant. Duplicate routing keys legitimately confuse reads; what this measures
-# is that they also corrupt memory, which they must not.
+# Recovery used to resolve file -> slab by routing key and could alias several
+# files onto one slab (a memory-corruption crash). Files are now matched by the
+# id in their header, so a byte copy of a slab under another name is a
+# duplicate id: recovery must drop it and neither crash nor lose data.
 DBDIR=$(mktemp -d /tmp/stellar-delete-XXXXXX)
 export DBDIR
 sandboxed ./test/test_delete_e2e populate 5000 >/dev/null 2>&1
-victim=$(ls "$DBDIR" | head -1)
-key=$(echo "$victim" | awk -F- '{if (NF==5) print $5; else print $4}')
-last=$(ls "$DBDIR" | sed -E 's/^slab-([0-9]+)-.*/\1/' | sort -n | tail -1)
+victim=$(ls "$DBDIR" | grep '^slab-' | head -1)
+last=$(ls "$DBDIR" | sed -nE 's/^slab-([0-9]+)$/\1/p' | sort -n | tail -1)
 for n in $((last+1)) $((last+2)) $((last+3)) $((last+4)); do
-  cp "$DBDIR/$victim" "$DBDIR/slab-$n-6-$key"
+  cp "$DBDIR/$victim" "$DBDIR/slab-$n"
 done
-echo "  INFO  injected 4 extra slabs sharing routing key $key"
-crashes=0
+echo "  INFO  injected 4 byte copies of $victim under new names"
+crashes=0; wrong=0
 for _ in $(seq 6); do
   sandboxed ./test/test_delete_e2e verify 5000 >/dev/null 2>&1
-  [ "$?" -ge 128 ] && crashes=$((crashes+1))
+  rc=$?
+  [ "$rc" -ge 128 ] && crashes=$((crashes+1))
+  [ "$rc" -ne 0 ] && [ "$rc" -lt 128 ] && wrong=$((wrong+1))
 done
 rm -rf "$DBDIR"; unset DBDIR
-echo "  INFO  recovery crashed $crashes / 6 times on duplicate routing keys"
+report "recovery drops duplicate-id copies ($crashes crashes, $wrong wrong)" $((crashes+wrong))
 echo "        (expected to crash: recovery resolves file -> slab by routing key,"
 echo "         and routing keys are not unique)"
 

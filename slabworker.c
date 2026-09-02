@@ -733,7 +733,7 @@ void rebuild_index(struct slab *s, uint64_t key, char *buf) {
 
   while (1) {
     end = start + GRANULARITY_REBUILD;
-    if (end > s->size_on_disk) end = s->size_on_disk;
+    if (end > slab_data_size(s)) end = slab_data_size(s); /* not the header */
     if (((end - start) % PAGE_SIZE) != 0) end = end - (end % PAGE_SIZE);
     if (((end - start) % PAGE_SIZE) != 0)
       die("File size is wrong (%%PAGE_SIZE!=0)\n");
@@ -776,7 +776,7 @@ int compare_uint64(const void *a, const void *b) {
 void invalid_indexes(struct slab **sa, int snum, uint64_t *keys) {
   struct slab *s;
   int nks, nkeys;
-  tree_entry_t *e;
+  centree_node p;
   uint64_t *ks = malloc((cfg.max_file_size/cfg.kv_size) * sizeof(uint64_t));
   char *item = create_unique_item(cfg.kv_size, 0);
   struct item_metadata *meta = (struct item_metadata *)item;
@@ -789,8 +789,12 @@ void invalid_indexes(struct slab **sa, int snum, uint64_t *keys) {
     // just put all keys of it in keys variable unconditionally.
     nkeys = subtree_forall_keys(s->subtree, get_all_keys, keys);
     
-    e = tnt_parent_subtree_get(s->centree_node);
-    s = e ? e->slab : NULL;
+    /*
+     * History, not routing: after recovery the routing tree is rebuilt
+     * balanced and no longer mirrors the history chain.
+     */
+    p = centree_lu_parent((centree_node)s->centree_node);
+    s = p ? p->value.slab : NULL;
 
     while (s != NULL) {
 
@@ -825,8 +829,8 @@ void invalid_indexes(struct slab **sa, int snum, uint64_t *keys) {
 
     next:
       // Move to parent
-      e = tnt_parent_subtree_get(s->centree_node);
-      s = e ? e->slab : NULL;
+      p = centree_lu_parent((centree_node)s->centree_node);
+      s = p ? p->value.slab : NULL;
     }
   }
   free(item);
@@ -839,6 +843,10 @@ static struct slab **leaf_slab_list;
 static int leaf_slab_totals = 0;
 static int rebuild_totals = 0;
 static int rebuild_ready = 0;
+static struct slab **live_slabs;
+static size_t nb_live_slabs, next_live_slab;
+
+struct slab *close_and_create_slab(struct slab *s);
 
 static int numeric_sort(const struct dirent **a, const struct dirent **b) {
     int num_a = 0, num_b = 0;
@@ -861,13 +869,15 @@ static void *worker_rebuild_init(void *pdata) {
     if ((dir = opendir(path)) != NULL) {
       // Sort the entries by name
       rebuild_totals = scandir(path, &rebuild_list, NULL, numeric_sort);
-      leaf_slab_list = malloc(rebuild_totals * sizeof(struct slab*));
       if (rebuild_totals < 0) {
         perror("scandir");
       } else {
-        // make central tree
+        // both trees from the headers; unreachable files are deleted here
         rebuild_slabs(rebuild_totals, rebuild_list);
       }
+      nb_live_slabs = slab_recovered(&live_slabs);
+      next_live_slab = 0;
+      leaf_slab_list = malloc((nb_live_slabs + 1) * sizeof(struct slab*));
     } else {
       perror("Could not open directory");
     }
@@ -881,45 +891,20 @@ static void *worker_rebuild_init(void *pdata) {
 
   cached_data = aligned_alloc(PAGE_SIZE, GRANULARITY_REBUILD);
 
-  last_insert = 0;
   while (1) {
-    char *filename = NULL;
-    int keynum;
-    uint64_t level, key, old_key, seq;
-    tree_entry_t *e;
-    struct slab *s;
+    struct slab *s = NULL;
+
+    // Each pthread takes the next live slab.
     W_LOCK(&rebuild_lock);
-    // Each pthread selects one subtree to work on.
-    for (int i = last_insert; i < rebuild_totals; i++) {
-      if (rebuild_list[i] != NULL) {
-        filename = rebuild_list[i]->d_name;
-        keynum = sscanf(filename, "slab-%lu-%lu-%lu-%lu", &seq, &level, &key, &old_key);
-        if (keynum == 4)
-          key = old_key;
-        free(rebuild_list[i]);
-        rebuild_list[i] = NULL;
-        last_insert = i;
-        break;
-      }
-    }
+    if (next_live_slab < nb_live_slabs)
+      s = live_slabs[next_live_slab++];
     W_UNLOCK(&rebuild_lock);
-
-    if (filename == NULL) {
+    if (s == NULL)
       break;
-    }
 
-    // Get the slab from centree.
-    e = tnt_tree_lookup((void*)key);
-    if (!e)
-      perr("REBUILD: No matched file with the key\n");
-    s = e->slab;
-
-    // Fill the B+-Tree of the subtree.
-    rebuild_index(s, key, cached_data);
-
-    if (keynum == 3) {
-      s->key = (s->min + s->max) / 2;
-    }
+    // Fill the B+-Tree of the subtree. Internal slabs were marked full when
+    // the trees were built, whatever their slot count says.
+    rebuild_index(s, s->key, cached_data);
 
     if (atomic_load_explicit(&s->full, memory_order_acquire) == 0) {
       W_LOCK(&rebuild_lock);
@@ -969,7 +954,26 @@ static void *worker_rebuild_init(void *pdata) {
   }
 
   if (ctx->worker_id == 0) {
+    /*
+     * A leaf that is physically full but has no children was cut off between
+     * taking its final slot and committing its split (children are created
+     * before the parent's header names them). Writers to its range would wait
+     * forever, so give it its children now.
+     */
+    for (size_t i = 0; i < nb_live_slabs; i++) {
+      struct slab *s = live_slabs[i];
+      centree_node node = (centree_node)s->centree_node;
+
+      if (atomic_load_explicit(&s->full, memory_order_acquire) &&
+          atomic_load_explicit(&node->child_flag, memory_order_acquire) == 0) {
+        fprintf(stderr, "Recovery: slab %lu is a full leaf, splitting it\n",
+                s->seq);
+        close_and_create_slab(s);
+      }
+    }
     free(leaf_slab_list);
+    for (int i = 0; i < rebuild_totals; i++)
+      free(rebuild_list[i]);
     free(rebuild_list);
   }
 

@@ -175,7 +175,7 @@ static void case_ondisk(uint64_t n) {
     if (!e) break;
     struct slab *s = e->slab;
     nb_slabs++;
-    ssize_t r = pread(s->fd, buf, s->size_on_disk, 0);
+    ssize_t r = pread(s->fd, buf, slab_data_size(s), 0); /* slots only */
     if (r <= 0) continue;
     size_t items_per_page = PAGE_SIZE / s->item_size;
     for (size_t p = 0; p * PAGE_SIZE < (size_t)r; p++) {
@@ -328,7 +328,7 @@ static void case_inplace(uint64_t n) {
     if (!e) break;
     struct slab *s = e->slab;
     slabs++;
-    ssize_t r = pread(s->fd, buf, s->size_on_disk, 0);
+    ssize_t r = pread(s->fd, buf, slab_data_size(s), 0); /* slots only */
     if (r <= 0) continue;
     size_t ipp = PAGE_SIZE / s->item_size;
     for (size_t p = 0; p * PAGE_SIZE < (size_t)r; p++)

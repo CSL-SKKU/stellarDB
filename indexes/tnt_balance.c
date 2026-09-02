@@ -359,6 +359,68 @@ void centree_balance_abort(struct centree_balance_plan *plan) {
   free_plan(plan);
 }
 
+static int build_unpublished(centree_node *nodes, size_t l, size_t r,
+                             centree_node parent, uint64_t level,
+                             uint64_t *depth, centree_node *out) {
+  size_t count = r - l;
+  size_t best_k = SIZE_MAX, best_diff = SIZE_MAX;
+  centree_node root, left, right;
+  int error;
+
+  if (count == 0 || count % 2 == 0)
+    return EINVAL;
+  if (level > *depth)
+    *depth = level;
+  if (count == 1) {
+    centree_node_init_links(nodes[l], NULL, NULL, parent);
+    atomic_store_explicit(&nodes[l]->value.level, level, memory_order_release);
+    *out = nodes[l];
+    return 0;
+  }
+  /* Same pivot choice as build_tree_from_array: the most balanced odd split. */
+  for (size_t k = l + 1; k < r - 1; k += 2) {
+    size_t ls = k - l, rs = r - k - 1;
+    size_t diff = ls > rs ? ls - rs : rs - ls;
+
+    if (diff < best_diff) {
+      best_diff = diff;
+      best_k = k;
+    }
+  }
+  if (best_k == SIZE_MAX)
+    return EINVAL;
+  root = nodes[best_k];
+  error = build_unpublished(nodes, l, best_k, root, level + 1, depth, &left);
+  if (error)
+    return error;
+  error = build_unpublished(nodes, best_k + 1, r, root, level + 1, depth,
+                            &right);
+  if (error)
+    return error;
+  centree_node_init_links(root, left, right, parent);
+  atomic_store_explicit(&root->value.level, level, memory_order_release);
+  *out = root;
+  return 0;
+}
+
+int centree_build_from_inorder(centree tree, centree_node *nodes, size_t n) {
+  centree_node root = NULL;
+  uint64_t depth = 0;
+  int error;
+
+  if (tree == NULL || nodes == NULL || n == 0 || n % 2 == 0)
+    return EINVAL;
+  if (centree_current_root(tree) != NULL)
+    return EBUSY;
+  error = build_unpublished(nodes, 0, n, NULL, 1, &depth, &root);
+  if (error)
+    return error;
+  rcu_ptr_init(&tree->root, root);
+  atomic_store_explicit(&tree->depth, depth, memory_order_release);
+  atomic_store_explicit(&tree->node_count, n, memory_order_release);
+  return centree_validate_locked(tree) ? 0 : EFAULT;
+}
+
 int centree_balance(centree tree) {
   struct centree_balance_plan *plan;
   int error = centree_balance_prepare(tree, &plan);

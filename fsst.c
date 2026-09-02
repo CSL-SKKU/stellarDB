@@ -28,7 +28,8 @@ static void *fsst_worker(void *pdata) {
 
       if (!s) goto fsst_sleep;
 
-      size_t num_words = (((s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE) + 63) / 64;
+      /* Slot pages only: the file's last page is the header. */
+      size_t num_words = ((slab_data_size(s) / PAGE_SIZE) + 63) / 64;
       struct slab_callback *cb;
       centree_node node = (centree_node)s->centree_node;
 
@@ -47,7 +48,7 @@ static void *fsst_worker(void *pdata) {
       R_UNLOCK(&s->tree_lock);
 
       printf("GC: %lu\n", s->seq);
-      size_t nread = pread(s->fd, gc_buf, s->size_on_disk, 0);
+      size_t nread = pread(s->fd, gc_buf, slab_data_size(s), 0);
       if (nread < 0) perror("pread GC");
 
       for (size_t w = 0; w < num_words; w++) {
