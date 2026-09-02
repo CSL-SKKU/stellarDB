@@ -1,8 +1,9 @@
 # Pruning — notes accumulated per step
 
-`PRUNING_PLAN.md` asks each step to update `AGENTS.md`. `AGENTS.md` lives outside this
-worktree and is shared with the other implementation, so the doc deltas land here instead;
-merge them into `AGENTS.md` when a version is picked.
+`PRUNING_PLAN.md` asks each step to update `AGENTS.md`. The deltas were collected here step by
+step and have since been merged into `AGENTS.md` (locking model, pruning implementation, recovery
+implementation and defects, and a consolidated "Known bugs" list). This file remains the
+step-by-step log, including every anomaly met on the way and how it was isolated.
 
 ## Step 0 — locking model / center-tree fields
 
