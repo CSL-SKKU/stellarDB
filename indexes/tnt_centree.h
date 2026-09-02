@@ -130,6 +130,54 @@ static inline centree_node centree_current_parent(centree tree,
   return (centree_node)rcu_current_ptr(&tree->topology_rcu, &node->parent);
 }
 
+/*
+ * Routing pointers in the generation the single topology writer is building.
+ * Reads see that writer's own uncommitted changes, which is what lets a
+ * multi-pointer restructure be staged consistently.
+ */
+static inline centree_node centree_writer_left(struct rcu_writer *writer,
+                                               centree_node node) {
+  return (centree_node)rcu_writer_ptr(writer, &node->left);
+}
+
+static inline centree_node centree_writer_right(struct rcu_writer *writer,
+                                                centree_node node) {
+  return (centree_node)rcu_writer_ptr(writer, &node->right);
+}
+
+static inline centree_node centree_writer_parent(struct rcu_writer *writer,
+                                                 centree_node node) {
+  return (centree_node)rcu_writer_ptr(writer, &node->parent);
+}
+
+static inline void centree_writer_set_left(struct rcu_writer *writer,
+                                           centree_node node,
+                                           centree_node value) {
+  rcu_writer_set_ptr(writer, &node->left, value);
+}
+
+static inline void centree_writer_set_right(struct rcu_writer *writer,
+                                            centree_node node,
+                                            centree_node value) {
+  rcu_writer_set_ptr(writer, &node->right, value);
+}
+
+static inline void centree_writer_set_parent(struct rcu_writer *writer,
+                                             centree_node node,
+                                             centree_node value) {
+  rcu_writer_set_ptr(writer, &node->parent, value);
+}
+
+static inline centree_node centree_writer_root(struct rcu_writer *writer,
+                                               centree tree) {
+  return (centree_node)rcu_writer_ptr(writer, &tree->root);
+}
+
+static inline void centree_writer_set_root(struct rcu_writer *writer,
+                                           centree tree, centree_node value) {
+  rcu_writer_set_ptr(writer, &tree->root, value);
+}
+
 /* Construction only: the node must not be reachable from a published root. */
 static inline void centree_node_init_links(centree_node node,
                                            centree_node left,

@@ -301,6 +301,7 @@ int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
   /* Unused slots stay zeroed, which is what item_is_empty() reads. */
   memset(out->buffer, 0, pages * PAGE_SIZE);
 
+  out->pivot_from = pivot_from;
   value.key = pivot;
   value.seq = out->slab->seq;
   value.slab = out->slab;
@@ -607,4 +608,104 @@ int prune_freeze_and_link(const struct prune_candidate *c,
 
   prune_link_history(c, b->node);
   return 0;
+}
+
+/* ===================================================================== *
+ * The routing splice
+ *
+ * P (the leaf's routing parent) and the leaf leave the tree together: P is
+ * replaced by its other child S. Then N takes Q's place, with Q's children
+ * and Q's pivot, so it routes exactly as Q did.
+ *
+ * The pivot that disappears is P's, so the leaf's key interval is absorbed by
+ * its in-order neighbour: by the rightmost leaf under N's left subtree if P
+ * was the triple's first node, by the leftmost leaf under its right subtree
+ * if P was the last. Either way that leaf's lu_parent chain runs through N,
+ * which now holds the leaf's entries -- which is why the history link has to
+ * be installed first (I-2).
+ *
+ * Everything here is bounded pointer work: ten rcu_writer_set_ptr() calls at
+ * most, no scans, and no lock held while entering the writer (I-11, I-12).
+ * The triple's own routing pointers are left alone: old-generation readers
+ * may still be walking them, and finish_deferred() waits for them.
+ * ===================================================================== */
+
+void prune_splice_routing(const struct prune_candidate *c,
+                          struct prune_build *b) {
+  centree tree = tnt_centree();
+  centree_node n = b->node;
+  centree_node p, q, s, g, ql, qr, gq;
+  struct rcu_writer writer;
+
+  writer = rcu_writer_in(&tree->topology_rcu);
+
+  /*
+   * Re-reading P here is an assertion, not a decision: it was fixed before
+   * the freeze. Concurrent splits cannot move it (a split only adds children
+   * under a leaf, and the frozen leaf can no longer split) and rebalancing is
+   * excluded. If it moved anyway, N is already in the history chain and the
+   * leaf is frozen, so there is nothing safe to roll back to.
+   */
+  p = centree_writer_parent(&writer, c->leaf);
+  q = (p == c->inner) ? c->outer : c->inner;
+  if ((p != c->inner && p != c->outer) || q != b->pivot_from ||
+      centree_pivot_load(n) != centree_pivot_load(q)) {
+    rcu_writer_abort(&tree->topology_rcu, &writer);
+    die("Pruning: the routing shape changed under the maintenance lock\n");
+  }
+
+  s = centree_writer_left(&writer, p) == c->leaf
+          ? centree_writer_right(&writer, p)
+          : centree_writer_left(&writer, p);
+  g = centree_writer_parent(&writer, p);
+  /* Q is a routing ancestor of P, so P is never the root. */
+  if (s == NULL || g == NULL) {
+    rcu_writer_abort(&tree->topology_rcu, &writer);
+    die("Pruning: the leaf's routing parent has no sibling or no parent\n");
+  }
+
+  /* P and the leaf out, S up into P's place. */
+  if (centree_writer_left(&writer, g) == p)
+    centree_writer_set_left(&writer, g, s);
+  else
+    centree_writer_set_right(&writer, g, s);
+  centree_writer_set_parent(&writer, s, g);
+
+  /*
+   * Q's children are read *after* that, so if G == Q this picks up S. The
+   * parent stores below then override S->parent = G, which is correct: S ends
+   * up under N.
+   */
+  ql = centree_writer_left(&writer, q);
+  qr = centree_writer_right(&writer, q);
+  gq = centree_writer_parent(&writer, q);
+  centree_writer_set_left(&writer, n, ql);
+  centree_writer_set_right(&writer, n, qr);
+  centree_writer_set_parent(&writer, n, gq);
+  centree_writer_set_parent(&writer, ql, n);
+  centree_writer_set_parent(&writer, qr, n);
+  if (gq == NULL)
+    centree_writer_set_root(&writer, tree, n);
+  else if (centree_writer_left(&writer, gq) == q)
+    centree_writer_set_left(&writer, gq, n);
+  else
+    centree_writer_set_right(&writer, gq, n);
+
+  /* Three nodes out, one in. depth and level stay advisory and go stale. */
+  centree_node_count_sub(tree, 2);
+
+  tnt_root_wlock();
+  rcu_writer_publish_deferred(&tree->topology_rcu, &writer, NULL, NULL);
+  tnt_root_wunlock();
+  rcu_writer_finish_deferred(&tree->topology_rcu, &writer);
+
+  /*
+   * Retire only now (I-3): a reader or writer that restarts because of these
+   * flags has to find the new topology, not the old one.
+   */
+  atomic_store_explicit(&c->leaf->removed, 1, memory_order_seq_cst);
+  atomic_store_explicit(&c->inner->removed, 1, memory_order_seq_cst);
+  atomic_store_explicit(&c->outer->removed, 1, memory_order_seq_cst);
+  /* Sets child_flag and wakes: the parked writers restart (step 3). */
+  wakeup_subtree_get(c->leaf);
 }

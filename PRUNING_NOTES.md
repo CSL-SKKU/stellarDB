@@ -229,3 +229,43 @@ still in the routing tree. So:
   re-reading them after: every one unchanged.
 - Writers whose key routes to the frozen leaf are parked until the splice. That is the accepted
   latency hiccup, and it is why `check_prune_link()` has to be the last thing the test does.
+
+## Step 7 — the routing splice
+
+- `prune_splice_routing()` takes the RCU writer with no lock held, stages ten pointer writes at
+  most, publishes under `centree_root_lock` (write) and only then retires the triple and wakes the
+  writers parked on the frozen leaf (I-3, I-11, I-12).
+- P and the leaf leave together: P is replaced by its other child S. Then N takes Q's children,
+  parent and pivot, so it routes exactly as Q did. **Q's children are read after the first
+  splice**, which is what makes `G == Q` work -- the slot that held P then holds S, and the
+  following `parent` stores override `S->parent = G` so S ends up under N.
+- The pivot that disappears is P's, so the leaf's key interval is absorbed by its in-order
+  neighbour, whose `lu_parent` chain runs through N. That is why the history link has to be
+  installed first (I-2).
+- Re-reading P inside the writer is an assertion, not a decision. Concurrent splits cannot move it
+  (they only add children under a leaf, and the frozen leaf cannot split); rebalancing is excluded
+  by `maintenance_lock`. If it moved anyway, `rcu_writer_abort()` + `die()`: N is already in the
+  history chain and the leaf is frozen, so there is no partial rollback.
+- The triple's own routing pointers are left untouched, and `finish_deferred()` waits for the
+  old-generation readers before mirroring, so nobody is walking them when the retired slots are
+  updated.
+- `node_count -= 2`. `depth` and `value.level` stay advisory and go stale; the rebalancer
+  recomputes them.
+
+### What the test covers
+
+`test/prune_links.c` runs one prune in two halves, with a writer parked on the frozen leaf in
+between, and checks: the parked writer completes only after the splice, the triple is retired,
+`centree_validate_locked()` passes, `node_count` drops by exactly 2, and the new in-order sequence
+is the old one with the triple replaced by N in its place. Then a sweep prunes until nothing is
+prunable (77 -> 51 nodes over ~10 prunes), 18000 keys are rewritten into the pruned tree and read
+back, and a stress phase runs 4 readers + 2 writers against an exact model while the pruner and
+the rebalancer work: ~525k reads and ~78k writes, 6 prunes, 8 rebalances, zero disagreements.
+All read snapshots (30000 keys) are identical across every stage.
+
+### One anomaly, and it was the test
+
+The stress phase first reported ~28 of 530k reads disagreeing. Every one was key 10000 reading
+`0xbeef`: `check_blocked_writer()` resurrects the key it uses, and 10000 is in the deleted tenth,
+so the model was wrong, not the DB. Reproduced identically with pruning *and* rebalancing disabled,
+which is what identified it. Fixed by having that check use a key the later write phase rewrites.

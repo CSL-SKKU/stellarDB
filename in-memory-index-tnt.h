@@ -23,6 +23,9 @@ int subtree_worker_delete(subtree_t *tree, void *item);
 void centree_init(void);
 /* The one center tree. NULL before centree_init(). */
 centree tnt_centree(void);
+/* Publication lock; see the comment on the definition. */
+void tnt_root_wlock(void);
+void tnt_root_wunlock(void);
 /*
  * Mutual exclusion between the maintenance operations that restructure the
  * center tree (rebalancing, and pruning once it lands). tnt_rebalancing()
@@ -153,6 +156,7 @@ struct prune_build {
   size_t count;       /* slots filled so far */
   size_t dirty_lo;    /* pages staged but not written yet, [lo, hi) */
   size_t dirty_hi;
+  centree_node pivot_from; /* Q: the routing position N will take */
 };
 
 /*
@@ -187,6 +191,17 @@ void prune_build_discard(struct prune_build *b);
  * splice has published, so that P and Q cannot be rewired underneath.
  */
 int prune_freeze_and_link(const struct prune_candidate *c,
+                          struct prune_build *b);
+
+/*
+ * Put N in Q's routing position, drop P and the leaf out of the tree, publish,
+ * then retire the triple and wake the writers parked on the frozen leaf.
+ * Must follow a successful prune_freeze_and_link() under the same
+ * tnt_maintenance_lock() hold. It does not fail: a routing shape that
+ * contradicts what was recorded means an invariant is broken, and there is no
+ * safe rollback once N is in the history chain.
+ */
+void prune_splice_routing(const struct prune_candidate *c,
                           struct prune_build *b);
 
 background_queue *bgq_get(enum fsst_mode m);

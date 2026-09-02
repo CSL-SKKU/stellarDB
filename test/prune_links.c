@@ -809,12 +809,21 @@ static void verify_reads(const char *when) {
 
 /* ------------------------------------- freeze, hot copy, history link */
 
+static uint64_t leaf_keys[8192];
+static size_t nb_leaf_keys;
+
+static void leaf_key_cb(uint64_t key, uint32_t slot, void *data) {
+  (void)data;
+  if (slot & (1u << 31)) return;
+  if (nb_leaf_keys < 8192) leaf_keys[nb_leaf_keys++] = key;
+}
+
 /*
- * Runs one real prune up to the history link and stops there -- the routing
- * splice is the next step. In this state the two trees deliberately disagree:
- * N is in the history chain, while the triple is still in the routing tree, so
- * validate() must not run after this. Reads must be unaffected either way,
- * because N holds every valid entry of the three and nothing is retired yet.
+ * One real prune, stopped in the middle so the intermediate state can be
+ * inspected. After the history link the two trees deliberately disagree (N is
+ * in the history chain, the triple is still in the routing tree) and a writer
+ * whose key routes to the frozen leaf is parked. The splice publishes N,
+ * retires the triple and releases that writer.
  */
 static void check_prune_link(void) {
   size_t cap = tnt_get_node_count() + 8;
@@ -843,14 +852,43 @@ static void check_prune_link(void) {
     return;
   }
 
+  /*
+   * A live key that routes to the leaf. It gets rewritten with its own value,
+   * so the read snapshot stays valid across the prune.
+   */
+  nb_leaf_keys = 0;
+  subtree_forall_entries(best.leaf->value.slab->subtree, leaf_key_cb, NULL);
+  uint64_t blocked_key = 0, blocked_value = 0;
+
+  for (size_t i = 0; i < nb_leaf_keys && !blocked_key; i++) {
+    read_back_quiet(leaf_keys[i]);
+    if (rb_found) {
+      blocked_key = leaf_keys[i];
+      blocked_value = rb_value;
+    }
+  }
+  check(blocked_key != 0, "no readable key routes to the leaf");
+  check(!blocked_key || leaf_for_key(blocked_key) == best.leaf,
+        "key %lu does not route to the leaf", blocked_key);
+
+  /* The in-order sequence the splice has to produce. */
+  size_t cap2 = tnt_get_node_count() + 8;
+  centree_node *before = calloc(cap2, sizeof(*before));
+  centree_node *want = calloc(cap2, sizeof(*want));
+  centree_node *after = calloc(cap2, sizeof(*after));
+  size_t nb_before = 0, nb_want = 0, nb_after = 0;
+
+  collect_routing(routing_root(), before, cap2, &nb_before);
   snapshot_reads(nb_keys + nb_keys / 2);
 
-  /* The real caller holds this until the routing splice has published. */
+  /* Held across both halves, as the real caller must. */
   tnt_maintenance_lock();
   error = prune_freeze_and_link(&best, &build);
-  tnt_maintenance_unlock();
   check(error == 0, "prune_freeze_and_link failed with %d", error);
-  if (error) return;
+  if (error) {
+    tnt_maintenance_unlock();
+    return;
+  }
 
   /* The three history rewires, and nothing else. */
   check(centree_lu_parent(build.node) == best.up, "N->lu_parent is wrong");
@@ -881,7 +919,252 @@ static void check_prune_link(void) {
          build.slab->seq, build.count, best.cold_bound);
 
   verify_reads("reads across the history link");
-  /* N is live in the history chain now: the build must not be discarded. */
+
+  /* A writer whose key routes to the frozen leaf must park, not spin. */
+  struct req blocked = {0};
+
+  blocked.item = make_item(blocked_key, blocked_value);
+  blocked.cb.cb = write_done;
+  blocked.cb.item = (char *)blocked.item;
+  blocked.cb.fsst_idx = -1;
+  atomic_store(&blocked.done, 0);
+  kv_upsert_async(&blocked.cb);
+  usleep(100000);
+  check(!atomic_load(&blocked.done), "a writer got into the frozen leaf (key %lu)",
+        blocked_key);
+
+  prune_splice_routing(&best, &build);
+  tnt_maintenance_unlock();
+
+  for (int i = 0; i < 5000 && !atomic_load(&blocked.done); i++) usleep(1000);
+  check(atomic_load(&blocked.done),
+        "the parked writer never completed after the splice");
+  free(blocked.item);
+
+  check(atomic_load(&best.leaf->removed) && atomic_load(&best.inner->removed) &&
+            atomic_load(&best.outer->removed),
+        "the triple was not retired");
+  check(centree_validate_locked(tnt_centree()),
+        "the routing tree does not validate after the splice");
+  check(tnt_get_node_count() == nb_before - 2, "node_count is %lu, expected %zu",
+        tnt_get_node_count(), nb_before - 2);
+
+  /* The old sequence, with the triple replaced by N in its place. */
+  for (size_t i = 0; i < nb_before; i++) {
+    if (before[i] == best.leaf || before[i] == best.inner ||
+        before[i] == best.outer) {
+      if (nb_want == 0 || want[nb_want - 1] != build.node)
+        want[nb_want++] = build.node;
+      continue;
+    }
+    want[nb_want++] = before[i];
+  }
+  collect_routing(routing_root(), after, cap2, &nb_after);
+  check(nb_after == nb_want, "in-order has %zu nodes, expected %zu", nb_after,
+        nb_want);
+  if (nb_after == nb_want)
+    for (size_t i = 0; i < nb_after; i++)
+      check(after[i] == want[i], "in-order position %zu changed", i);
+
+  validate("after one prune");
+  verify_reads("reads across the splice");
+  printf("  %-34s slab %lu took over from %lu/%lu/%lu\n", "routing splice",
+         build.slab->seq, best.inner->value.slab->seq,
+         best.leaf->value.slab->seq, best.outer->value.slab->seq);
+  free(before);
+  free(want);
+  free(after);
+  /* N is live now: the build must not be discarded. */
+}
+
+/* Prune until nothing is prunable any more. */
+static void check_prune_all(void) {
+  size_t done = 0;
+
+  for (;;) {
+    struct prune_candidate c;
+    struct prune_build b;
+    int error;
+
+    if (!prune_scan_for_candidate(&c)) break;
+    tnt_maintenance_lock();
+    error = prune_freeze_and_link(&c, &b);
+    if (!error) prune_splice_routing(&c, &b);
+    tnt_maintenance_unlock();
+    if (error) {
+      /* Nothing changed, and the scan would hand back the same candidate. */
+      printf("  %-34s stopped at %d after %zu prunes\n", "prune sweep", error,
+             done);
+      break;
+    }
+    if (++done > 500) break;
+  }
+  check(done > 0, "the sweep pruned nothing");
+  check(centree_validate_locked(tnt_centree()),
+        "the routing tree does not validate after the sweep");
+  validate("after the prune sweep");
+  verify_reads("reads across the sweep");
+  printf("  %-34s %zu prunes, %lu nodes left\n", "prune sweep", done,
+         tnt_get_node_count());
+}
+
+/* The pruned tree must still take writes and serve them. */
+static void check_writes_after_prune(void) {
+  size_t bad = 0;
+
+  run_ops(0, nb_keys, 10, 0, 9, 0, 1);
+  for (uint64_t k = 0; k < nb_keys; k++) {
+    if (k % 10 == 0) continue;
+    read_back_quiet(k);
+    if (rb_found && rb_value == k * 7 + 9) continue;
+    if (bad < 5)
+      check(false, "key %lu reads found=%d value=%lu, want %lu", k, rb_found,
+            rb_value, k * 7 + 9);
+    bad++;
+  }
+  check(bad == 0, "%zu keys wrong after writing into the pruned tree", bad);
+  if (!bad)
+    printf("  %-34s %lu keys rewritten and read back\n", "writes after prune",
+           nb_keys - nb_keys / 10);
+}
+
+/* ------------------------------------------- prunes under live traffic */
+
+/*
+ * Readers and writers hammering the whole key range while the pruner works.
+ * The writers rewrite each key with the value it already has, so the expected
+ * state never changes and any read that disagrees is a real fault: a miss on a
+ * live key, a resurrected tombstone, or a stale value.
+ */
+static _Atomic int stress_stop;
+static _Atomic size_t stress_reads, stress_writes, stress_bad;
+
+static uint64_t stress_value(uint64_t k) { return k * 7 + 9; }
+static int stress_deleted(uint64_t k) { return k % 10 == 0; }
+
+struct stress_req {
+  struct slab_callback cb;
+  unsigned char *item;
+  _Atomic int done;
+  int found;
+  uint64_t value;
+};
+
+static void stress_read_done(struct slab_callback *cb, void *item) {
+  struct stress_req *r = (struct stress_req *)cb;
+  struct item_metadata *meta = item;
+
+  r->found = item != NULL;
+  if (item)
+    r->value =
+        *(uint64_t *)((unsigned char *)item + sizeof(*meta) + sizeof(uint64_t));
+  atomic_store(&r->done, 1);
+}
+
+static void stress_write_done(struct slab_callback *cb, void *item) {
+  (void)item;
+  atomic_store(&((struct stress_req *)cb)->done, 1);
+}
+
+static void *stress_reader(void *arg) {
+  unsigned seed = (unsigned)(uintptr_t)arg * 7919 + 13;
+
+  while (!atomic_load(&stress_stop)) {
+    struct stress_req r = {0};
+    uint64_t k = rand_r(&seed) % nb_keys;
+
+    r.item = make_item(k, 0);
+    r.cb.cb = stress_read_done;
+    r.cb.item = (char *)r.item;
+    r.cb.fsst_idx = -1;
+    atomic_store(&r.done, 0);
+    kv_read_async(&r.cb);
+    while (!atomic_load(&r.done)) NOP10();
+    atomic_fetch_add(&stress_reads, 1);
+    if (stress_deleted(k) ? r.found : (!r.found || r.value != stress_value(k))) {
+      size_t slot = atomic_fetch_add(&stress_bad, 1);
+
+      if (slot < 8)
+        printf("    read anomaly: key %lu found=%d value=%lu want %s%lu\n", k,
+               r.found, r.value, stress_deleted(k) ? "miss/" : "",
+               stress_value(k));
+    }
+    free(r.item);
+  }
+  return NULL;
+}
+
+static void *stress_writer(void *arg) {
+  unsigned seed = (unsigned)(uintptr_t)arg * 104729 + 7;
+
+  while (!atomic_load(&stress_stop)) {
+    struct stress_req r = {0};
+    uint64_t k = rand_r(&seed) % nb_keys;
+
+    if (stress_deleted(k)) k++;
+    r.item = make_item(k, stress_value(k));
+    r.cb.cb = stress_write_done;
+    r.cb.item = (char *)r.item;
+    r.cb.fsst_idx = -1;
+    atomic_store(&r.done, 0);
+    kv_upsert_async(&r.cb);
+    while (!atomic_load(&r.done)) NOP10();
+    atomic_fetch_add(&stress_writes, 1);
+    free(r.item);
+  }
+  return NULL;
+}
+
+static int prune_one(void) {
+  struct prune_candidate c;
+  struct prune_build b;
+  int error;
+
+  if (!prune_scan_for_candidate(&c)) return 0;
+  tnt_maintenance_lock();
+  error = prune_freeze_and_link(&c, &b);
+  if (!error) prune_splice_routing(&c, &b);
+  tnt_maintenance_unlock();
+  return error ? -1 : 1;
+}
+
+static void check_concurrent_prune(void) {
+  pthread_t readers[4], writers[2];
+  size_t prunes = 0, rejects = 0, idle = 0;
+
+  atomic_store(&stress_stop, 0);
+  for (size_t i = 0; i < 4; i++)
+    pthread_create(&readers[i], NULL, stress_reader, (void *)i);
+  for (size_t i = 0; i < 2; i++)
+    pthread_create(&writers[i], NULL, stress_writer, (void *)i);
+
+  for (int round = 0; round < 400; round++) {
+    int r = getenv("PRUNE_STRESS_NOPRUNE") ? 0 : prune_one();
+
+    if (r > 0) prunes++;
+    else if (r < 0) rejects++;
+    else {
+      idle++;
+      usleep(5000);
+    }
+    /* Rebalancing has to interleave safely with pruning too. */
+    if (round % 50 == 49 && !getenv("PRUNE_STRESS_NOREBAL"))
+      check(tnt_rebalancing() >= 0, "rebalancing failed");
+  }
+
+  atomic_store(&stress_stop, 1);
+  for (size_t i = 0; i < 4; i++) pthread_join(readers[i], NULL);
+  for (size_t i = 0; i < 2; i++) pthread_join(writers[i], NULL);
+
+  check(atomic_load(&stress_bad) == 0, "%zu reads disagreed with the model",
+        (size_t)atomic_load(&stress_bad));
+  check(prunes > 0, "no prune happened under load");
+  check(centree_validate_locked(tnt_centree()),
+        "the routing tree does not validate after the stress run");
+  validate("after concurrent prunes");
+  printf("  %-34s %zu prunes (%zu rejected, %zu idle), %zu reads, %zu writes\n",
+         "prunes under load", prunes, rejects, idle,
+         (size_t)atomic_load(&stress_reads), (size_t)atomic_load(&stress_writes));
 }
 
 int main(int argc, char **argv) {
@@ -935,11 +1218,17 @@ int main(int argc, char **argv) {
   check_read_restart(0);
   check_read_restart(nb_keys + nb_keys / 2 - 1);
 
-  check_blocked_writer(nb_keys / 2);
+  /*
+   * Not a multiple of 10: the deleted tenth must stay deleted for the stress
+   * phase's model, and this key gets rewritten by check_writes_after_prune().
+   */
+  check_blocked_writer(nb_keys / 2 + 1);
   validate("after blocked-writer restart");
 
-  /* Leaves the two trees disagreeing on purpose; keep it last. */
   check_prune_link();
+  check_prune_all();
+  check_writes_after_prune();
+  check_concurrent_prune();
 
   /* The rule has two orientations and a history-root case; cover all three. */
   check(cov_candidates > 0, "no prunable triple was ever selected");

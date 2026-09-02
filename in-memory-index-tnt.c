@@ -400,6 +400,14 @@ void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
 
 centree tnt_centree(void) { return centree_root; }
 
+/*
+ * The publication lock. Held for write only while an epoch change is made
+ * visible, which is what excludes the callers that walk the current
+ * generation without registering as RCU readers.
+ */
+void tnt_root_wlock(void) { W_LOCK(&centree_root_lock); }
+void tnt_root_wunlock(void) { W_UNLOCK(&centree_root_lock); }
+
 tree_entry_t *centree_worker_lookup(void *key) {
   return centree_lookup(centree_root, key, tnt_pointer_cmp);
 }
