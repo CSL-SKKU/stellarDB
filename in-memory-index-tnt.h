@@ -70,7 +70,14 @@ int tnt_get_nodes_at_level(int level, background_queue *q);
 
 void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent);
 void tnt_index_add(struct slab_callback *cb, void *item);
+/*
+ * On success the returned entry carries one read reference on its slab, taken
+ * under the slab lock that found it. The read path passes it to the read
+ * completion; every other caller must release it with
+ * tnt_index_lookup_unref().
+ */
 index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item);
+void tnt_index_lookup_unref(index_entry_t *e);
 index_entry_t *tnt_index_lookup_for_test(struct slab_callback *cb, void *item, int *ttry, uint64_t *tkey);
 int tnt_index_invalid(void *item);
 
@@ -94,6 +101,11 @@ int tnt_rebalancing(void);
 void tnt_set_rebalance_precommit_test_hook(void (*hook)(void));
 /* Test-only hook: runs after publication/root unlock and before RCU cleanup. */
 void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void));
+/*
+ * Test-only hook: runs once per upward-walk step in tnt_index_lookup(),
+ * before the node's slab lock is taken and its removed flag is read.
+ */
+void tnt_set_index_lookup_step_test_hook(void (*hook)(centree_node n));
 
 background_queue *bgq_get(enum fsst_mode m);
 int bgq_is_empty(enum fsst_mode m);

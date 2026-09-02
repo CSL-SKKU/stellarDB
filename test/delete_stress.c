@@ -219,6 +219,7 @@ static void perform_read(uint64_t key) {
   size_t idx = GET_SIDX(entry->slab_idx);
   struct test_slab *store = store_for_slab(s);
   if (!store || idx >= s->nb_max_items) {
+    tnt_index_lookup_unref(entry);
     atomic_fetch_add_explicit(&read_bad_records, 1, memory_order_relaxed);
     return;
   }
@@ -235,7 +236,7 @@ static void perform_read(uint64_t key) {
   };
 
   pthread_mutex_lock(&store->page_locks[page]);
-  __sync_fetch_and_add(&s->read_ref, 1);
+  /* tnt_index_lookup() took the reference read_item_async_cb() drops. */
   read_result = (void *)(uintptr_t)1;
   read_item_async_cb(&read_cb);
 
@@ -332,6 +333,7 @@ static uint64_t audit_final_state(void) {
 
     struct slab_callback cb = {.item = query};
     index_entry_t *entry = tnt_index_lookup(&cb, query);
+    tnt_index_lookup_unref(entry);
     if (created) {
       if (!entry ||
           ((uint32_t)entry->slab_idx & (1u << 31)) != 0 ||

@@ -175,6 +175,79 @@ out:
   free(history);
 }
 
+/* ------------------------------------------- read restart on a retired node */
+
+/*
+ * The hook marks the first node the upward walk touches as retired. A correct
+ * read path must restart the descent, i.e. come back to that same node, rather
+ * than skipping past it to its lu_parent -- the retired node's entries live in
+ * the replacement node the published topology routes to. The second visit
+ * clears the flag so the walk can finish.
+ */
+static centree_node trip_first;
+static int trip_state; /* 0: armed, 1: marked, 2: restart seen */
+static uint64_t trip_steps;
+
+static void trip_hook(centree_node n) {
+  trip_steps++;
+  if (trip_state == 0) {
+    trip_first = n;
+    trip_state = 1;
+    atomic_store(&n->removed, 1);
+    return;
+  }
+  if (trip_state == 1) {
+    check(n == trip_first,
+          "walk moved on to another node instead of restarting");
+    atomic_store(&n->removed, 0);
+    trip_state = 2;
+  }
+}
+
+static void check_read_restart(uint64_t key) {
+  unsigned char *item = make_item(key, 0);
+  struct slab_callback cb = {.item = (char *)item};
+  struct slab *want_slab;
+  uint64_t want_idx;
+  index_entry_t *e;
+
+  /* Reference: what an undisturbed lookup returns. */
+  e = tnt_index_lookup(&cb, item);
+  check(e != NULL, "key %lu not in the index", key);
+  if (!e) {
+    free(item);
+    return;
+  }
+  want_slab = e->slab;
+  want_idx = GET_SIDX(e->slab_idx);
+  tnt_index_lookup_unref(e);
+
+  trip_first = NULL;
+  trip_state = 0;
+  trip_steps = 0;
+  tnt_set_index_lookup_step_test_hook(trip_hook);
+  e = tnt_index_lookup(&cb, item);
+  tnt_set_index_lookup_step_test_hook(NULL);
+
+  check(trip_state == 2, "key %lu: no restart observed (state %d, %lu steps)",
+        key, trip_state, trip_steps);
+  check(e != NULL, "key %lu: lost after a restart", key);
+  if (e) {
+    check(e->slab == want_slab && GET_SIDX(e->slab_idx) == want_idx,
+          "key %lu: restart returned a different entry", key);
+    check(e->slab->read_ref == 1, "key %lu: read_ref %lu after lookup, want 1",
+          key, e->slab->read_ref);
+    tnt_index_lookup_unref(e);
+    check(e->slab->read_ref == 0, "key %lu: read_ref %lu after unref, want 0",
+          key, e->slab->read_ref);
+  }
+  if (trip_first)
+    check(atomic_load(&trip_first->removed) == 0, "node left marked retired");
+  printf("  %-34s key %lu, %lu walk steps\n", "restart on retired node", key,
+         trip_steps);
+  free(item);
+}
+
 int main(int argc, char **argv) {
   if (argc > 1) nb_keys = strtoull(argv[1], NULL, 0);
 
@@ -198,6 +271,10 @@ int main(int argc, char **argv) {
   /* Writes that land in the rebalanced tree must keep history consistent. */
   run_upserts(nb_keys, nb_keys + nb_keys / 2);
   validate("after post-rebalance writes");
+
+  /* An early key sits in an internal slab, a late one in its leaf. */
+  check_read_restart(0);
+  check_read_restart(nb_keys + nb_keys / 2 - 1);
 
   if (failures) {
     printf("== %lu failures ==\n", failures);

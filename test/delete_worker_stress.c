@@ -282,7 +282,9 @@ static void expect_direct_index_hit(uint64_t key) {
 
   init_item(item, key, 0);
   callback.item = item;
-  TEST_CHECK(tnt_index_lookup(&callback, item) != NULL);
+  index_entry_t *e = tnt_index_lookup(&callback, item);
+  TEST_CHECK(e != NULL);
+  tnt_index_lookup_unref(e);
 }
 
 static bool wait_for_flag(_Atomic bool *flag, time_t timeout_seconds) {

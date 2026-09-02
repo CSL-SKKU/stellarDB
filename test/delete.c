@@ -229,6 +229,9 @@ static void test_routing_publication_and_invalidation(void) {
   CHECK(entry != NULL);
   CHECK(entry->slab == left);
   CHECK(GET_SIDX(entry->slab_idx) == idx);
+  CHECK(left->read_ref == 1);
+  tnt_index_lookup_unref(entry);
+  CHECK(left->read_ref == 0);
   expect_read_result(left, idx, moving_tombstone, true);
 
   unsigned char *normal_in_leaf = new_test_item(10, false);

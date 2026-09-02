@@ -249,6 +249,7 @@ static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int centree_phase_state;
 static void (*rebalance_precommit_test_hook)(void);
 static void (*rebalance_postpublish_test_hook)(void);
+static void (*index_lookup_step_test_hook)(centree_node n);
 
 #define CENTREE_RESTRUCTURING (1U << 30)
 #define CENTREE_SPLIT_COUNT_MASK (CENTREE_RESTRUCTURING - 1)
@@ -329,6 +330,10 @@ void tnt_set_rebalance_precommit_test_hook(void (*hook)(void)) {
 
 void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void)) {
   rebalance_postpublish_test_hook = hook;
+}
+
+void tnt_set_index_lookup_step_test_hook(void (*hook)(centree_node n)) {
+  index_lookup_step_test_hook = hook;
 }
 
 void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
@@ -846,6 +851,17 @@ index_entry_t *tnt_index_lookup_for_test(struct slab_callback *cb, void *item, i
   return e;
 }
 
+/*
+ * Drops the read reference tnt_index_lookup() took on the entry's slab. Only
+ * for callers that do not go on to read the record: the read completion
+ * (read_item_async_cb) drops it otherwise.
+ */
+void tnt_index_lookup_unref(index_entry_t *e) {
+  if (e == NULL)
+    return;
+  __sync_fetch_and_sub(&e->slab->read_ref, 1);
+}
+
 index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
@@ -854,15 +870,41 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   index_entry_t *e = NULL, *tmp = NULL;
   int tmp_try = 0, upward_len = 1;
   int count = 0;
+  bool leaf_timed = false;
+
+restart:
+  e = NULL;
+  tmp_try = 0;
+  upward_len = 1;
+  count = 0;
 
   n = centree_find_leaf((void*)key);
-  add_time_in_payload(cb, TIMING_STAGE_LEAF_FOUND);
+  if (!leaf_timed) {
+    /* Only the first descent is timed; a restart must not add a stage. */
+    add_time_in_payload(cb, TIMING_STAGE_LEAF_FOUND);
+    leaf_timed = true;
+  }
 
   // Leaf node에서 upward 탐색
   while (n != NULL) {
     struct slab *s = n->value.slab;
+
+    if (index_lookup_step_test_hook != NULL)
+      index_lookup_step_test_hook(n);
+
     R_LOCK(&s->tree_lock);
+    /*
+     * A retired node's valid entries were copied into its replacement, which
+     * the published topology routes to. Walking past it would miss them, so
+     * restart the descent instead. removed is monotone and is only set after
+     * the replacement is published, so this cannot spin.
+     */
+    if (atomic_load_explicit(&n->removed, memory_order_acquire)) {
+      R_UNLOCK(&s->tree_lock);
+      goto restart;
+    }
     tmp_try++;
+    tmp = NULL;
     if (s->min != -1) {
 #if WITH_FILTER
       if (filter_contain(s->filter, (unsigned char *)&key)) {
@@ -875,6 +917,14 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
           //  && !TEST_INVAL(tmp->slab_idx)
           //  이 조건을 지웠는데, update의 lock을 최소화하기 위해서
           //  1. 지운다. 2. 추가한다 이 과정에서 1-2 사이에 있는 중일 수 있음
+          /*
+           * The reference is taken under the lock that found the entry and
+           * after the removed check, so a retired slab can never gain a new
+           * reader. The caller reading the record hands it to the read
+           * completion; any other caller must tnt_index_lookup_unref().
+           */
+          assert(tmp->slab == s);
+          __sync_fetch_and_add(&s->read_ref, 1);
           e = tmp;
           R_UNLOCK(&s->tree_lock);
 	          if (tmp_try > try) {
@@ -890,9 +940,9 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
     }
     R_UNLOCK(&s->tree_lock);
 
-    // 부모 노드로 이동
+    // 부모(history) 노드로 이동
     upward_len++;
-    n = centree_lu_parent(n);  // 부모(history) 노드로 이동
+    n = centree_lu_parent(n);
   }
   add_time_in_payload(cb, TIMING_STAGE_INDEX_LOOKUP_DONE);
   // printf("%d", try);

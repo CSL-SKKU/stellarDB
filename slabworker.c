@@ -397,7 +397,7 @@ again:
           struct slab *s = e->slab;
           callback->slab = s;
           callback->slab_idx = GET_SIDX(e->slab_idx);
-          __sync_fetch_and_add(&e->slab->read_ref, 1);
+          /* tnt_index_lookup() already holds the read reference. */
           kv_read_async_no_lookup(callback, callback->slab, callback->slab_idx,
                                   0);
         }

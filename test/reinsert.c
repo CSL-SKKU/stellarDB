@@ -248,6 +248,7 @@ void *worker(void *arg) {
       if (!e)
 	  printf("Not Found %lu\n", keys[i]);
       clock_gettime(CLOCK_MONOTONIC, &te);
+      tnt_index_lookup_unref(e);
       double lat = (te.tv_sec - ts.tv_sec) * 1e9 + (te.tv_nsec - ts.tv_nsec);
       td->read_lat[td->read_cnt++] = lat;
     }
@@ -303,6 +304,7 @@ void *phase2_worker(void *arg) {
       if (!e)
 	  printf("Not Found %lu\n", keys[i]);
       clock_gettime(CLOCK_MONOTONIC, &te);
+      tnt_index_lookup_unref(e);
       td->read_lat[td->read_cnt++] =
         (te.tv_sec - ts.tv_sec) * 1e9 + (te.tv_nsec - ts.tv_nsec);
     }
