@@ -7,7 +7,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-make -j"$(nproc)" test/test_prune_freeze test/test_prune_links >/dev/null || exit 1
+make -j"$(nproc)" test/test_prune_freeze test/test_prune_links test/test_split_skip >/dev/null || exit 1
 
 # Runs a binary with a throwaway /scratch0/kvell. $DBDIR is reused when set,
 # which is how the recovery case re-opens the database it just wrote.
@@ -30,6 +30,15 @@ filter() { grep -v "SLAB WORKER\|^CORE:\|Reserving memory\|page_cache_init\|BREA
 echo "== in-process unit tests (no slab files) =="
 ./test/test_prune_freeze >/dev/null 2>&1
 report "slab_freeze (reject paths, drain, freeze vs. split race)" $?
+
+echo
+echo "== the final-slot writer must split (Known bugs 23) =="
+# A moving UPSERT whose source slot index equals the destination's final slot
+# index used to skip the split and strand every later writer to that range.
+sandboxed ./test/test_split_skip 2>&1 | filter | tail -1
+report "final-slot moving upsert splits" "${PIPESTATUS[0]}"
+CONTROL=1 sandboxed env CONTROL=1 ./test/test_split_skip 2>&1 | filter | tail -1
+report "final-slot moving upsert splits (control)" "${PIPESTATUS[0]}"
 
 echo
 echo "== end-to-end through the real pipeline =="
