@@ -37,6 +37,7 @@ extern struct restructuring_stats rstats;
 #define RSTAT_INC(field) RSTAT_ADD(field, 1)
 void rstat_max(uint64_t *slot, uint64_t v);
 void print_restructuring_stats(const char *phase);
+void process_memory_kb(uint64_t *rss, uint64_t *vsz, uint64_t *hwm);
 void reset_restructuring_stats(void);
 
 void add_timing_stat(uint64_t elapsed);

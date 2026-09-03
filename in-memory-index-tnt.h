@@ -210,6 +210,7 @@ int prune_build_finish(struct prune_build *b);
 int prune_build_cold(const struct prune_candidate *c, struct prune_build *out);
 /* Unlinks N's file and frees the build. Only valid while unpublished. */
 void prune_build_discard(struct prune_build *b);
+void prune_build_release_buffer(struct prune_build *b);
 
 /*
  * Freeze the leaf, copy it into N, and splice N into the history chain.

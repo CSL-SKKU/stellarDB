@@ -679,7 +679,7 @@ static void *utilization_sampler(void *pdata) {
 
   gettimeofday(&t0, NULL);
   printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
-         "reins_queued reins_slabs prune_done rebalance_calls\n");
+         "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb\n");
   while (1) {
     struct prune_stale m;
     unsigned int dist = get_distributor_utilization();
@@ -688,14 +688,18 @@ static void *utilization_sampler(void *pdata) {
 
     prune_stale_measure(&m);
     gettimeofday(&now, NULL);
-    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu\n",
+    uint64_t rss_kb, vsz_kb, hwm_kb;
+
+    process_memory_kb(&rss_kb, &vsz_kb, &hwm_kb);
+    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu\n",
            (now.tv_sec - t0.tv_sec) + (now.tv_usec - t0.tv_usec) / 1e6, dist,
            io, gate, tnt_rebalancing_needed() ? 1 : 0, tnt_get_node_count(),
            tnt_get_depth(), prune_stale_ratio(&m),
            __atomic_load_n(&rstats.reins_queued, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.reins_slabs, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.prune_done, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED));
+           __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED),
+           rss_kb / 1024, vsz_kb / 1024);
     fflush(stdout);
     usleep(1000000);
   }

@@ -50,6 +50,25 @@ void reset_restructuring_stats(void) {
   memset(&rstats, 0, sizeof(rstats));
 }
 
+/* VmRSS / VmSize / VmHWM of this process in KiB, from /proc/self/status. */
+void process_memory_kb(uint64_t *rss, uint64_t *vsz, uint64_t *hwm) {
+  char line[256];
+  FILE *f = fopen("/proc/self/status", "r");
+
+  *rss = *vsz = *hwm = 0;
+  if (f == NULL)
+    return;
+  while (fgets(line, sizeof(line), f) != NULL) {
+    if (strncmp(line, "VmRSS:", 6) == 0)
+      *rss = strtoull(line + 6, NULL, 10);
+    else if (strncmp(line, "VmSize:", 7) == 0)
+      *vsz = strtoull(line + 7, NULL, 10);
+    else if (strncmp(line, "VmHWM:", 6) == 0)
+      *hwm = strtoull(line + 6, NULL, 10);
+  }
+  fclose(f);
+}
+
 /* One block per phase; every line is "#R <phase> key=value ..." for grep. */
 void print_restructuring_stats(const char *phase) {
   struct restructuring_stats r;
@@ -70,6 +89,13 @@ void print_restructuring_stats(const char *phase) {
          "failed=%lu total_ms=%.1f max_ms=%.1f\n", phase, r.prune_bursts,
          r.prune_calls, r.prune_done, r.prune_noop, r.prune_dropped,
          r.prune_failed, r.prune_us / 1000.0, r.prune_max_us / 1000.0);
+  {
+    uint64_t rss, vsz, hwm;
+
+    process_memory_kb(&rss, &vsz, &hwm);
+    printf("#R %s mem: rss_mb=%lu vsz_mb=%lu peak_rss_mb=%lu\n", phase,
+           rss / 1024, vsz / 1024, hwm / 1024);
+  }
   printf("#R %s prune-stale: stale=%lu reserved=%lu ratio=%.3f\n", phase,
          r.prune_stale_last, r.prune_reserved_last,
          r.prune_reserved_last ? (double)r.prune_stale_last / r.prune_reserved_last : 0.0);

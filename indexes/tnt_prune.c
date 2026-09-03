@@ -750,6 +750,17 @@ int prune_build_cold(const struct prune_candidate *c,
   return error;
 }
 
+/*
+ * N is on disk and committed: the page image is no longer needed. Only the
+ * failure path released it before, so every successful prune kept a 64 MiB
+ * mapping (measured: +64 MiB VmSize per prune, ~60 MiB of it resident).
+ */
+void prune_build_release_buffer(struct prune_build *b) {
+  if (b->buffer != NULL)
+    munmap(b->buffer, pages_for_capacity(b) * PAGE_SIZE);
+  b->buffer = NULL;
+}
+
 void prune_build_discard(struct prune_build *b) {
   if (b->slab != NULL) {
     char proc[64], path[512];
@@ -1096,6 +1107,7 @@ static int tnt_prune_once_timed(void) {
     t = now_us();
     prune_retire(&c);
     pt.retire = now_us() - t;
+    prune_build_release_buffer(&b);
   }
   tnt_maintenance_unlock();
 
