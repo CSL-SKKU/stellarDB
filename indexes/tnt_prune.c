@@ -31,7 +31,23 @@
 #include "tnt_centree.h"
 
 #include <errno.h>
+#include <time.h>
 #include <stdbool.h>
+
+/* Per-prune phase timing, printed after the "Prune:" line. */
+struct prune_timing {
+  uint64_t scan, drain, snap_cold, copy_cold, flush_cold, freeze, copy_leaf,
+      finish, headers, splice, retire;
+  uint64_t preads, cold_entries, leaf_entries;
+};
+static struct prune_timing pt;
+
+static uint64_t now_us(void) {
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
 
 static bool retired(centree_node n) {
   return atomic_load_explicit(&n->removed, memory_order_acquire) != 0;
@@ -484,6 +500,7 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
    * snapshot is copied anyway; it lands in N as a stale entry, shadowed by
    * the newer copy nearer the leaf (§7).
    */
+  uint64_t t0 = now_us();
   R_LOCK(&src->tree_lock);
   if (retired(source)) {
     R_UNLOCK(&src->tree_lock);
@@ -499,6 +516,12 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
 
   /* Slot order, so each source page is read at most once. */
   qsort(snap.entries, snap.nb, sizeof(*snap.entries), compare_by_slot);
+  if (override) {
+    pt.leaf_entries += snap.nb;
+  } else {
+    pt.snap_cold += now_us() - t0;
+    pt.cold_entries += snap.nb;
+  }
 
   for (size_t i = 0; i < snap.nb; i++) {
     uint64_t key = snap.entries[i].key;
@@ -533,6 +556,8 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
     if (page_idx != cached_page) {
       ssize_t got = pread(src->fd, page, PAGE_SIZE,
                           (off_t)page_idx * PAGE_SIZE);
+
+      pt.preads++;
 
       if (got != (ssize_t)PAGE_SIZE) {
         error = -EIO;
@@ -738,20 +763,28 @@ int prune_freeze_and_link(const struct prune_candidate *c,
    * slot is reserved, not when its write lands. Wait for that before taking
    * their snapshot, exactly as the freeze waits for the leaf.
    */
+  uint64_t t = now_us();
   slab_drain_updates(c->inner->value.slab);
   slab_drain_updates(c->outer->value.slab);
+  pt.drain += now_us() - t;
+  t = now_us();
   error = prune_build_add_source(b, c->inner, 0);
   if (!error)
     error = prune_build_add_source(b, c->outer, 0);
+  pt.copy_cold += now_us() - t;
   /* Get the cold pages onto the device before the freeze window opens. */
+  t = now_us();
   if (!error)
     error = prune_build_flush(b);
+  pt.flush_cold += now_us() - t;
   if (error) {
     prune_build_discard(b);
     return error;
   }
 
+  t = now_us();
   frozen = slab_freeze(leaf_slab, b->capacity - b->count);
+  pt.freeze += now_us() - t;
   if (frozen < 0) {
     prune_build_discard(b);
     return (int)frozen;
@@ -764,15 +797,20 @@ int prune_freeze_and_link(const struct prune_candidate *c,
    * and supersedes one of them -- and such an entry is copied into N anyway,
    * shadowed by the newer copy nearer the leaf.
    */
+  t = now_us();
   error = prune_build_add_source(b, c->leaf, 1);
+  pt.copy_leaf += now_us() - t;
+  t = now_us();
   if (!error)
     error = prune_build_finish(b);
+  pt.finish += now_us() - t;
   if (error)
     die("Pruning could not finish the merged slab after freezing slab %lu "
         "(%d); the frozen leaf has no way back\n",
         leaf_slab->seq, error);
 
   prune_link_history(c, b->node);
+  t = now_us();
 
   /*
    * Durable commit. N's header names its history children and carries Q's
@@ -792,6 +830,7 @@ int prune_freeze_and_link(const struct prune_candidate *c,
     die("Pruning cannot make slab %lu the history root\n", b->slab->seq);
   }
   slab_maybe_crash(CRASH_PRUNE_AFTER_COMMIT);
+  pt.headers += now_us() - t;
   return 0;
 }
 
@@ -952,15 +991,22 @@ static int tnt_prune_once_timed(void) {
    * Selection runs under the same lock as the rest, so the candidate cannot
    * go stale between picking it and freezing its leaf.
    */
+  memset(&pt, 0, sizeof(pt));
+  uint64_t t = now_us();
   tnt_maintenance_lock();
   if (!prune_scan_for_candidate(&c)) {
     tnt_maintenance_unlock();
     return TNT_PRUNE_NOOP;
   }
+  pt.scan = now_us() - t;
   error = prune_freeze_and_link(&c, &b);
   if (!error) {
+    t = now_us();
     prune_splice_routing(&c, &b);
+    pt.splice = now_us() - t;
+    t = now_us();
     prune_retire(&c);
+    pt.retire = now_us() - t;
   }
   tnt_maintenance_unlock();
 
@@ -968,5 +1014,14 @@ static int tnt_prune_once_timed(void) {
     return error;
   printf("Prune: %lu <- %lu/%lu/%lu\n", b.slab->seq, c.outer->value.slab->seq,
          c.leaf->value.slab->seq, c.inner->value.slab->seq);
+  printf("Prune timing (ms): scan=%.1f drain=%.1f snapshot=%.1f copy_cold=%.1f "
+         "flush_cold=%.1f freeze=%.1f copy_leaf=%.1f finish=%.1f headers=%.1f "
+         "splice=%.1f retire=%.1f | preads=%lu cold_entries=%lu "
+         "leaf_entries=%lu merged=%zu\n",
+         pt.scan / 1e3, pt.drain / 1e3, pt.snap_cold / 1e3,
+         (pt.copy_cold - pt.snap_cold) / 1e3, pt.flush_cold / 1e3,
+         pt.freeze / 1e3, pt.copy_leaf / 1e3, pt.finish / 1e3, pt.headers / 1e3,
+         pt.splice / 1e3, pt.retire / 1e3, pt.preads, pt.cold_entries,
+         pt.leaf_entries, b.count);
   return TNT_PRUNE_DONE;
 }
