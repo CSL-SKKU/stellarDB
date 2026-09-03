@@ -74,6 +74,48 @@ int main(void) {
   item_clear_shy(&legacy);
   check(item_is_legacy(&legacy), "clear touched a legacy record");
 
+  /* ---- the slot word in the local index ---- */
+  {
+    subtree_t *t = subtree_create();
+    struct slab fake = {0};
+    uint64_t k1 = 11, k2 = 22;
+    index_entry_t e = {{&fake}, {5}}, found;
+
+    subtree_set_slab(t, &fake);
+    subtree_insert(t, (unsigned char *)&k1, sizeof(k1), &e);
+    e.slab_idx = 6;
+    subtree_insert_shy(t, (unsigned char *)&k2, sizeof(k2), &e);
+
+    check(subtree_find(t, (unsigned char *)&k1, sizeof(k1), &found) &&
+              !sidx_is_shy(found.slab_idx) && GET_SIDX(found.slab_idx) == 5,
+          "normal entry is wrong");
+    check(subtree_find(t, (unsigned char *)&k2, sizeof(k2), &found) &&
+              sidx_is_shy(found.slab_idx) && GET_SIDX(found.slab_idx) == 6,
+          "shy entry is wrong (word %zx)", found.slab_idx);
+    check(!sidx_is_invalid(found.slab_idx), "shy entry reads as invalid");
+
+    /* The invalid hint and the shy bit are independent. */
+    subtree_set_invalid(t, (unsigned char *)&k2, sizeof(k2));
+    subtree_find(t, (unsigned char *)&k2, sizeof(k2), &found);
+    check(sidx_is_invalid(found.slab_idx) && sidx_is_shy(found.slab_idx) &&
+              GET_SIDX(found.slab_idx) == 6,
+          "invalidating a shy entry lost a bit (word %zx)", found.slab_idx);
+    check(subtree_clear_shy(t, (unsigned char *)&k2, sizeof(k2)) == 1,
+          "clear_shy did not find the key");
+    subtree_find(t, (unsigned char *)&k2, sizeof(k2), &found);
+    check(sidx_is_invalid(found.slab_idx) && !sidx_is_shy(found.slab_idx) &&
+              GET_SIDX(found.slab_idx) == 6,
+          "clear_shy touched other bits (word %zx)", found.slab_idx);
+    check(subtree_clear_shy(t, (unsigned char *)&k1, sizeof(k1)) == 1 &&
+              subtree_find(t, (unsigned char *)&k1, sizeof(k1), &found) &&
+              found.slab_idx == 5,
+          "clear_shy on a normal entry changed it");
+    uint64_t missing = 33;
+    check(subtree_clear_shy(t, (unsigned char *)&missing, sizeof(missing)) == 0,
+          "clear_shy invented a key");
+    subtree_free(t);
+  }
+
   if (failures) {
     printf("== %lu failures ==\n", failures);
     return 1;
