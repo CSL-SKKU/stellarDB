@@ -662,10 +662,23 @@ int add_existing_item(struct slab *s, size_t idx, void *item,
 #if WITH_FILTER
 if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
   #endif
-  if (tnt_index_lookup_utree(s->subtree, item)) {
-    tnt_index_delete(s->subtree, item);
-    s->nb_items--;
-    __sync_sub_and_fetch(&nb_totals, 1);
+  {
+    index_entry_t *prev = tnt_index_lookup_utree(s->subtree, item);
+
+    if (prev != NULL) {
+      /*
+       * The same key twice in one slab. The runtime rule: a shy record (a
+       * copy made by reinsertion) never beats a client record, whatever the
+       * slot order; otherwise the later slot wins. This is also what makes an
+       * abandoned reinsertion slot harmless after a crash: it always sits in
+       * the same slab as, or above, a client record for its key.
+       */
+      if (item_is_shy(meta) && !sidx_is_shy(prev->slab_idx))
+        return 1; /* occupied, but the existing record stays indexed */
+      tnt_index_delete(s->subtree, item);
+      s->nb_items--;
+      __sync_sub_and_fetch(&nb_totals, 1);
+    }
   }
 #if WITH_FILTER
 }
@@ -677,7 +690,10 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
   cb->slab_idx = idx;
 
   __sync_add_and_fetch(&nb_totals, 1);
-  tnt_index_add(cb, item);
+  if (item_is_shy(meta))
+    tnt_index_add_shy(cb, item); /* the completions' rule keeps applying */
+  else
+    tnt_index_add(cb, item);
 
   slab_widen_range(s, key);
 

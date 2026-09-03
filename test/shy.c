@@ -15,6 +15,10 @@ int print = 0;
 int load = 0;
 int rc_thr = 1;
 
+/* Recovery's per-slot indexer (slabworker.c); not in a header. */
+int add_existing_item(struct slab *s, size_t idx, void *item,
+                      struct slab_callback *cb);
+
 static uint64_t failures;
 
 static void check(bool ok, const char *fmt, ...) {
@@ -177,6 +181,59 @@ static void test_completions(void) {
         "R with a higher slot beat a client write");
 }
 
+/* ------------------------------------------- recovery over shy records */
+
+static void feed(struct slab *s, size_t slot, uint64_t key, int shy, int expect) {
+  struct slab_callback cb = {.slab = s};
+  unsigned char *item = fake_item(key, slot);
+
+  if (shy) item_mark_shy((struct item_metadata *)item);
+  check(add_existing_item(s, slot, item, &cb) == expect,
+        "add_existing_item(slot %zu, %s) return value", slot, shy ? "shy" : "normal");
+  free(item);
+}
+
+static void expect_slot(struct slab *s, uint64_t key, size_t slot, int shy,
+                        const char *what) {
+  index_entry_t e;
+
+  if (!lookup(s, key, &e)) {
+    check(false, "%s: key %lu not indexed", what, key);
+    return;
+  }
+  check(GET_SIDX(e.slab_idx) == slot && !!sidx_is_shy(e.slab_idx) == !!shy,
+        "%s: key %lu indexed at slot %zu%s, want %zu%s", what, key,
+        GET_SIDX(e.slab_idx), sidx_is_shy(e.slab_idx) ? " (shy)" : "", slot,
+        shy ? " (shy)" : "");
+}
+
+static void test_recovery_rule(void) {
+  struct slab *s = fake_slab(9);
+
+  printf("== recovery tie-break ==\n");
+  /* normal then shy: the client record stays, the shy one is skipped */
+  feed(s, 1, 100, 0, 1);
+  feed(s, 2, 100, 1, 1);
+  expect_slot(s, 100, 1, 0, "normal then shy");
+  /* shy then normal: the client record replaces the copy */
+  feed(s, 3, 101, 1, 1);
+  feed(s, 4, 101, 0, 1);
+  expect_slot(s, 101, 4, 0, "shy then normal");
+  /* shy then shy: later wins, stays shy */
+  feed(s, 5, 102, 1, 1);
+  feed(s, 6, 102, 1, 1);
+  expect_slot(s, 102, 6, 1, "shy then shy");
+  /* normal then normal: later wins, as before */
+  feed(s, 7, 103, 0, 1);
+  feed(s, 8, 103, 0, 1);
+  expect_slot(s, 103, 8, 0, "normal then normal");
+  /* a lone shy record is indexed, and indexed as shy */
+  feed(s, 9, 104, 1, 1);
+  expect_slot(s, 104, 9, 1, "lone shy");
+  check(s->nb_items == 5, "nb_items after the tie-breaks is %zu, want 5",
+        s->nb_items);
+}
+
 int main(void) {
   struct item_metadata normal, tomb, empty = {0}, legacy;
 
@@ -266,6 +323,7 @@ int main(void) {
   }
 
   test_completions();
+  test_recovery_rule();
 
   if (failures) {
     printf("== %lu failures ==\n", failures);
