@@ -49,6 +49,78 @@ static uint64_t now_us(void) {
   return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
 }
 
+/*
+ * Batched page reads for the merge. One synchronous 4 KiB read per touched
+ * page was the pruner's whole cost under load: each read waited its turn
+ * behind the workload's queue (~1.5 ms against ~20 us on an idle device), so a
+ * source with 10k live entries took 15 s. Submitting the touched pages as
+ * batches of QUEUE_DEPTH concurrent reads pays that wait once per batch. The
+ * pruner is a single thread, so it owns one aio context of its own.
+ */
+#define PRUNE_READ_BATCH QUEUE_DEPTH
+
+static aio_context_t prune_aio;
+static struct iocb prune_iocb[PRUNE_READ_BATCH];
+static struct iocb *prune_iocbs[PRUNE_READ_BATCH];
+static struct io_event prune_events[PRUNE_READ_BATCH];
+
+static int prune_aio_init(void) {
+  if (prune_aio != 0)
+    return 0;
+  if (syscall(__NR_io_setup, PRUNE_READ_BATCH, &prune_aio) != 0)
+    return -errno;
+  for (int i = 0; i < PRUNE_READ_BATCH; i++)
+    prune_iocbs[i] = &prune_iocb[i];
+  return 0;
+}
+
+/* Reads pages[0..nb) of fd into buf, PAGE_SIZE each, in submission batches. */
+static int prune_read_pages(int fd, const size_t *pages, size_t nb, char *buf) {
+  int error = prune_aio_init();
+
+  if (error)
+    return error;
+  for (size_t done = 0; done < nb;) {
+    long batch = (long)(nb - done);
+    long got = 0;
+
+    if (batch > PRUNE_READ_BATCH)
+      batch = PRUNE_READ_BATCH;
+    for (long i = 0; i < batch; i++) {
+      struct iocb *cb = &prune_iocb[i];
+
+      memset(cb, 0, sizeof(*cb));
+      cb->aio_fildes = (uint32_t)fd;
+      cb->aio_lio_opcode = IOCB_CMD_PREAD;
+      cb->aio_buf = (uint64_t)(uintptr_t)(buf + (done + (size_t)i) * PAGE_SIZE);
+      cb->aio_nbytes = PAGE_SIZE;
+      cb->aio_offset = (int64_t)(pages[done + (size_t)i] * PAGE_SIZE);
+    }
+    for (long sent = 0; sent < batch;) {
+      long r = syscall(__NR_io_submit, prune_aio, batch - sent,
+                       prune_iocbs + sent);
+
+      if (r < 0)
+        return -errno;
+      sent += r;
+    }
+    pt.preads++;
+    while (got < batch) {
+      long r = syscall(__NR_io_getevents, prune_aio, batch - got, batch - got,
+                       prune_events, NULL);
+
+      if (r < 0)
+        return -errno;
+      for (long i = 0; i < r; i++)
+        if (prune_events[i].res != (int64_t)PAGE_SIZE)
+          return -EIO;
+      got += r;
+    }
+    done += (size_t)batch;
+  }
+  return 0;
+}
+
 static bool retired(centree_node n) {
   return atomic_load_explicit(&n->removed, memory_order_acquire) != 0;
 }
@@ -480,14 +552,13 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
   struct slab *n = b->slab;
   struct prune_snapshot snap = {0};
   size_t items_per_page = PAGE_SIZE / src->item_size;
-  size_t cached_page = (size_t)-1;
-  char *page = NULL;
+  size_t *touched = NULL, nb_touched = 0, cur = 0;
+  char *pages = NULL;
   int error = 0;
 
   snap.capacity = src->nb_max_items;
   snap.entries = malloc(snap.capacity * sizeof(*snap.entries));
-  page = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
-  if (snap.entries == NULL || page == NULL) {
+  if (snap.entries == NULL) {
     error = -ENOMEM;
     goto out;
   }
@@ -522,6 +593,33 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
     pt.snap_cold += now_us() - t0;
     pt.cold_entries += snap.nb;
   }
+  if (snap.nb == 0)
+    goto out;
+
+  /* Distinct touched pages, ascending (entries are in slot order). */
+  touched = malloc(snap.nb * sizeof(*touched));
+  if (touched == NULL) {
+    error = -ENOMEM;
+    goto out;
+  }
+  for (size_t i = 0; i < snap.nb; i++) {
+    size_t pg = snap.entries[i].slot / items_per_page;
+
+    if (snap.entries[i].slot >= src->nb_max_items) {
+      error = -EINVAL;
+      goto out;
+    }
+    if (nb_touched == 0 || touched[nb_touched - 1] != pg)
+      touched[nb_touched++] = pg;
+  }
+  pages = aligned_alloc(PAGE_SIZE, nb_touched * PAGE_SIZE);
+  if (pages == NULL) {
+    error = -ENOMEM;
+    goto out;
+  }
+  error = prune_read_pages(src->fd, touched, nb_touched, pages);
+  if (error)
+    goto out;
 
   for (size_t i = 0; i < snap.nb; i++) {
     uint64_t key = snap.entries[i].key;
@@ -553,20 +651,10 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
     }
     dst = replaces ? GET_SIDX(existing.slab_idx) : b->count;
 
-    if (page_idx != cached_page) {
-      ssize_t got = pread(src->fd, page, PAGE_SIZE,
-                          (off_t)page_idx * PAGE_SIZE);
-
-      pt.preads++;
-
-      if (got != (ssize_t)PAGE_SIZE) {
-        error = -EIO;
-        goto out;
-      }
-      cached_page = page_idx;
-    }
-
-    record = page + (slot % items_per_page) * src->item_size;
+    /* touched[] is ascending and so are the entries: advance cur to page_idx. */
+    while (touched[cur] != page_idx)
+      cur++;
+    record = pages + cur * PAGE_SIZE + (slot % items_per_page) * src->item_size;
     meta = (struct item_metadata *)record;
     if (item_is_legacy(meta) || item_is_empty(meta) ||
         *(uint64_t *)(record + sizeof(*meta)) != key) {
@@ -606,7 +694,8 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
 
 out:
   free(snap.entries);
-  free(page);
+  free(touched);
+  free(pages);
   return error;
 }
 
@@ -1016,7 +1105,7 @@ static int tnt_prune_once_timed(void) {
          c.leaf->value.slab->seq, c.inner->value.slab->seq);
   printf("Prune timing (ms): scan=%.1f drain=%.1f snapshot=%.1f copy_cold=%.1f "
          "flush_cold=%.1f freeze=%.1f copy_leaf=%.1f finish=%.1f headers=%.1f "
-         "splice=%.1f retire=%.1f | preads=%lu cold_entries=%lu "
+         "splice=%.1f retire=%.1f | read_batches=%lu cold_entries=%lu "
          "leaf_entries=%lu merged=%zu\n",
          pt.scan / 1e3, pt.drain / 1e3, pt.snap_cold / 1e3,
          (pt.copy_cold - pt.snap_cold) / 1e3, pt.flush_cold / 1e3,
