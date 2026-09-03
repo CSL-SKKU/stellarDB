@@ -138,11 +138,11 @@ report "reinsertion copies tombstones forward" "${PIPESTATUS[0]}"
 sandboxed ./test/test_delete_edge count 3000 2>&1 | filter | tail -5
 report "no key readable after deleting everything" "${PIPESTATUS[0]}"
 
+sandboxed ./test/test_delete_edge readd 10 2>&1 | filter | tail -3
+report "kv_add_async() on a deleted key resurrects it (ADD is an UPSERT alias)" "${PIPESTATUS[0]}"
+
 echo
 echo "== known-bad cases (these are expected to fail today) =="
-
-sandboxed ./test/test_delete_edge readd 10 2>&1 | filter | tail -3
-report "kv_add_async() on a deleted key" "${PIPESTATUS[0]}" 255
 
 sandboxed ./test/test_delete_edge reuse 10 2>&1 | filter | tail -5
 report "client reuses its item buffer across DELETE" "${PIPESTATUS[0]}" 134

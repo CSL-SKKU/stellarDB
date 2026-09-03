@@ -415,27 +415,18 @@ again:
                                   0);
         }
         break;
-      case ADD:
-        tree = centree_lookup_and_reserve(callback->item, 
-                          &callback->slab_idx, &e);
-        if (e) {
-          die("Adding item that is already in the database! Use upsert "
-              "instead! (This error might also appear if 2 keys have the same "
-              "prefix, TODO: make index more robust to that.)\n");
-        } else {
-          callback->slab = tree->slab;
-          //callback->slab =
-          //    get_slab(ctx, callback->item, &callback->slab_idx, e);
-          add_time_in_payload(callback, TIMING_STAGE_STORAGE_TARGET_READY);
-          add_item_async(callback);
-        }
-        break;
       case DELETE:
         if (item_is_legacy(callback->item))
           die("Attempted to delete with legacy item metadata\n");
         item_encode_tombstone(callback->item);
 
         /* fall through */
+      case ADD:
+        /*
+         * ADD is an alias of UPSERT. The KVell ADD died on a duplicate key;
+         * for a new key the two paths were identical, and the duplicate check
+         * made the load phase abort on a deleted-then-re-added key.
+         */
       case UPSERT:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
