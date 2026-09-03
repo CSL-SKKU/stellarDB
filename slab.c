@@ -460,6 +460,7 @@ struct slab *close_and_create_slab(struct slab *s) {
   uint64_t range_max;
 
   tnt_split_phase_enter();
+  RSTAT_INC(splits);
   R_LOCK(&s->tree_lock);
   range_min = __atomic_load_n(&s->min, __ATOMIC_ACQUIRE);
   range_max = __atomic_load_n(&s->max, __ATOMIC_ACQUIRE);
@@ -926,6 +927,7 @@ void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item) {
   R_UNLOCK(&old_s->tree_lock);
   if (!source_ok) {
     __sync_fetch_and_sub(&s->nb_items, 1);
+    RSTAT_INC(reins_abandoned);
     goto skip;
   }
 
@@ -939,9 +941,11 @@ void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item) {
   if (tnt_index_lookup_utree(s->subtree, item) != NULL) {
     __sync_fetch_and_sub(&s->nb_items, 1);
     W_UNLOCK(&s->tree_lock);
+    RSTAT_INC(reins_abandoned);
     goto skip;
   }
   tnt_index_add_shy(cb, item);
+  RSTAT_INC(reins_published);
   __sync_fetch_and_add(&nb_totals, 1);
   slab_widen_range(s, key);
   W_UNLOCK(&s->tree_lock);

@@ -21,6 +21,8 @@ static void print_help(char *n) {
   puts("  -e, --epoch <number>            set EPOCH");
   puts("  -r, --with-reins                enable reinsertion logic");
   puts("  -R, --with-rebal                enable rebalancing logic");
+  puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
+  puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
   puts("  -p, --with-prune                enable pruning logic");
   puts("      --prune-margin <slots>      slots kept free in a merged slab");
   puts("      --prune-min-age <slabs>     skip triples whose leaf is newer than this");
@@ -48,6 +50,8 @@ int main(int argc, char **argv) {
         {"epoch",           required_argument, 0, 'e'},
         {"with-reins",      no_argument,       0, 'r'},
         {"with-rebal",      no_argument,       0, 'R'},
+        {"rebalance-threshold", required_argument, 0, 1004},
+        {"util-gate",       no_argument,       0, 1005},
         {"with-prune",      no_argument,       0, 'p'},
         {"prune-margin",    required_argument, 0, 1000},
         {"prune-min-age",   required_argument, 0, 1001},
@@ -74,6 +78,8 @@ int main(int argc, char **argv) {
         case 'e': cfg.epoch           = strtoul(optarg, NULL, 0); break;
         case 'r': cfg.with_reins      = 1;                       break;
         case 'R': cfg.with_rebal      = 1;                       break;
+        case 1004: cfg.rebalance_threshold = strtod(optarg, NULL); break;
+        case 1005: cfg.util_gate = 1; break;
         case 'p': cfg.with_prune      = 1;                       break;
         case 1000: cfg.prune_margin   = strtoul(optarg, NULL, 0); break;
         case 1001: cfg.prune_min_age  = strtoul(optarg, NULL, 0); break;
@@ -143,10 +149,10 @@ int main(int argc, char **argv) {
     printf("# \tPruning trigger: stale ratio >= %.2f, measured every %lu ms\n",
            cfg.prune_stale_ratio, cfg.prune_period_ms);
   if (cfg.with_rebal) {
-    printf("# \tRebalancing thresholds: distributor >= %u%%, "
-           "I/O worker <= %u%%, depth > log2(nodes) * %.2f\n",
-           DISTRIBUTOR_HIGH_UTIL, IO_WORKER_LOW_UTIL,
-           (double)REBALANCE_THRESHOLD);
+    printf("# \tRebalancing threshold: depth > ceil(log2(nodes+1)) * %.2f "
+           "(checked every %lu ms; utilization gate %s)\n",
+           cfg.rebalance_threshold, cfg.prune_period_ms,
+           cfg.util_gate ? "required" : "off, sampled only");
   }
 
   /* Initialization of random library */
@@ -187,6 +193,9 @@ int main(int argc, char **argv) {
   print = 1;
   cache_hit = 0;
   merged = 0;
+  print_restructuring_stats("load");
+  prune_scan_report("load");
+  reset_restructuring_stats();
 
   //if (w.api == &BGWORK) {
   //  start_timer {
@@ -219,6 +228,8 @@ int main(int argc, char **argv) {
 
   if (cfg.with_reins)
     fsst_worker_init();
+
+  utilization_sampler_init();
 
   /* Launch benchs */
   foreach (workload, workloads) {

@@ -107,6 +107,7 @@ int tnt_index_invalid(void *item);
 uint64_t tnt_get_depth(void);
 uint64_t tnt_get_node_count(void);
 bool tnt_rebalancing_needed(void);
+void prune_scan_report(const char *phase);
 void tnt_print(void);
 
 enum tnt_rebalance_status {

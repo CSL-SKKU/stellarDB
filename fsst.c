@@ -51,6 +51,7 @@ static void *fsst_worker(void *pdata) {
       R_UNLOCK(&s->tree_lock);
 
       printf("GC: %lu\n", s->seq);
+      RSTAT_INC(reins_slabs);
       size_t nread = pread(s->fd, gc_buf, slab_data_size(s), 0);
       if (nread < 0) perror("pread GC");
 
@@ -118,6 +119,7 @@ static void *fsst_worker(void *pdata) {
             
             /* empty slot; no need for reinsertion */
             if (item_is_empty(meta)) goto skip;
+            RSTAT_INC(reins_examined);
 
             /*
              * The source slab's subtree is freed under its write lock when it
@@ -203,6 +205,7 @@ static void *fsst_worker(void *pdata) {
             cb->lru_entry = NULL;
             cb->io_cb(cb);
             updated++;
+            RSTAT_INC(reins_issued);
             continue;
           skip:
             free(cb->item);

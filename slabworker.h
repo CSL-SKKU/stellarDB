@@ -34,6 +34,7 @@ int get_nb_distributors(void);
 unsigned int get_distributor_utilization(void);
 unsigned int get_io_worker_utilization(void);
 int restructuring_worker_init(void);
+void utilization_sampler_init(void);
 void *kv_read_sync(void *item);  // Unsafe
 struct pagecache *get_pagecache(struct slab_context *ctx);
 struct pagecache *get_scancache(struct slab_context *ctx);

@@ -17,6 +17,28 @@ enum timing_stage {
   TIMING_STAGE_REQUEST_COMPLETE,
 };
 
+/*
+ * Restructuring counters: did each mechanism actually fire, how often, and how
+ * long it held the tree. Relaxed atomics, bumped from any thread.
+ */
+struct restructuring_stats {
+  uint64_t splits;
+  uint64_t worker_wakeups, worker_gate_open, rebalance_needed;
+  uint64_t rebalance_calls, rebalance_success, rebalance_noop, rebalance_failed;
+  uint64_t rebalance_us, rebalance_max_us;
+  uint64_t reins_queued, reins_slabs, reins_examined, reins_issued;
+  uint64_t reins_published, reins_abandoned;
+  uint64_t prune_bursts, prune_calls, prune_done, prune_noop, prune_dropped;
+  uint64_t prune_failed, prune_us, prune_max_us;
+  uint64_t prune_stale_last, prune_reserved_last; /* last -C measurement */
+};
+extern struct restructuring_stats rstats;
+#define RSTAT_ADD(field, n) __atomic_fetch_add(&rstats.field, (uint64_t)(n), __ATOMIC_RELAXED)
+#define RSTAT_INC(field) RSTAT_ADD(field, 1)
+void rstat_max(uint64_t *slot, uint64_t v);
+void print_restructuring_stats(const char *phase);
+void reset_restructuring_stats(void);
+
 void add_timing_stat(uint64_t elapsed);
 void print_stats(void);
 

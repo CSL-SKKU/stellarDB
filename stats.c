@@ -36,6 +36,45 @@ int cmp_uint(const void *_a, const void *_b) {
     return 0;
 }
 
+struct restructuring_stats rstats;
+
+void rstat_max(uint64_t *slot, uint64_t v) {
+  uint64_t cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
+  while (v > cur &&
+         !__atomic_compare_exchange_n(slot, &cur, v, 1, __ATOMIC_RELAXED,
+                                      __ATOMIC_RELAXED))
+    ;
+}
+
+void reset_restructuring_stats(void) {
+  memset(&rstats, 0, sizeof(rstats));
+}
+
+/* One block per phase; every line is "#R <phase> key=value ..." for grep. */
+void print_restructuring_stats(const char *phase) {
+  struct restructuring_stats r;
+  memcpy(&r, &rstats, sizeof(r));
+  printf("#R %s tree: nodes=%lu depth=%lu splits=%lu\n", phase,
+         tnt_get_node_count(), tnt_get_depth(), r.splits);
+  printf("#R %s worker: wakeups=%lu gate_open=%lu rebalance_needed=%lu\n",
+         phase, r.worker_wakeups, r.worker_gate_open, r.rebalance_needed);
+  printf("#R %s rebalance: calls=%lu success=%lu noop=%lu failed=%lu "
+         "total_ms=%.1f max_ms=%.1f\n", phase, r.rebalance_calls,
+         r.rebalance_success, r.rebalance_noop, r.rebalance_failed,
+         r.rebalance_us / 1000.0, r.rebalance_max_us / 1000.0);
+  printf("#R %s reinsertion: slabs_queued=%lu slabs_processed=%lu "
+         "slots_examined=%lu copies_issued=%lu published=%lu abandoned=%lu\n",
+         phase, r.reins_queued, r.reins_slabs, r.reins_examined,
+         r.reins_issued, r.reins_published, r.reins_abandoned);
+  printf("#R %s prune: bursts=%lu calls=%lu done=%lu noop=%lu dropped=%lu "
+         "failed=%lu total_ms=%.1f max_ms=%.1f\n", phase, r.prune_bursts,
+         r.prune_calls, r.prune_done, r.prune_noop, r.prune_dropped,
+         r.prune_failed, r.prune_us / 1000.0, r.prune_max_us / 1000.0);
+  printf("#R %s prune-stale: stale=%lu reserved=%lu ratio=%.3f\n", phase,
+         r.prune_stale_last, r.prune_reserved_last,
+         r.prune_reserved_last ? (double)r.prune_stale_last / r.prune_reserved_last : 0.0);
+}
+
 void print_stats(void) {
   uint64_t avg = 0;
 

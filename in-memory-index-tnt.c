@@ -599,7 +599,12 @@ bool tnt_rebalancing_needed(void) {
 
   if (node_count <= 1)
     return false;
-  return (double)depth > log2((double)node_count) * REBALANCE_THRESHOLD;
+  /*
+   * A perfectly balanced tree of n nodes has ceil(log2(n + 1)) levels, so a
+   * threshold of 1.0 means "rebalance unless the tree is perfectly balanced".
+   */
+  return (double)depth >
+         ceil(log2((double)node_count + 1.0)) * cfg.rebalance_threshold;
 }
 
 static void centree_worker_insert(int worker_id, void *item, tree_entry_t *e) {
@@ -1253,11 +1258,14 @@ void tnt_print(void) {
 
 int tnt_rebalancing(void) {
   struct centree_balance_plan *plan = NULL;
+  struct timeval t0, t1;
   int result;
 
   if (centree_root == NULL)
     return -EINVAL;
 
+  RSTAT_INC(rebalance_calls);
+  gettimeofday(&t0, NULL);
   tnt_maintenance_lock();
   restructuring_phase_enter();
 
@@ -1288,5 +1296,18 @@ int tnt_rebalancing(void) {
 
   restructuring_phase_exit();
   tnt_maintenance_unlock();
+  gettimeofday(&t1, NULL);
+  {
+    uint64_t us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
+                  (uint64_t)(t1.tv_usec - t0.tv_usec);
+    RSTAT_ADD(rebalance_us, us);
+    rstat_max(&rstats.rebalance_max_us, us);
+  }
+  if (result == TNT_REBALANCE_SUCCESS)
+    RSTAT_INC(rebalance_success);
+  else if (result == TNT_REBALANCE_NOOP)
+    RSTAT_INC(rebalance_noop);
+  else
+    RSTAT_INC(rebalance_failed);
   return result;
 }

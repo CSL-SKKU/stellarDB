@@ -393,6 +393,7 @@ again:
                     &s->queued, &expected, 1, memory_order_acq_rel,
                     memory_order_acquire)) {
               printf("Reinsert: %lu\n", s->seq);
+              RSTAT_INC(reins_queued);
               bgq_enqueue(GC, s);
             }
           }
@@ -577,10 +578,15 @@ static void *worker_restructuring_init(void *pdata) {
 
   while (1) {
     pthread_mutex_lock(&restructuring_lock);
-    if (cfg.prune_auto) {
+    {
       /*
-       * -C: wake at least once per period to measure the stale ratio, on top
-       * of the utilization-driven signals.
+       * Periodic: wake once per period and check the structural conditions
+       * (depth for rebalancing, stale ratio for -C pruning). The utilization
+       * gate used to stand in front of both; it measured queue-empty time,
+       * which a closed-loop benchmark keeps near zero for every pool, and
+       * booked time blocked in io_getevents as busy, so it never opened on a
+       * disk-bound run. --util-gate puts it back in front; by default it is
+       * only sampled for the statistics.
        */
       struct timespec deadline;
 
@@ -595,15 +601,20 @@ static void *worker_restructuring_init(void *pdata) {
              pthread_cond_timedwait(&restructuring_cond, &restructuring_lock,
                                     &deadline) == 0)
         ;
-    } else {
-      while (!restructuring_requested)
-        pthread_cond_wait(&restructuring_cond, &restructuring_lock);
     }
     restructuring_requested = 0;
     pthread_mutex_unlock(&restructuring_lock);
 
-    while (cfg.with_rebal && restructuring_utilization_thresholds_met() &&
-           tnt_rebalancing_needed()) {
+    RSTAT_INC(worker_wakeups);
+    int gate_ok = restructuring_utilization_thresholds_met();
+    if (gate_ok)
+      RSTAT_INC(worker_gate_open);
+    if (cfg.util_gate && !gate_ok)
+      continue;
+    if (cfg.with_rebal && tnt_rebalancing_needed())
+      RSTAT_INC(rebalance_needed);
+
+    while (cfg.with_rebal && tnt_rebalancing_needed()) {
       int status = tnt_rebalancing();
 
       if (status >= 0)
@@ -618,10 +629,9 @@ static void *worker_restructuring_init(void *pdata) {
      * exclusive; the mutex is there for the callers in main.c and the tests.
      *
      * -C: prune while the stale-slot ratio is at or above the threshold and a
-     * candidate exists, whatever the CPU looks like. A dropped candidate
-     * (-EAGAIN/-EBUSY/-ENOSPC) ends the burst: the scan would hand back the
-     * same triple, and the next period retries. Without -C: one prune per
-     * wake-up, behind the utilization gate, as before.
+     * candidate exists. A dropped candidate (-EAGAIN/-EBUSY/-ENOSPC) ends the
+     * burst: the scan would hand back the same triple, and the next period
+     * retries. Without -C (-p): one prune per wake-up.
      */
     if (cfg.prune_auto) {
       struct prune_stale m;
@@ -629,6 +639,8 @@ static void *worker_restructuring_init(void *pdata) {
       int status = TNT_PRUNE_NOOP;
 
       prune_stale_measure(&m);
+      __atomic_store_n(&rstats.prune_stale_last, (uint64_t)m.stale, __ATOMIC_RELAXED);
+      __atomic_store_n(&rstats.prune_reserved_last, (uint64_t)m.reserved, __ATOMIC_RELAXED);
       while (prune_stale_ratio(&m) >= cfg.prune_stale_ratio) {
         status = tnt_prune_once();
         if (status != TNT_PRUNE_DONE)
@@ -636,13 +648,15 @@ static void *worker_restructuring_init(void *pdata) {
         done++;
         prune_stale_measure(&m);
       }
-      if (done)
+      if (done) {
+        RSTAT_INC(prune_bursts);
         printf("Prune trigger: %zu prunes, stale %zu/%zu (%.1f%%)\n", done,
                m.stale, m.reserved, 100.0 * prune_stale_ratio(&m));
+      }
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&
           status != -ENOSPC)
         fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
-    } else if (cfg.with_prune && restructuring_utilization_thresholds_met()) {
+    } else if (cfg.with_prune) {
       int status = tnt_prune_once();
 
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&
@@ -652,6 +666,47 @@ static void *worker_restructuring_init(void *pdata) {
   }
 
   return NULL;
+}
+
+/*
+ * Utilization sampler: one "#U" line per second with the two pool
+ * utilizations the restructuring gate reads, the gate's verdict, the tree
+ * shape and the stale-slot ratio. Started after load, runs until exit.
+ */
+static void *utilization_sampler(void *pdata) {
+  struct timeval t0, now;
+  (void)pdata;
+
+  gettimeofday(&t0, NULL);
+  printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
+         "reins_queued reins_slabs prune_done rebalance_calls\n");
+  while (1) {
+    struct prune_stale m;
+    unsigned int dist = get_distributor_utilization();
+    unsigned int io = get_io_worker_utilization();
+    int gate = dist >= DISTRIBUTOR_HIGH_UTIL && io <= IO_WORKER_LOW_UTIL;
+
+    prune_stale_measure(&m);
+    gettimeofday(&now, NULL);
+    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu\n",
+           (now.tv_sec - t0.tv_sec) + (now.tv_usec - t0.tv_usec) / 1e6, dist,
+           io, gate, tnt_rebalancing_needed() ? 1 : 0, tnt_get_node_count(),
+           tnt_get_depth(), prune_stale_ratio(&m),
+           __atomic_load_n(&rstats.reins_queued, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.reins_slabs, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.prune_done, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED));
+    fflush(stdout);
+    usleep(1000000);
+  }
+  return NULL;
+}
+
+void utilization_sampler_init(void) {
+  pthread_t thread;
+
+  if (pthread_create(&thread, NULL, utilization_sampler, NULL) == 0)
+    pthread_detach(thread);
 }
 
 int restructuring_worker_init(void) {

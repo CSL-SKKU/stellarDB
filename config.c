@@ -78,6 +78,8 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->epoch           = EPOCH;
     cfg->with_reins      = 0;
     cfg->with_rebal      = 0;
+    cfg->rebalance_threshold = REBALANCE_THRESHOLD;
+    cfg->util_gate       = 0;
     cfg->with_prune      = 0;
     cfg->prune_margin    = 0;
     cfg->prune_min_age   = 0;

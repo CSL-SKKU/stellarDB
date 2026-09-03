@@ -459,6 +459,8 @@ void run_workload(struct workload *w, bench_t b) {
   stop_timer("%s - %lu requests (%lu req/s)", w->api->name(b), w->nb_requests,
              w->nb_requests * 1000000 / elapsed);
   print_stats();
+  print_restructuring_stats("run");
+  prune_scan_report("run");
 
   free(pdata);
 }

@@ -16,6 +16,10 @@ struct runtime_config {
     unsigned long      epoch;
     int                with_reins;
     int                with_rebal;
+    /* Rebalance when depth > log2(nodes) * rebalance_threshold. */
+    double             rebalance_threshold;
+    /* --util-gate: also require the (distributor busy, I/O idle) gate. Off. */
+    int                util_gate;
     int                with_prune;
     /* Slots kept free in a merged slab. */
     unsigned long      prune_margin;

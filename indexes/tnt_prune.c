@@ -41,37 +41,65 @@ static int child_flag(centree_node n) {
   return atomic_load_explicit(&n->child_flag, memory_order_acquire);
 }
 
-bool prune_select(centree_node leaf, struct prune_candidate *out) {
+/* Why a leaf was not the leaf of a prunable triple; PRUNE_OK otherwise. */
+enum prune_reject {
+  PRUNE_OK = 0,
+  PRUNE_NO_INNER,      /* leaf has no history parent (history root) */
+  PRUNE_NO_OUTER,      /* inner has no history parent */
+  PRUNE_NOT_HISTORY_CHILD,
+  PRUNE_SAME_SIDE,     /* triple not consecutive in-order */
+  PRUNE_NO_SIB_STAR,
+  PRUNE_INTERNAL_SPLITTING,
+  PRUNE_LEAF_SPLITTING,
+  PRUNE_RETIRED,
+  PRUNE_LEAF_FULL,
+  PRUNE_NO_FIT,
+  PRUNE_TOO_YOUNG,
+  PRUNE_NB_REASONS
+};
+static const char *prune_reject_name[PRUNE_NB_REASONS] = {
+  "ok", "no_inner", "no_outer", "not_history_child", "same_side",
+  "no_sib_star", "internal_splitting", "leaf_splitting", "retired",
+  "leaf_full", "no_fit", "too_young"
+};
+
+/*
+ * `overflow` (may be NULL) receives, for PRUNE_NO_FIT, how many slots the
+ * triple's valid entries exceed one slab by: the distance to prunability.
+ */
+static enum prune_reject prune_select_why(centree_node leaf,
+                                          struct prune_candidate *out,
+                                          size_t *overflow) {
   centree_node inner, outer, sib, star;
   struct slab *ls, *is, *os;
   size_t cold_bound;
   int side;
 
   if (leaf == NULL)
-    return false;
+    return PRUNE_NO_INNER;
 
   inner = centree_lu_parent(leaf);
   if (inner == NULL)
-    return false;
+    return PRUNE_NO_INNER;
   outer = centree_lu_parent(inner);
   if (outer == NULL)
-    return false;
+    return PRUNE_NO_OUTER;
 
   if (inner->lu_child[CENTREE_LU_LEFT] == leaf)
     side = CENTREE_LU_LEFT;
   else if (inner->lu_child[CENTREE_LU_RIGHT] == leaf)
     side = CENTREE_LU_RIGHT;
   else
-    return false;
+    return PRUNE_NOT_HISTORY_CHILD;
 
   /* Opposite sides: only then is the triple consecutive in-order. */
   if (outer->lu_child[!side] != inner)
-    return false;
+    return PRUNE_SAME_SIDE;
 
   sib = inner->lu_child[!side];
   star = outer->lu_child[side];
   if (sib == NULL || star == NULL)
-    return false;
+    return PRUNE_NO_SIB_STAR;
 
   /*
    * Both internals must be fully split -- a half-published split would leave
@@ -80,17 +108,17 @@ bool prune_select(centree_node leaf, struct prune_candidate *out) {
    * rules out a leaf that is mid-split or about to be.
    */
   if (child_flag(inner) != 1 || child_flag(outer) != 1)
-    return false;
+    return PRUNE_INTERNAL_SPLITTING;
   if (child_flag(leaf) != 0)
-    return false;
+    return PRUNE_LEAF_SPLITTING;
   if (retired(leaf) || retired(inner) || retired(outer))
-    return false;
+    return PRUNE_RETIRED;
 
   ls = leaf->value.slab;
   is = inner->value.slab;
   os = outer->value.slab;
   if (atomic_load_explicit(&ls->full, memory_order_acquire))
-    return false;
+    return PRUNE_LEAF_FULL;
 
   /*
    * nb_items is only ever decremented when an entry is invalidated, so it is
@@ -99,8 +127,11 @@ bool prune_select(centree_node leaf, struct prune_candidate *out) {
    * count actually copied.
    */
   cold_bound = is->nb_items + os->nb_items;
-  if (cold_bound + ls->nb_items + cfg.prune_margin > ls->nb_max_items)
-    return false;
+  if (cold_bound + ls->nb_items + cfg.prune_margin > ls->nb_max_items) {
+    if (overflow)
+      *overflow = cold_bound + ls->nb_items + cfg.prune_margin - ls->nb_max_items;
+    return PRUNE_NO_FIT;
+  }
 
   /*
    * A leaf that was created a moment ago is where the writes are going, and
@@ -109,7 +140,7 @@ bool prune_select(centree_node leaf, struct prune_candidate *out) {
    */
   if (cfg.prune_min_age &&
       slab_create_sequence() - ls->seq < cfg.prune_min_age)
-    return false;
+    return PRUNE_TOO_YOUNG;
 
   out->leaf = leaf;
   out->inner = inner;
@@ -119,7 +150,11 @@ bool prune_select(centree_node leaf, struct prune_candidate *out) {
   out->star = star;
   out->side = side;
   out->cold_bound = cold_bound;
-  return true;
+  return PRUNE_OK;
+}
+
+bool prune_select(centree_node leaf, struct prune_candidate *out) {
+  return prune_select_why(leaf, out, NULL) == PRUNE_OK;
 }
 
 /*
@@ -171,6 +206,47 @@ bool prune_scan_for_candidate(struct prune_candidate *out) {
 
   free(leaves);
   return found;
+}
+
+/*
+ * Diagnostic: one full scan, every leaf classified. Answers "was there ever a
+ * candidate, and if not, what stopped the closest triple". Nothing mutates.
+ */
+void prune_scan_report(const char *phase) {
+  centree tree = tnt_centree();
+  struct prune_candidate candidate;
+  centree_node *leaves;
+  size_t capacity, nb = 0, hist[PRUNE_NB_REASONS] = {0};
+  size_t overflow, min_overflow = (size_t)-1, nb_max = 0;
+
+  if (tree == NULL)
+    return;
+  capacity =
+      atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
+  leaves = malloc(capacity * sizeof(*leaves));
+  if (leaves == NULL)
+    return;
+
+  centree_read_in(tree);
+  collect_leaves(tree, centree_read_root(tree), leaves, capacity, &nb);
+  centree_read_out(tree);
+
+  for (size_t i = 0; i < nb; i++) {
+    enum prune_reject why = prune_select_why(leaves[i], &candidate, &overflow);
+    hist[why]++;
+    if (why == PRUNE_NO_FIT && overflow < min_overflow) {
+      min_overflow = overflow;
+      nb_max = leaves[i]->value.slab->nb_max_items;
+    }
+  }
+  free(leaves);
+
+  printf("#R %s prune-scan: leaves=%zu candidates=%zu", phase, nb, hist[PRUNE_OK]);
+  for (int r = 1; r < PRUNE_NB_REASONS; r++)
+    printf(" %s=%zu", prune_reject_name[r], hist[r]);
+  if (hist[PRUNE_NO_FIT])
+    printf(" closest_overflow_slots=%zu slab_slots=%zu", min_overflow, nb_max);
+  printf("\n");
 }
 
 size_t prune_count_candidates(void) {
@@ -837,7 +913,34 @@ uint64_t prune_bad_slot_count(void) {
   return __sync_fetch_and_or(&prune_bad_slots, 0);
 }
 
+static int tnt_prune_once_timed(void);
+
 int tnt_prune_once(void) {
+  struct timeval t0, t1;
+  uint64_t us;
+  int status;
+
+  RSTAT_INC(prune_calls);
+  gettimeofday(&t0, NULL);
+  status = tnt_prune_once_timed();
+  gettimeofday(&t1, NULL);
+  us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
+       (uint64_t)(t1.tv_usec - t0.tv_usec);
+  if (status == TNT_PRUNE_DONE) {
+    RSTAT_INC(prune_done);
+    RSTAT_ADD(prune_us, us);
+    rstat_max(&rstats.prune_max_us, us);
+  } else if (status == TNT_PRUNE_NOOP) {
+    RSTAT_INC(prune_noop);
+  } else if (status == -EAGAIN || status == -EBUSY || status == -ENOSPC) {
+    RSTAT_INC(prune_dropped);
+  } else {
+    RSTAT_INC(prune_failed);
+  }
+  return status;
+}
+
+static int tnt_prune_once_timed(void) {
   struct prune_candidate c;
   struct prune_build b;
   int error;
