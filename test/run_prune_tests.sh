@@ -56,6 +56,13 @@ PRUNE_REINS=1 sandboxed env PRUNE_REINS=1 ./test/test_prune_links 2>&1 | filter 
 report "prune with reinsertion" "${PIPESTATUS[0]}"
 
 echo
+echo "== the automatic trigger (-C) =="
+# The restructuring worker, woken on a timer, must bring the stale-slot ratio
+# under the threshold on its own, and every key must still read correctly.
+sandboxed ./test/test_prune_links auto 2>&1 | filter | grep -E "FAIL|automatic|stale"
+report "automatic pruning brings the stale ratio under the threshold" "${PIPESTATUS[0]}"
+
+echo
 echo "== recovery of a pruned database =="
 DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
 export DBDIR

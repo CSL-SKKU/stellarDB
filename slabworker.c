@@ -577,8 +577,28 @@ static void *worker_restructuring_init(void *pdata) {
 
   while (1) {
     pthread_mutex_lock(&restructuring_lock);
-    while (!restructuring_requested)
-      pthread_cond_wait(&restructuring_cond, &restructuring_lock);
+    if (cfg.prune_auto) {
+      /*
+       * -C: wake at least once per period to measure the stale ratio, on top
+       * of the utilization-driven signals.
+       */
+      struct timespec deadline;
+
+      clock_gettime(CLOCK_REALTIME, &deadline);
+      deadline.tv_sec += cfg.prune_period_ms / 1000;
+      deadline.tv_nsec += (cfg.prune_period_ms % 1000) * 1000000L;
+      if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+      }
+      while (!restructuring_requested &&
+             pthread_cond_timedwait(&restructuring_cond, &restructuring_lock,
+                                    &deadline) == 0)
+        ;
+    } else {
+      while (!restructuring_requested)
+        pthread_cond_wait(&restructuring_cond, &restructuring_lock);
+    }
     restructuring_requested = 0;
     pthread_mutex_unlock(&restructuring_lock);
 
@@ -594,11 +614,35 @@ static void *worker_restructuring_init(void *pdata) {
     }
 
     /*
-     * One prune per wake-up. Both maintenance operations run on this thread,
-     * which is what keeps them exclusive; the mutex is there for the callers
-     * in main.c and the tests.
+     * Both maintenance operations run on this thread, which is what keeps them
+     * exclusive; the mutex is there for the callers in main.c and the tests.
+     *
+     * -C: prune while the stale-slot ratio is at or above the threshold and a
+     * candidate exists, whatever the CPU looks like. A dropped candidate
+     * (-EAGAIN/-EBUSY/-ENOSPC) ends the burst: the scan would hand back the
+     * same triple, and the next period retries. Without -C: one prune per
+     * wake-up, behind the utilization gate, as before.
      */
-    if (cfg.with_prune && restructuring_utilization_thresholds_met()) {
+    if (cfg.prune_auto) {
+      struct prune_stale m;
+      size_t done = 0;
+      int status = TNT_PRUNE_NOOP;
+
+      prune_stale_measure(&m);
+      while (prune_stale_ratio(&m) >= cfg.prune_stale_ratio) {
+        status = tnt_prune_once();
+        if (status != TNT_PRUNE_DONE)
+          break;
+        done++;
+        prune_stale_measure(&m);
+      }
+      if (done)
+        printf("Prune trigger: %zu prunes, stale %zu/%zu (%.1f%%)\n", done,
+               m.stale, m.reserved, 100.0 * prune_stale_ratio(&m));
+      if (status < 0 && status != -EAGAIN && status != -EBUSY &&
+          status != -ENOSPC)
+        fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
+    } else if (cfg.with_prune && restructuring_utilization_thresholds_met()) {
       int status = tnt_prune_once();
 
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&

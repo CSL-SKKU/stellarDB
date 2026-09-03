@@ -200,6 +200,46 @@ size_t prune_count_candidates(void) {
 }
 
 /* ===================================================================== *
+ * The stale-slot estimate (see in-memory-index-tnt.h)
+ * ===================================================================== */
+
+static void sum_stale(centree tree, centree_node n, struct prune_stale *acc) {
+  struct slab *s;
+  size_t reserved, valid;
+
+  if (n == NULL)
+    return;
+  s = n->value.slab;
+  reserved = atomic_load_explicit(&s->last_item, memory_order_acquire);
+  if (reserved > s->nb_max_items)
+    reserved = s->nb_max_items;
+  valid = s->nb_items;
+  if (valid > reserved)
+    valid = reserved;
+  acc->nodes++;
+  acc->reserved += reserved;
+  acc->valid += valid;
+  sum_stale(tree, centree_read_left(tree, n), acc);
+  sum_stale(tree, centree_read_right(tree, n), acc);
+}
+
+void prune_stale_measure(struct prune_stale *out) {
+  centree tree = tnt_centree();
+
+  memset(out, 0, sizeof(*out));
+  if (tree == NULL)
+    return;
+  centree_read_in(tree);
+  sum_stale(tree, centree_read_root(tree), out);
+  centree_read_out(tree);
+  out->stale = out->reserved - out->valid;
+}
+
+double prune_stale_ratio(const struct prune_stale *m) {
+  return m->reserved ? (double)m->stale / (double)m->reserved : 0.0;
+}
+
+/* ===================================================================== *
  * Building the replacement node N
  *
  * N is assembled entirely off to the side: a fresh slab file, a fresh

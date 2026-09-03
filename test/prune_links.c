@@ -1012,7 +1012,16 @@ static void check_prune_config(void) {
 
 /* Prune until nothing is prunable any more. */
 static void check_prune_all(void) {
+  struct prune_stale before, after;
   size_t done = 0;
+
+  /* The stale-slot estimate that the automatic trigger acts on. */
+  prune_stale_measure(&before);
+  check(before.nodes == tnt_get_node_count(),
+        "stale estimate saw %zu nodes, node_count %lu", before.nodes,
+        tnt_get_node_count());
+  check(before.stale > 0, "no stale slot before the sweep although the "
+        "overwrite passes invalidated entries");
 
   for (;;) {
     int r = prune_one();
@@ -1033,6 +1042,19 @@ static void check_prune_all(void) {
   verify_reads("reads across the sweep");
   printf("  %-34s %zu prunes, %lu nodes left\n", "prune sweep", done,
          tnt_get_node_count());
+
+  /* Pruning removes stale slots and nothing else: valid stays, stale drops. */
+  prune_stale_measure(&after);
+  check(after.stale < before.stale,
+        "stale slots did not drop across the sweep (%zu -> %zu)", before.stale,
+        after.stale);
+  check(after.valid <= before.valid,
+        "valid entries grew across the sweep (%zu -> %zu)", before.valid,
+        after.valid);
+  printf("  %-34s %zu/%zu stale (%.1f%%) -> %zu/%zu (%.1f%%)\n",
+         "stale estimate", before.stale, before.reserved,
+         100.0 * prune_stale_ratio(&before), after.stale, after.reserved,
+         100.0 * prune_stale_ratio(&after));
 }
 
 /* The pruned tree must still take writes and serve them. */
@@ -1653,6 +1675,74 @@ static void hole_verify(void) {
            "state after recovery", seq, nb_before - 1);
 }
 
+/* ------------------------------------------ the automatic trigger (-C) */
+
+/*
+ * The same load and overwrite passes as the main run, then the restructuring
+ * worker is started as -C would start it, with a short period and a threshold
+ * the sweep is known to reach. Nobody calls tnt_prune_once() here: the worker
+ * has to notice the stale ratio on its own timer and bring it under the
+ * threshold, and every key must still read as before.
+ */
+static void check_auto_trigger(void) {
+  struct prune_stale m;
+  int waited_ms = 0;
+  size_t nodes_before;
+
+  run_upserts(0, nb_keys);
+  check(tnt_rebalancing() >= 0, "tnt_rebalancing() failed");
+  run_upserts(nb_keys, nb_keys + nb_keys / 2);
+  run_ops(0, nb_keys, 10, 0, 2, 0, 1);
+  run_ops(0, nb_keys, 10, 0, 0, 1, 0);
+  run_ops(0, nb_keys, 10, 0, 3, 0, 1);
+  validate("before the automatic trigger");
+  snapshot_reads(nb_keys + nb_keys / 2);
+  nodes_before = tnt_get_node_count();
+
+  cfg.with_prune = 1;
+  cfg.prune_auto = 1;
+  cfg.prune_stale_ratio = 0.2;
+  cfg.prune_period_ms = 50;
+  prune_stale_measure(&m);
+  check(prune_stale_ratio(&m) >= cfg.prune_stale_ratio,
+        "the load left only %.1f%% stale, below the %.0f%% threshold",
+        100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
+  printf("  %-34s %zu/%zu stale (%.1f%%), threshold %.0f%%\n",
+         "before the automatic trigger", m.stale, m.reserved,
+         100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
+
+  check(restructuring_worker_init() == 0, "restructuring worker did not start");
+  while (waited_ms < 30000) {
+    prune_stale_measure(&m);
+    if (prune_stale_ratio(&m) < cfg.prune_stale_ratio) break;
+    usleep(100000);
+    waited_ms += 100;
+  }
+  /* Park the worker: no more automatic prunes while the checks run. */
+  cfg.prune_auto = 0;
+  cfg.with_prune = 0;
+  tnt_maintenance_lock(); /* waits for a prune in flight */
+  tnt_maintenance_unlock();
+  prune_stale_measure(&m);
+
+  check(prune_stale_ratio(&m) < cfg.prune_stale_ratio,
+        "after %d ms the stale ratio is still %.1f%%", waited_ms,
+        100.0 * prune_stale_ratio(&m));
+  check(tnt_get_node_count() < nodes_before,
+        "the worker pruned nothing (%lu nodes before and after)", nodes_before);
+  check(centree_validate_locked(tnt_centree()),
+        "the routing tree does not validate after automatic pruning");
+  validate("after automatic pruning");
+  verify_reads("reads after automatic pruning");
+  check(count_slab_files() == tnt_get_node_count(),
+        "%zu slab files for %lu nodes after automatic pruning",
+        count_slab_files(), tnt_get_node_count());
+  printf("  %-34s %zu/%zu stale (%.1f%%) after %d ms, %lu -> %lu nodes\n",
+         "automatic pruning", m.stale, m.reserved,
+         100.0 * prune_stale_ratio(&m), waited_ms, nodes_before,
+         tnt_get_node_count());
+}
+
 int main(int argc, char **argv) {
   int verify_only = argc > 1 && !strcmp(argv[1], "verify");
   int hole_punch_mode = argc > 1 && !strcmp(argv[1], "hole-punch");
@@ -1661,8 +1751,10 @@ int main(int argc, char **argv) {
   int verify_consistent = argc > 1 && !strcmp(argv[1], "verify-consistent");
   int crash_split = argc > 1 && !strcmp(argv[1], "crash-split");
   int crash_prune = argc > 1 && !strncmp(argv[1], "crash-prune", 11);
+  int auto_mode = argc > 1 && !strcmp(argv[1], "auto");
   int mode_arg = verify_only || verify_crash || verify_consistent ||
-                 crash_split || crash_prune || hole_punch_mode || hole_verify_mode;
+                 crash_split || crash_prune || hole_punch_mode ||
+                 hole_verify_mode || auto_mode;
 
   if (argc > 1 && !mode_arg) nb_keys = strtoull(argv[1], NULL, 0);
   if (argc > 2) nb_keys = strtoull(argv[2], NULL, 0);
@@ -1693,6 +1785,16 @@ int main(int argc, char **argv) {
       hole_punch();
     else
       hole_verify();
+    if (failures) {
+      printf("== %lu failures ==\n", failures);
+      return 1;
+    }
+    printf("== ok ==\n");
+    return 0;
+  }
+
+  if (auto_mode) {
+    check_auto_trigger();
     if (failures) {
       printf("== %lu failures ==\n", failures);
       return 1;

@@ -157,6 +157,24 @@ bool prune_scan_for_candidate(struct prune_candidate *out);
 size_t prune_count_candidates(void);
 
 /*
+ * The stale-slot estimate: over every node in the routing tree, slots ever
+ * reserved (last_item) against entries still believed valid (nb_items, which
+ * every invalidation and every abandoned slot decrements). stale = reserved -
+ * valid. It undercounts (a missed invalidation, a stale-but-unmarked entry
+ * carried into N, both count as valid) and never overcounts, so acting on it
+ * never prunes too eagerly. A hint, not a snapshot: the counters are read
+ * without locks.
+ */
+struct prune_stale {
+  size_t nodes;
+  size_t reserved;
+  size_t valid;
+  size_t stale;
+};
+void prune_stale_measure(struct prune_stale *out);
+double prune_stale_ratio(const struct prune_stale *m);
+
+/*
  * The replacement node N under construction. Nothing points at it until the
  * history link and routing splice, so an unfinished build can simply be
  * discarded.

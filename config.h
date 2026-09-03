@@ -21,6 +21,10 @@ struct runtime_config {
     unsigned long      prune_margin;
     /* Skip a triple whose leaf is among the newest N slabs (0: no minimum). */
     unsigned long      prune_min_age;
+    /* -C: prune automatically when the stale-slot ratio crosses the threshold. */
+    int                prune_auto;
+    double             prune_stale_ratio;
+    unsigned long      prune_period_ms;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;
