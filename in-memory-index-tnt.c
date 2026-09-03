@@ -1098,8 +1098,7 @@ restart:
   while (n != NULL) {
     struct slab *s = n->value.slab;
 
-    if (index_lookup_step_test_hook != NULL)
-      index_lookup_step_test_hook(n);
+    if (index_lookup_step_test_hook != NULL) index_lookup_step_test_hook(n);
 
     R_LOCK(&s->tree_lock);
     /*
@@ -1114,39 +1113,36 @@ restart:
     }
     tmp_try++;
     tmp = NULL;
-    if (s->min != -1) {
+    if (s->min == -1) goto quick_skip;
 #if WITH_FILTER
-      if (filter_contain(s->filter, (unsigned char *)&key)) {
+    if (!filter_contain(s->filter, (unsigned char *)&key)) goto quick_skip;
 #endif
-	    if (key <= s->max && key >= s->min) {
-	      count++;
-          tmp = subtree_worker_lookup_utree(s->subtree, item);
-	    }
-        if (tmp) {
-          //  && !TEST_INVAL(tmp->slab_idx)
-          //  이 조건을 지웠는데, update의 lock을 최소화하기 위해서
-          //  1. 지운다. 2. 추가한다 이 과정에서 1-2 사이에 있는 중일 수 있음
-          /*
-           * The reference is taken under the lock that found the entry and
-           * after the removed check, so a retired slab can never gain a new
-           * reader. The caller reading the record hands it to the read
-           * completion; any other caller must tnt_index_lookup_unref().
-           */
-          assert(tmp->slab == s);
-          __sync_fetch_and_add(&s->read_ref, 1);
-          e = tmp;
-          R_UNLOCK(&s->tree_lock);
-	          if (tmp_try > try) {
-	            try = tmp_try;
-	            try_key = key;
-	          }
-          //printf("[%lu] try: %d\n", key, try);
-          break;
-        }
-#if WITH_FILTER
-      }
-#endif
+    if (key <= s->max && key >= s->min) {
+      count++;
+      tmp = subtree_worker_lookup_utree(s->subtree, item);
     }
+    if (tmp) {
+      //  && !TEST_INVAL(tmp->slab_idx)
+      //  이 조건을 지웠는데, update의 lock을 최소화하기 위해서
+      //  1. 지운다. 2. 추가한다 이 과정에서 1-2 사이에 있는 중일 수 있음
+      /*
+       * The reference is taken under the lock that found the entry and
+       * after the removed check, so a retired slab can never gain a new
+       * reader. The caller reading the record hands it to the read
+       * completion; any other caller must tnt_index_lookup_unref().
+       */
+      assert(tmp->slab == s);
+      __sync_fetch_and_add(&s->read_ref, 1);
+      e = tmp;
+      R_UNLOCK(&s->tree_lock);
+      if (tmp_try > try) {
+        try = tmp_try;
+        try_key = key;
+      }
+      // printf("[%lu] try: %d\n", key, try);
+      break;
+    }
+quick_skip:
     R_UNLOCK(&s->tree_lock);
 
     // 부모(history) 노드로 이동

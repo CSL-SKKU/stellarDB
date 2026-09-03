@@ -166,11 +166,16 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
 long slab_freeze(struct slab *s, size_t budget);
 
 /*
- * Wait until no write holds a reference on the slab. A slab becomes internal
- * the moment its final slot is *reserved*, but a record is published only when
- * its page write completes, so for a short while after a split an internal
- * slab is not yet immutable. Anyone about to treat it as immutable (the
- * pruner, before snapshotting inner/outer) waits here first.
+ * Wait until no write holds a reference on the slab.
+ * This is to ensure the slab becomes stable, since the internal nodes
+ * may under publish for a brief moment. (not fully immutable yet)
+ * This check is neccessary for immutable-ness, because splits happen
+ * proactively at the moment of the last slot gets reserved, not when the slab
+ * is full with published slots.
+ * Anyone about to treat it as immutable (the pruner, before snapshotting inner/outer)
+ * waits here first.
+ * Should not wait for a slab that is not internal, otherwise it may wait quite a long time,
+ * until that slab also becomes internal.
  */
 void slab_drain_updates(struct slab *s);
 

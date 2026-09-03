@@ -642,26 +642,26 @@ void upsert_item_async(struct slab_callback *callback) {
  */
 void add_item_async_cb1(struct slab_callback *callback) {
   struct slab *s = callback->slab;
-  struct lru *lru_entry = callback->lru_entry;
 
   R_LOCK(&s->tree_lock);
-  if (lru_entry == NULL) {  // no free page, append
-    if (callback->slab_idx + 1 == s->nb_max_items &&
-        callback->slab_idx != callback->fsst_idx) {
-      assert(atomic_load_explicit(&s->full, memory_order_acquire) == 1);
-      assert(atomic_load_explicit(&s->last_item, 
-	     memory_order_acquire) == s->nb_max_items);
-      // s->imm = 1;
-      R_UNLOCK(&s->tree_lock);
-      s = close_and_create_slab(s);
-      R_LOCK(&s->tree_lock);
-    }
-  } else {  // reuse a free spot. Don't forget to add the linked tombstone in
-            // the freelist.
-    die("LRU entry != NULL\n");
+
+  // slab_idx + 1 == s->nb_max_items: we're full
+  // fsst_*: last_item, so we're checking if this is in-place
+  if (callback->slab_idx + 1 == s->nb_max_items &&
+      !(callback->fsst_slab == s && callback->fsst_idx == callback->slab_idx)) {
+    // perform a split
+    assert(atomic_load_explicit(&s->full, memory_order_acquire) == 1);
+    assert(atomic_load_explicit(&s->last_item, 
+      memory_order_acquire) == s->nb_max_items);
+    // s->imm = 1;
+    R_UNLOCK(&s->tree_lock);
+    s = close_and_create_slab(s);
+    R_LOCK(&s->tree_lock);
   }
 
   R_UNLOCK(&s->tree_lock);
+  
+  /* what is this? */
   if (load) {
     W_LOCK(&s->tree_lock);
     s->batched_callbacks[s->nb_batched++] = callback;

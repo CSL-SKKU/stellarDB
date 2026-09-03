@@ -49,8 +49,10 @@ Retrieved from: http://en.literateprograms.org/Red-black_tree_(C)?oldid=16016
  * node/slab only after a grace period.
  */
 typedef struct centree_node_t {
-  _Atomic(uint64_t) key;
-  tree_entry_t value;
+  _Atomic(uint64_t) key;    // it's a routing pivot; it should be presistent
+  tree_entry_t value;       // node's actual payload, like slabs
+  
+  // routing pointers, protected by RCU (centree->topology_rcu)
   struct rcu_ptr left;
   struct rcu_ptr right;
   struct rcu_ptr parent;
@@ -62,8 +64,16 @@ typedef struct centree_node_t {
    * only by the splitter before publication and by the single pruner, so they
    * stay plain.
    */
+  // history pointers. the users must be only: walkers and pruner, if other entities touch any of these,
+  // it should treated as a BUG.
+  // unless there's a pruning, these links are never meant to be changed after the split.
+  // @lu_parent used by upward lookup.
+  // @lu_child is a back pointer of lu_parent, used by pruner to find the history-referencing node of pruning triple.
+  // READers must use @lu_parent lock-free, since they are meant to be used that way.
   _Atomic(struct centree_node_t *) lu_parent;
   struct centree_node_t* lu_child[2];
+  
+  // used to publish the child nodes of this node after the split.
   _Atomic int child_flag;
   /* Advisory maintenance metadata; never used to choose a routing edge. */
   _Atomic(unsigned char) removed;
