@@ -234,6 +234,74 @@ static void test_recovery_rule(void) {
         s->nb_items);
 }
 
+/* ------------------------------------------------------ shy tombstones */
+
+/* A tombstone as the reinsertion worker copies it: both bits set. */
+static unsigned char *fake_shy_tombstone(uint64_t key) {
+  unsigned char *item = fake_item(key, 0);
+  struct item_metadata *meta = (struct item_metadata *)item;
+
+  item_encode_tombstone(meta);
+  item_mark_shy(meta);
+  return item;
+}
+
+static void feed_tomb(struct slab *s, size_t slot, uint64_t key, int expect) {
+  struct slab_callback cb = {.slab = s};
+  unsigned char *item = fake_shy_tombstone(key);
+
+  check(add_existing_item(s, slot, item, &cb) == expect,
+        "add_existing_item(slot %zu, shy tombstone) return value", slot);
+  free(item);
+}
+
+static void test_shy_tombstone(void) {
+  struct slab *src = fake_slab(11), *dst = fake_slab(12), *rec = fake_slab(13);
+  unsigned char *item = fake_shy_tombstone(500);
+  struct item_metadata *meta = (struct item_metadata *)item;
+  struct slab_callback cb = {
+      .slab = dst, .slab_idx = 4, .fsst_slab = src, .fsst_idx = 2};
+  index_entry_t e;
+
+  printf("== shy tombstone ==\n");
+
+  /* The record keeps both bits and its partial-slot size. */
+  check(item_is_tombstone(meta) && item_is_shy(meta),
+        "shy tombstone lost a bit (%zx)", meta->key_size_flags);
+  check(item_stored_size(meta) == sizeof(*meta) + sizeof(uint64_t),
+        "shy tombstone stored size is %zu", item_stored_size(meta));
+
+  /* Copy-forward of a tombstone: published shy, source invalidated. */
+  seed(src, 500, 2);
+  dst->update_ref = 1;
+  dst->nb_items++;
+  cb.item = (char *)item;
+  add_in_tree_for_reinsertion(&cb, item);
+  check(lookup(dst, 500, &e) && sidx_is_shy(e.slab_idx) && GET_SIDX(e.slab_idx) == 4,
+        "shy tombstone was not published");
+  check(lookup(src, 500, &e) && sidx_is_invalid(e.slab_idx),
+        "shy tombstone did not invalidate its source");
+
+  /* A client resurrecting the key later, in a lower slot, still wins. */
+  run_upsert(dst, 3, src, 2, 500);
+  check(lookup(dst, 500, &e) && !sidx_is_shy(e.slab_idx) && GET_SIDX(e.slab_idx) == 3,
+        "client write did not beat the shy tombstone");
+  free(item);
+
+  /* Recovery: a shy tombstone yields to a client record either way round. */
+  feed(rec, 1, 600, 0, 1);
+  feed_tomb(rec, 2, 600, 1);
+  expect_slot(rec, 600, 1, 0, "client record then shy tombstone");
+  feed_tomb(rec, 3, 601, 1);
+  feed(rec, 4, 601, 0, 1);
+  expect_slot(rec, 601, 4, 0, "shy tombstone then client record");
+  /* Alone it is indexed, as shy, so the key reads as deleted. */
+  feed_tomb(rec, 5, 602, 1);
+  expect_slot(rec, 602, 5, 1, "lone shy tombstone");
+  check(rec->nb_items == 3, "nb_items after shy tombstones is %zu, want 3",
+        rec->nb_items);
+}
+
 int main(void) {
   struct item_metadata normal, tomb, empty = {0}, legacy;
 
@@ -324,6 +392,7 @@ int main(void) {
 
   test_completions();
   test_recovery_rule();
+  test_shy_tombstone();
 
   if (failures) {
     printf("== %lu failures ==\n", failures);
