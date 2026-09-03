@@ -14,7 +14,7 @@ report() { # report <name> <exit code> [expected code]
 
 echo "== in-process unit tests (no slab files) =="
 ./test/test_shy >/dev/null 2>&1
-report "shy flag helpers and index slot word" $?
+report "shy flag, index slot word, write completions" $?
 
 echo
 echo "== $pass passed, $fail failed =="

@@ -581,6 +581,7 @@ void upsert_item_async_cb2(struct slab_callback *callback) {
         callback->slab->seq, callback->slab_idx);
 
   if(callback->cb != add_in_tree_for_upsert
+    && callback->cb != add_in_tree_for_reinsertion
     && callback->cb != add_in_tree)
     __sync_fetch_and_sub(&callback->slab->update_ref, 1);
 
@@ -830,11 +831,19 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
     // 그 다음 쓰레드는 스킵해야함.
   e = tnt_index_lookup_utree(s->subtree, item);
   if (e) {
-    if (e->slab_idx > cb->slab_idx) {
+    /*
+     * Two client writes of one key in one slab: the higher slot wins (there is
+     * no request ordering, so either is acceptable). A shy entry -- put there
+     * by reinsertion, a copy of an older value -- never wins against a client
+     * write, whatever its slot: that is the rule that stops a copy-forward
+     * from dropping or shadowing a real write.
+     */
+    if (!sidx_is_shy(e->slab_idx) &&
+        GET_SIDX(e->slab_idx) > GET_SIDX(cb->slab_idx)) {
       __sync_fetch_and_sub(&s->nb_items, 1);
       W_UNLOCK(&s->tree_lock);
       goto skip;
-    } 
+    }
     alrdy = tnt_index_delete(s->subtree, item);
   }
 
@@ -888,6 +897,72 @@ skip:
     free(cb->item);
     free(cb);
   }
+}
+
+void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item) {
+  struct slab *s = cb->slab;
+  struct slab *old_s = cb->fsst_slab;
+  struct item_metadata *meta = (struct item_metadata *)item;
+  char *item_key = &item[sizeof(*meta)];
+  uint64_t key = *(uint64_t *)item_key;
+  index_entry_t *e;
+  int source_ok = 0, removed = 0;
+
+  add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
+
+  /*
+   * The copy is only worth publishing if the record it was taken from is still
+   * the authoritative one. A client write that completed since invalidated
+   * it; a prune that retired the source dropped its index. Either way the
+   * slot just reserved is abandoned: it holds a shy record on disk, so
+   * recovery knows to let any client record for the key beat it.
+   */
+  R_LOCK(&old_s->tree_lock);
+  if (old_s->min != (uint64_t)-1 && old_s->subtree != NULL) {
+    e = tnt_index_lookup_utree(old_s->subtree, item);
+    source_ok = e != NULL && !sidx_is_invalid(e->slab_idx) &&
+                GET_SIDX(e->slab_idx) == cb->fsst_idx;
+  }
+  R_UNLOCK(&old_s->tree_lock);
+  if (!source_ok) {
+    __sync_fetch_and_sub(&s->nb_items, 1);
+    goto skip;
+  }
+
+  W_LOCK(&s->tree_lock);
+  /*
+   * Any entry for the key in the destination -- a client's, or another
+   * copy's -- means somebody got here first. A client write that lands later
+   * replaces a shy entry regardless of slot order (see add_in_tree_for_upsert),
+   * so publishing here is safe against writes still in flight.
+   */
+  if (tnt_index_lookup_utree(s->subtree, item) != NULL) {
+    __sync_fetch_and_sub(&s->nb_items, 1);
+    W_UNLOCK(&s->tree_lock);
+    goto skip;
+  }
+  tnt_index_add_shy(cb, item);
+  __sync_fetch_and_add(&nb_totals, 1);
+  slab_widen_range(s, key);
+  W_UNLOCK(&s->tree_lock);
+
+  add_time_in_payload(cb, TIMING_STAGE_NEW_INDEX_PUBLISHED);
+
+  /* Destination published: the source copy is now the older one. */
+  R_LOCK(&old_s->tree_lock);
+  if (old_s->min == (uint64_t)-1 || old_s->subtree == NULL)
+    removed = 1;
+  else {
+    removed = tnt_index_invalid_utree(old_s->subtree, item);
+    if (removed)
+      __sync_fetch_and_sub(&old_s->nb_items, 1);
+  }
+  R_UNLOCK(&old_s->tree_lock);
+  (void)removed;
+
+skip:
+  __sync_fetch_and_sub(&s->update_ref, 1);
+  slab_release_if_idle(s);
 }
 
 void remove_and_add_item_async(struct slab_callback *callback) {
