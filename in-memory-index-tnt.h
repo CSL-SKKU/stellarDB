@@ -189,6 +189,16 @@ struct prune_build {
   size_t dirty_lo;    /* pages staged but not written yet, [lo, hi) */
   size_t dirty_hi;
   centree_node pivot_from; /* Q: the routing position N will take */
+  /*
+   * Root triple (D == NULL): a live tombstone shadows nothing older than the
+   * triple, so it is not carried into N. Keys whose newest copy in the triple
+   * is such a tombstone go into `dead`, so older copies in later sources are
+   * skipped too (sources are merged newest first).
+   */
+  int drop_tombstones;
+  uint64_t *dead;          /* open-addressing set of dropped keys */
+  size_t dead_cap, dead_nb;
+  int dead_has_zero;
 };
 
 /*

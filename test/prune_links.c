@@ -522,6 +522,34 @@ static void build_expected(centree_node *srcs, int nb_srcs) {
   qsort(exp_list, nb_exp, sizeof(*exp_list), cmp_exp);
 }
 
+/*
+ * Root triple (D == NULL): a key whose winning copy is a tombstone is not
+ * carried into N, since nothing older than the triple exists for it. Drop
+ * those key groups from the expectation. Returns how many keys were dropped.
+ */
+static size_t exp_drop_root_tombstones(void) {
+  size_t out = 0, dropped = 0, i = 0;
+
+  while (i < nb_exp) {
+    size_t j = i;
+    unsigned char rec[4096];
+    int tomb = 0;
+
+    while (j < nb_exp && exp_list[j].key == exp_list[i].key) j++;
+    /* exp_list is sorted by key then rank, so entry i is the winner. */
+    if (read_slot(exp_list[i].src, exp_list[i].slot, rec))
+      tomb = item_is_tombstone((struct item_metadata *)rec);
+    if (tomb) {
+      dropped++;
+    } else {
+      for (size_t k = i; k < j; k++) exp_list[out++] = exp_list[k];
+    }
+    i = j;
+  }
+  nb_exp = out;
+  return dropped;
+}
+
 static void collect_got(struct slab *n) {
   got_cap = n->nb_max_items;
   free(got_list);
@@ -921,10 +949,15 @@ static void check_prune_link(void) {
   srcs[1] = best.inner;
   srcs[2] = best.outer;
   build_expected(srcs, 3);
+  size_t root_tombstones = best.up ? 0 : exp_drop_root_tombstones();
   collect_got(build.slab);
   verify_merged(build.slab, "after link");
-  printf("  %-34s slab %lu, %zu entries (cold<=%zu)\n", "history link", 
-         build.slab->seq, build.count, best.cold_bound);
+  printf("  %-34s slab %lu, %zu entries (cold<=%zu)%s\n", "history link",
+         build.slab->seq, build.count, best.cold_bound,
+         best.up ? "" : " root triple");
+  if (!best.up)
+    printf("  %-34s %zu tombstoned keys left out of N\n", "root triple",
+           root_tombstones);
 
   verify_reads("reads across the history link");
 

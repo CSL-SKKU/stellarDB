@@ -38,7 +38,7 @@
 struct prune_timing {
   uint64_t scan, drain, snap_cold, copy_cold, flush_cold, freeze, copy_leaf,
       finish, headers, splice, retire;
-  uint64_t preads, cold_entries, leaf_entries;
+  uint64_t preads, cold_entries, leaf_entries, tombstones_dropped;
 };
 static struct prune_timing pt;
 
@@ -546,6 +546,95 @@ static void mark_dirty(struct prune_build *b, size_t slot) {
     b->dirty_hi = page + 1;
 }
 
+/* ---- dropped-tombstone key set (root triple only) ---- */
+
+static int dead_set_add(struct prune_build *b, uint64_t key) {
+  if (key == 0) {
+    b->dead_has_zero = 1;
+    return 0;
+  }
+  if (b->dead_nb * 2 >= b->dead_cap) {
+    size_t cap = b->dead_cap ? b->dead_cap * 2 : 1024;
+    uint64_t *bigger = calloc(cap, sizeof(*bigger));
+
+    if (bigger == NULL)
+      return -ENOMEM;
+    for (size_t i = 0; i < b->dead_cap; i++) {
+      uint64_t k = b->dead[i];
+
+      if (k == 0)
+        continue;
+      for (size_t h = (k * 0x9E3779B97F4A7C15ULL) & (cap - 1);; h = (h + 1) & (cap - 1))
+        if (bigger[h] == 0) {
+          bigger[h] = k;
+          break;
+        }
+    }
+    free(b->dead);
+    b->dead = bigger;
+    b->dead_cap = cap;
+  }
+  for (size_t h = (key * 0x9E3779B97F4A7C15ULL) & (b->dead_cap - 1);;
+       h = (h + 1) & (b->dead_cap - 1)) {
+    if (b->dead[h] == key)
+      return 0;
+    if (b->dead[h] == 0) {
+      b->dead[h] = key;
+      b->dead_nb++;
+      return 0;
+    }
+  }
+}
+
+static int dead_set_has(const struct prune_build *b, uint64_t key) {
+  if (key == 0)
+    return b->dead_has_zero;
+  if (b->dead_cap == 0)
+    return 0;
+  for (size_t h = (key * 0x9E3779B97F4A7C15ULL) & (b->dead_cap - 1);;
+       h = (h + 1) & (b->dead_cap - 1)) {
+    if (b->dead[h] == key)
+      return 1;
+    if (b->dead[h] == 0)
+      return 0;
+  }
+}
+
+/*
+ * Un-stage the record at slot `dst` (a superseded copy a root-triple tombstone
+ * would have shadowed). The last staged record moves into the hole so N stays
+ * dense: no empty slot, no stale slot, nothing for the stale estimate to
+ * count.
+ */
+static void build_unstage(struct prune_build *b, uint64_t key, size_t dst) {
+  struct slab *n = b->slab;
+  size_t last = b->count - 1;
+
+  subtree_delete(n->subtree, (unsigned char *)&key, sizeof(key));
+  if (dst != last) {
+    char *from = slot_in_buffer(b, last), *to = slot_in_buffer(b, dst);
+    struct item_metadata *m = (struct item_metadata *)from;
+    uint64_t mkey = *(uint64_t *)(from + sizeof(*m));
+    index_entry_t e;
+    int shy = 0;
+
+    if (subtree_find(n->subtree, (unsigned char *)&mkey, sizeof(mkey), &e))
+      shy = sidx_is_shy(e.slab_idx);
+    subtree_delete(n->subtree, (unsigned char *)&mkey, sizeof(mkey));
+    memcpy(to, from, n->item_size);
+    e.slab = n;
+    e.slab_idx = dst;
+    if (shy)
+      subtree_insert_shy(n->subtree, (unsigned char *)&mkey, sizeof(mkey), &e);
+    else
+      subtree_insert(n->subtree, (unsigned char *)&mkey, sizeof(mkey), &e);
+    mark_dirty(b, dst);
+  }
+  memset(slot_in_buffer(b, last), 0, n->item_size);
+  mark_dirty(b, last);
+  b->count--;
+}
+
 int prune_build_add_source(struct prune_build *b, centree_node source,
                            int override) {
   struct slab *src = source->value.slab;
@@ -641,6 +730,9 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
                             &existing);
     if (replaces && !override)
       continue;
+    /* A younger source's tombstone already killed this key (cold pass). */
+    if (!override && b->drop_tombstones && dead_set_has(b, key))
+      continue;
     if (slot >= src->nb_max_items) {
       error = -EINVAL;
       goto out;
@@ -673,6 +765,25 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
                 "Pruning: slab %lu slot %lu does not hold indexed key %lu; "
                 "skipping it\n",
                 src->seq, slot, key);
+      continue;
+    }
+
+    if (b->drop_tombstones && item_is_tombstone(meta)) {
+      /*
+       * Root triple: nothing older than the triple exists for this key, so
+       * the tombstone only has to defeat copies *inside* the triple. Those
+       * are either already staged (un-stage them) or still to come from an
+       * older source (block them through the dead set). The tombstone itself
+       * is not written.
+       */
+      if (replaces)
+        build_unstage(b, key, dst);
+      else if (!override) {
+        error = dead_set_add(b, key);
+        if (error)
+          goto out;
+      }
+      pt.tombstones_dropped++;
       continue;
     }
 
@@ -759,6 +870,9 @@ void prune_build_release_buffer(struct prune_build *b) {
   if (b->buffer != NULL)
     munmap(b->buffer, pages_for_capacity(b) * PAGE_SIZE);
   b->buffer = NULL;
+  free(b->dead);
+  b->dead = NULL;
+  b->dead_cap = b->dead_nb = 0;
 }
 
 void prune_build_discard(struct prune_build *b) {
@@ -785,6 +899,7 @@ void prune_build_discard(struct prune_build *b) {
   free(b->node);
   if (b->buffer != NULL)
     munmap(b->buffer, pages_for_capacity(b) * PAGE_SIZE);
+  free(b->dead);
   memset(b, 0, sizeof(*b));
 }
 
@@ -857,6 +972,7 @@ int prune_freeze_and_link(const struct prune_candidate *c,
   error = prune_build_begin(c, q, b);
   if (error)
     return error;
+  b->drop_tombstones = (c->up == NULL);
   /*
    * The two internal slabs are only immutable once every write that reserved
    * a slot in them has completed and published: a split happens when the last
@@ -1118,11 +1234,12 @@ static int tnt_prune_once_timed(void) {
   printf("Prune timing (ms): scan=%.1f drain=%.1f snapshot=%.1f copy_cold=%.1f "
          "flush_cold=%.1f freeze=%.1f copy_leaf=%.1f finish=%.1f headers=%.1f "
          "splice=%.1f retire=%.1f | read_batches=%lu cold_entries=%lu "
-         "leaf_entries=%lu merged=%zu\n",
+         "leaf_entries=%lu merged=%zu tombstones_dropped=%lu%s\n",
          pt.scan / 1e3, pt.drain / 1e3, pt.snap_cold / 1e3,
          (pt.copy_cold - pt.snap_cold) / 1e3, pt.flush_cold / 1e3,
          pt.freeze / 1e3, pt.copy_leaf / 1e3, pt.finish / 1e3, pt.headers / 1e3,
          pt.splice / 1e3, pt.retire / 1e3, pt.preads, pt.cold_entries,
-         pt.leaf_entries, b.count);
+         pt.leaf_entries, b.count, pt.tombstones_dropped,
+         c.up == NULL ? " (root triple)" : "");
   return TNT_PRUNE_DONE;
 }
