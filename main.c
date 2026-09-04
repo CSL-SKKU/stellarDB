@@ -193,17 +193,8 @@ int main(int argc, char **argv) {
   print = 1;
   cache_hit = 0;
   merged = 0;
-  print_restructuring_stats("load");
-  prune_scan_report("load");
-  reset_restructuring_stats();
 
-  //if (w.api == &BGWORK) {
-  //  start_timer {
-  //    init_old_keys(w.nb_items_in_db);
-  //  }
-  //  stop_timer("Init array for reinsertion test");
-  //}
-
+  /* Setup, not workload: counted in the load-phase block below. */
   if (cfg.with_rebal) {
     int rebalance_status;
 
@@ -216,6 +207,18 @@ int main(int argc, char **argv) {
     else if (rebalance_status == TNT_REBALANCE_NOOP)
       puts("Rebalancing was not needed");
   }
+
+  print_restructuring_stats("load");
+  prune_scan_report("load");
+  reset_restructuring_stats();
+
+  //if (w.api == &BGWORK) {
+  //  start_timer {
+  //    init_old_keys(w.nb_items_in_db);
+  //  }
+  //  stop_timer("Init array for reinsertion test");
+  //}
+
 
   /* One thread runs both maintenance operations, so they exclude each other. */
   if (cfg.with_rebal || cfg.with_prune) {
