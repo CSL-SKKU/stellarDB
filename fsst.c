@@ -286,6 +286,7 @@ void skip_or_invalidate_index_fsst(void *slab, uint64_t slab_idx) {
   char *src;
 
   cb = malloc(sizeof(*cb));
+  cb->payload = NULL;  /* read by add_time_in_payload()'s write-once test */
   cb->cb = NULL;
   cb->cb_cb = check_and_remove_tree;
   cb->slab = s;

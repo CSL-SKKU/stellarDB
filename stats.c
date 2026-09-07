@@ -268,7 +268,12 @@ void add_time_in_payload(struct slab_callback *c, enum timing_stage origin) {
   payload[pos].time = t;
   payload[pos].origin = origin;
 #else
-  if (origin != TIMING_STAGE_REQUEST_ENQUEUED) return;
+  /*
+   * Write-once: a request is enqueued twice (client -> distributor, then
+   * distributor -> I/O worker after the center-tree descent). Overwriting
+   * here dropped the whole distributor stage from every latency number.
+   */
+  if (origin != TIMING_STAGE_REQUEST_ENQUEUED || c->payload) return;
   uint64_t t;
   rdtscll(t);
   c->payload = (void *)t;

@@ -301,10 +301,12 @@ static void reins_retry_deferred(struct slab_context *ctx) {
 static void enqueue_slab_callback(struct slab_context *ctx,
                                   enum slab_action action,
                                   struct slab_callback *callback) {
+  /* Stamped before the wait: get_slab_buffer() blocks while the queue is
+   * full, and that wait is part of the latency the client sees. */
+  add_time_in_payload(callback, TIMING_STAGE_REQUEST_ENQUEUED);
   size_t buffer_idx = get_slab_buffer(ctx);
   callback->action = action;
   ctx->callbacks[buffer_idx] = callback;
-  add_time_in_payload(callback, TIMING_STAGE_REQUEST_ENQUEUED);
   submit_slab_buffer(ctx, buffer_idx);
 }
 
