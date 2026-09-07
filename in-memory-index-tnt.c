@@ -1159,8 +1159,9 @@ quick_skip:
   
   if (e){
     add_upward_in_lat_ctx(cb, upward_len);
+    cb->upward_len = (uint32_t)upward_len;
     add_scount_in_lat_ctx(cb, count);
-    if (cfg.with_reins)
+    if (cfg.with_reins && !cfg.reins_on_read)
       e->slab->upward_maxlen = upward_len;
     return e;
   }

@@ -74,7 +74,14 @@ struct slab_context {
   uint64_t rdt;  // Latest timestamp
   _Atomic unsigned int utilization;
   _Atomic uint64_t utilization_sample_ms;
+  /* Reinsertion on read: copies whose destination queue was full, retried
+   * by this worker at the top of its loop. Only this thread touches it. */
+#define REINS_DEFER_MAX 256
+  struct slab_callback *reins_deferred[REINS_DEFER_MAX];
+  int nb_reins_deferred;
 } *slab_contexts;
+
+static __thread struct slab_context *my_ctx; /* the worker running this thread */
 
 _Static_assert(DISTRIBUTOR_HIGH_UTIL >= 0 && DISTRIBUTOR_HIGH_UTIL <= 100,
                "DISTRIBUTOR_HIGH_UTIL must be a percentage");
@@ -229,6 +236,68 @@ static struct slab *get_slab(struct slab_context *ctx, void *item,
   return tree->slab;
 }
 
+/*
+ * Non-blocking enqueue: claims a slot only if the queue has room, then the
+ * usual ordered submit (which waits only for concurrent *enqueuers*, never for
+ * the consumer). Returns 0 when the queue is full or the claim raced.
+ */
+static int enqueue_slab_callback_try(struct slab_context *ctx,
+                                     enum slab_action action,
+                                     struct slab_callback *callback) {
+  size_t next = ctx->buffered_callbacks_idx;
+
+  if (next - ctx->processed_callbacks >= ctx->max_pending_callbacks)
+    return 0;
+  if (!__sync_bool_compare_and_swap(&ctx->buffered_callbacks_idx, next, next + 1))
+    return 0;
+  callback->action = action;
+  ctx->callbacks[next % ctx->max_pending_callbacks] = callback;
+  add_time_in_payload(callback, TIMING_STAGE_REQUEST_ENQUEUED);
+  submit_slab_buffer(ctx, next % ctx->max_pending_callbacks);
+  return 1;
+}
+
+int kv_add_async_no_lookup_try(struct slab_callback *callback, struct slab *s,
+                               size_t slab_idx) {
+  struct slab_context *ctx = get_slab_context_uidx((PAGE_SIZE / s->item_size), slab_idx);
+
+  callback->ctx = ctx;
+  callback->slab = s;
+  callback->slab_idx = slab_idx;
+  return enqueue_slab_callback_try(ctx, ADD_NO_LOOKUP, callback);
+}
+
+void reins_defer(struct slab_callback *callback) {
+  struct slab_context *ctx = my_ctx;
+
+  if (ctx == NULL || ctx->nb_reins_deferred == REINS_DEFER_MAX) {
+    /*
+     * No worker context (should not happen) or the list is full: the
+     * reserved slot is abandoned. It stays empty on disk; recovery skips
+     * empty slots. The update reference must still be released.
+     */
+    RSTAT_INC(reins_or_dropped);
+    __sync_fetch_and_sub(&callback->slab->update_ref, 1);
+    slab_release_if_idle(callback->slab);
+    free(callback->item);
+    free(callback);
+    return;
+  }
+  RSTAT_INC(reins_or_deferred);
+  ctx->reins_deferred[ctx->nb_reins_deferred++] = callback;
+}
+
+static void reins_retry_deferred(struct slab_context *ctx) {
+  for (int i = 0; i < ctx->nb_reins_deferred;) {
+    struct slab_callback *cb = ctx->reins_deferred[i];
+
+    if (kv_add_async_no_lookup_try(cb, cb->slab, cb->slab_idx))
+      ctx->reins_deferred[i] = ctx->reins_deferred[--ctx->nb_reins_deferred];
+    else
+      i++;
+  }
+}
+
 static void enqueue_slab_callback(struct slab_context *ctx,
                                   enum slab_action action,
                                   struct slab_callback *callback) {
@@ -357,7 +426,26 @@ again:
         break;
       case READ_NO_LOOKUP: {
         // slab idx에 카운트 담아옴
-	if (cfg.with_reins) {
+	if (cfg.reins_on_read) {
+          /*
+           * On-read mode: no per-read shared counter (48 workers incrementing
+           * one slab's epcnt is a contended cache line on every hot read).
+           * Only the page's hot bit, with the bitmap cleared every 10 epochs.
+           */
+          struct slab *s = callback->slab;
+          uint64_t curr_epoch = atomic_load_explicit(&epoch, memory_order_acquire);
+
+          if (atomic_load_explicit(&s->cur_ep, memory_order_acquire) != curr_epoch) {
+            atomic_store_explicit(&s->cur_ep, curr_epoch, memory_order_release);
+            if (curr_epoch % 10 == 0) {
+              size_t num_words = (((s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE) + 63) / 64;
+              for (size_t i = 0; i < num_words; i++)
+                __atomic_exchange_n(&s->hot_bits[i], 0ULL, __ATOMIC_RELAXED);
+            }
+          }
+          callback->page_was_hot =
+              mark_page_hot_test(s, item_page_num(s, callback->slab_idx));
+        } else if (cfg.with_reins) {
           struct slab *s = callback->slab;
           uint64_t curr_epoch = atomic_load_explicit(&epoch, memory_order_acquire);
           uint64_t slab_epoch = atomic_load_explicit(&s->cur_ep, memory_order_acquire);
@@ -484,6 +572,7 @@ static void *worker_slab_init(void *pdata) {
   printf("[SLAB WORKER %lu] tid %d\n", ctx->worker_id, x);
   pin_me_on(ctx->worker_id);
 
+  my_ctx = ctx;
   /* Create the pagecache for the worker */
   ctx->pagecache = calloc(1, sizeof(*ctx->pagecache));
   page_cache_init(ctx->pagecache);
@@ -497,6 +586,8 @@ static void *worker_slab_init(void *pdata) {
   while (1) {
     ctx->rdt++;
 
+    if (ctx->nb_reins_deferred)
+      reins_retry_deferred(ctx);
     while (io_pending(ctx->io_ctx)) {
       worker_ioengine_enqueue_ios(ctx->io_ctx);
       __1 worker_ioengine_get_completed_ios(ctx->io_ctx);

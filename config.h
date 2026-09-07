@@ -22,6 +22,22 @@ struct runtime_config {
     int                util_gate;
     /* --latency-series <ms>: per-interval latency lines ("#L"); 0 = off. */
     unsigned long      latency_series_ms;
+    /*
+     * --reins-on-read <levels>: reinsertion decided at read completion by the
+     * I/O worker that owns the page, per record, for records found at least
+     * <levels> above the leaf on a page already hot in this epoch. Replaces the
+     * background worker's full-slab pass. 0 = off (with -r: the old worker).
+     */
+    unsigned long      reins_on_read;
+    /* --reins-sample N: copy on one in N qualifying reads (1 = every one). A
+     * key read deep N times is copied with high probability; a key read once
+     * almost never is. Zero-memory stand-in for a per-record hit counter. */
+    unsigned long      reins_sample;
+    /* --reins-depth-ratio th: instead of a fixed level count, copy when the
+     * upward walk exceeded th * ceil(log2(nodes+1)), the depth a balanced tree
+     * would need. Nothing qualifies on a well-shaped tree; stranded records
+     * on long history chains do, whatever the tree size. 0 = use levels. */
+    double             reins_depth_ratio;
     int                with_prune;
     /* Slots kept free in a merged slab. */
     unsigned long      prune_margin;

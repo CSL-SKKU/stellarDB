@@ -24,6 +24,9 @@ static void print_help(char *n) {
   puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
   puts("      --latency-series <ms>       print per-interval latency lines (#L); off by default");
+  puts("      --reins-on-read <levels>    reinsert at read completion, per record found >= <levels> above the leaf (0 = off)");
+  puts("      --reins-sample <N>          on-read: copy on one in N qualifying reads (16)");
+  puts("      --reins-depth-ratio <th>    on-read: copy when upward walk > th * ceil(log2(nodes+1)) (0 = use levels)");
   puts("  -p, --with-prune                enable pruning logic");
   puts("      --prune-margin <slots>      slots kept free in a merged slab");
   puts("      --prune-min-age <slabs>     skip triples whose leaf is newer than this");
@@ -54,6 +57,9 @@ int main(int argc, char **argv) {
         {"rebalance-threshold", required_argument, 0, 1004},
         {"util-gate",       no_argument,       0, 1005},
         {"latency-series",  required_argument, 0, 1006},
+        {"reins-on-read",   required_argument, 0, 1008},
+        {"reins-sample",    required_argument, 0, 1009},
+        {"reins-depth-ratio", required_argument, 0, 1010},
         {"with-prune",      no_argument,       0, 'p'},
         {"prune-margin",    required_argument, 0, 1000},
         {"prune-min-age",   required_argument, 0, 1001},
@@ -82,6 +88,18 @@ int main(int argc, char **argv) {
         case 'R': cfg.with_rebal      = 1;                       break;
         case 1004: cfg.rebalance_threshold = strtod(optarg, NULL); break;
         case 1005: cfg.util_gate = 1; break;
+        case 1010: cfg.reins_depth_ratio = strtod(optarg, NULL);
+                   if (cfg.reins_depth_ratio > 0) {
+                     if (!cfg.reins_on_read) cfg.reins_on_read = 1;
+                     cfg.with_reins = 1;
+                   }
+                   break;
+        case 1009: cfg.reins_sample = strtoul(optarg, NULL, 0);
+                   if (!cfg.reins_sample) cfg.reins_sample = 1;
+                   break;
+        case 1008: cfg.reins_on_read = strtoul(optarg, NULL, 0);
+                   if (cfg.reins_on_read) cfg.with_reins = 1;
+                   break;
         case 1006: cfg.latency_series_ms = strtoul(optarg, NULL, 0);
                    if (cfg.latency_series_ms && cfg.latency_series_ms < 100)
                      cfg.latency_series_ms = 100;
@@ -145,7 +163,17 @@ int main(int argc, char **argv) {
         cfg.insert_mode == DESCEND ? "DESCEND" : 
         cfg.insert_mode == RANDOM ? "RANDOM" : "UNKNOWN");
   printf("# \tChunk for shuffling: %lu\n", cfg.chunk_for_shuffle);
-  printf("# \tReinsertion: %s\n", cfg.with_reins ? "enabled" : "disabled");
+  printf("# \tReinsertion: %s%s\n", cfg.with_reins ? "enabled" : "disabled",
+         cfg.reins_on_read ? " (on-read mode: per record, >= levels above leaf)" : "");
+  if (cfg.reins_on_read) {
+    if (cfg.reins_depth_ratio > 0)
+      printf("# \tReinsert on read: upward walk > %.2f * ceil(log2(nodes+1)), page must be "
+             "hot already, one copy per %lu qualifying reads\n",
+             cfg.reins_depth_ratio, cfg.reins_sample);
+    else
+      printf("# \tReinsert on read: min distance %lu levels, page must be hot already, "
+             "one copy per %lu qualifying reads\n", cfg.reins_on_read, cfg.reins_sample);
+  }
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
   printf("# \tPruning: %s\n", cfg.with_prune ? "enabled" : "disabled");
   if (cfg.latency_series_ms)
@@ -238,7 +266,7 @@ int main(int argc, char **argv) {
               strerror(-worker_status));
   }
 
-  if (cfg.with_reins)
+  if (cfg.with_reins && !cfg.reins_on_read)
     fsst_worker_init();
 
   utilization_sampler_init();

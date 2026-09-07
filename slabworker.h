@@ -13,6 +13,15 @@ void kv_remove_async(struct slab_callback *callback);
 
 void kv_upsert_async_no_lookup(struct slab_callback *callback, struct slab *s,
                                size_t slab_idx);
+/*
+ * Non-blocking variant for I/O-worker-originated writes (reinsertion on
+ * read): returns 1 if enqueued, 0 if the destination queue is full. A worker
+ * must never spin on another worker's queue.
+ */
+int kv_add_async_no_lookup_try(struct slab_callback *callback, struct slab *s,
+                               size_t slab_idx);
+/* Park a copy whose enqueue failed; retried by this worker each loop. */
+void reins_defer(struct slab_callback *callback);
 void kv_add_async_no_lookup(struct slab_callback *callback, struct slab *s,
                             size_t slab_idx);
 

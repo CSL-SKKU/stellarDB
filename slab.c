@@ -1,4 +1,5 @@
 #include "headers.h"
+#include <math.h>
 #include "utils.h"
 #include "items.h"
 #include "slab.h"
@@ -38,6 +39,108 @@ off_t item_page_num(struct slab *s, size_t idx) {
 static off_t item_in_page_offset(struct slab *s, size_t idx) {
   size_t items_per_page = PAGE_SIZE / s->item_size;
   return (idx % items_per_page) * s->item_size;
+}
+
+int mark_page_hot_test(struct slab *s, size_t page_idx) {
+  size_t word_idx = page_idx / 64;
+  uint64_t mask = 1ULL << (page_idx % 64);
+
+  if (word_idx > 255)
+    die("mark_page_hot_test: page %lu out of range on slab %lu\n", page_idx, s->seq);
+  return (__sync_fetch_and_or(&s->hot_bits[word_idx], mask) & mask) != 0;
+}
+
+/* Frees a reinsertion copy's private item and callback (both malloc'ed). */
+static void reins_or_free(struct slab_callback *cb, void *item) {
+  (void)item;
+  free(cb->item);
+  free(cb);
+}
+
+/*
+ * Reinsertion on read (--reins-on-read k). Runs on the I/O worker that owns
+ * the page, at the completion of a client read, with the record bytes in the
+ * cached page. The record is copied forward to the leaf when
+ *   - the read walked at least k levels above the leaf to find it,
+ *   - the page was already hot in this epoch (repeat access), and
+ *   - it is still the authoritative copy and not already at the leaf.
+ * The copy is the same shy, append-only move the background worker makes
+ * (add_in_tree_for_reinsertion decides at completion), but per record, with no
+ * slab read and no separate thread.
+ */
+void reins_on_read_consider(struct slab_callback *callback,
+                            struct item_metadata *meta) {
+  struct slab *s = callback->slab;
+  size_t slot = callback->slab_idx;
+  struct slab_callback *cb;
+  struct tree_entry *tree;
+  index_entry_t *cur, *e = NULL;
+
+  RSTAT_INC(reins_or_seen);
+  if (!callback->page_was_hot)
+    return;
+  if (cfg.reins_depth_ratio > 0) {
+    /* The depth a balanced tree of this size needs; the rebalancer's yardstick. */
+    uint64_t nodes = tnt_get_node_count();
+    double ideal = ceil(log2((double)nodes + 1.0));
+
+    if ((double)callback->upward_len <= cfg.reins_depth_ratio * ideal)
+      return;
+  } else if (callback->upward_len < cfg.reins_on_read + 1) {
+    return;
+  }
+  if (item_is_empty(meta))
+    return;
+  RSTAT_INC(reins_or_deep);
+  if (cfg.reins_sample > 1) {
+    static __thread uint64_t x = 0x9E3779B97F4A7C15ULL;
+
+    x ^= x << 13; x ^= x >> 7; x ^= x << 17; /* xorshift, per worker */
+    if (x % cfg.reins_sample != 0)
+      return;
+  }
+
+  cb = calloc(1, sizeof(*cb));
+  cb->item = malloc(s->item_size);
+  if (cb == NULL || cb->item == NULL)
+    die("reins_on_read: out of memory\n");
+  memcpy(cb->item, meta, s->item_size);
+  cb->fsst_idx = -1;
+  RSTAT_INC(reins_examined);
+
+  /* Authority: the copy we hold must be what a READ returns right now. */
+  cur = tnt_index_lookup(cb, cb->item);
+  {
+    int authoritative = cur != NULL && cur->slab == s &&
+                        GET_SIDX(cur->slab_idx) == slot &&
+                        !sidx_is_invalid(cur->slab_idx);
+
+    tnt_index_lookup_unref(cur);
+    if (!authoritative)
+      goto skip;
+  }
+
+  cb->fsst_slab = s;
+  cb->fsst_idx = slot;
+  tree = centree_lookup_and_reserve(cb->item, &cb->slab_idx, &e);
+  cb->slab = tree->slab;
+  if (cb->slab_idx == (uint64_t)-1) {
+    /* Already at the leaf: nothing to move; give the in-place reference back. */
+    __sync_fetch_and_sub(&cb->slab->update_ref, 1);
+    slab_release_if_idle(cb->slab);
+    goto skip;
+  }
+  item_mark_shy((struct item_metadata *)cb->item);
+  cb->cb = add_in_tree_for_reinsertion; /* decides at completion */
+  cb->cb_cb = reins_or_free;
+  cb->io_cb = add_item_async_cb1;
+  cb->lru_entry = NULL;
+  RSTAT_INC(reins_issued);
+  cb->io_cb(cb); /* split check, then the (non-blocking) enqueue */
+  return;
+skip:
+  free(cb->item);
+  free(cb);
 }
 
 void mark_page_hot(struct slab *s, size_t page_idx) {
@@ -544,6 +647,9 @@ void read_item_async_cb(struct slab_callback *callback) {
       (struct item_metadata *)&disk_page[in_page_offset];
   if (item_is_legacy(meta))
     die("Read encountered legacy item metadata\n");
+  if (cfg.reins_on_read && !load && callback->action == READ_NO_LOOKUP &&
+      callback->upward_len)
+    reins_on_read_consider(callback, meta);
   if (callback->cb)
     callback->cb(callback, item_is_tombstone(meta) ? NULL : meta);
 }
@@ -689,6 +795,11 @@ void add_item_async_cb1(struct slab_callback *callback) {
     return;
   }
 
+  if (cfg.reins_on_read && callback->cb == add_in_tree_for_reinsertion) {
+    if (!kv_add_async_no_lookup_try(callback, callback->slab, callback->slab_idx))
+      reins_defer(callback);
+    return;
+  }
   kv_add_async_no_lookup(callback, callback->slab, callback->slab_idx);
 }
 

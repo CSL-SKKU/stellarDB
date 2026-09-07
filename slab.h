@@ -136,6 +136,8 @@ struct slab_callback {
   };
   struct slab_context *ctx;
   uint64_t user_start;  /* client use: start cycle of a chained request */
+  uint32_t upward_len;  /* READ: levels walked from the leaf to find the record (1 = at leaf) */
+  uint32_t page_was_hot; /* READ_NO_LOOKUP: the page's hot bit was already set */
 };
 
 /*
@@ -255,6 +257,11 @@ void remove_and_add_item_async(struct slab_callback *callback);
 
 off_t item_page_num(struct slab *s, size_t idx);
 void mark_page_hot(struct slab *s, size_t page_idx);
+/* Same, returning whether the bit was already set. */
+int mark_page_hot_test(struct slab *s, size_t page_idx);
+/* Reinsertion on read: decide and issue a copy for the record just read. */
+void reins_on_read_consider(struct slab_callback *callback,
+                            struct item_metadata *meta);
 
 /*
  * Recovery: read every slab header, rebuild both trees, delete the files that

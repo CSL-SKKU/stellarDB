@@ -1,5 +1,6 @@
 // config.c
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include "config.h"
 
@@ -84,6 +85,17 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->rebalance_threshold = REBALANCE_THRESHOLD;
     cfg->util_gate       = 0;
     cfg->latency_series_ms = 0;
+    cfg->reins_on_read   = 0;
+    cfg->reins_sample    = 16;
+    cfg->reins_depth_ratio = 0.0;
+    {
+        /* Tests cannot pass flags; STELLAR_REINS_ON_READ=<levels> turns it on. */
+        const char *env = getenv("STELLAR_REINS_ON_READ");
+        if (env && *env) {
+            cfg->reins_on_read = strtoul(env, NULL, 0);
+            if (cfg->reins_on_read) cfg->with_reins = 1;
+        }
+    }
     cfg->with_prune      = 0;
     cfg->prune_margin    = 0;
     cfg->prune_min_age   = 0;

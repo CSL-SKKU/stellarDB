@@ -197,6 +197,8 @@ void print_restructuring_stats(const char *phase) {
          "slots_examined=%lu copies_issued=%lu published=%lu abandoned=%lu\n",
          phase, r.reins_queued, r.reins_slabs, r.reins_examined,
          r.reins_issued, r.reins_published, r.reins_abandoned);
+  printf("#R %s reins-on-read: reads_seen=%lu deep_and_hot=%lu deferred=%lu dropped=%lu\n",
+         phase, r.reins_or_seen, r.reins_or_deep, r.reins_or_deferred, r.reins_or_dropped);
   printf("#R %s prune: bursts=%lu calls=%lu done=%lu noop=%lu dropped=%lu "
          "failed=%lu total_ms=%.1f max_ms=%.1f\n", phase, r.prune_bursts,
          r.prune_calls, r.prune_done, r.prune_noop, r.prune_dropped,
