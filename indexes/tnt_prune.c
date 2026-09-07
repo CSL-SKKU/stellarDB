@@ -779,11 +779,17 @@ int tnt_migrate_up(centree_node child) {
  * slots nothing is done. The scan takes no lock (the operations re-check
  * their nodes under the maintenance lock and refuse what no longer fits).
  */
-int tnt_compact_once(void) {
+int tnt_compact_once(enum tnt_compact_kind kind) {
   centree tree = tnt_centree();
   centree_node *nodes, best = NULL;
   size_t capacity, nb = 0, best_gain = 0, min_gain = PAGE_SIZE / cfg.kv_size;
+  /* Target cleaner: skip nodes whose stale space is not worth a header commit. */
+  size_t min_stale = full_slab_items() / 64 > min_gain ? full_slab_items() / 64 : min_gain;
+  double best_frac = 0.0;
   int best_migrate = 0, status;
+  int want_migrate = kind != TNT_COMPACT_TARGET && cfg.migrate_th > 0;
+  int want_ratio = kind == TNT_COMPACT_ANY && cfg.compact_ratio > 0;
+  int want_target = kind == TNT_COMPACT_TARGET;
 
   if (tree == NULL)
     return -EINVAL;
@@ -805,8 +811,23 @@ int tnt_compact_once(void) {
       continue;
     node_slots(n, &r, &v);
     stale = r - v;
+    if (want_target) {
+      /*
+       * Highest stale fraction: by the pigeonhole over internal nodes it is at
+       * least the global ratio, so each rebuild frees at least target *
+       * reserved(X) for (1 - target) * reserved(X) written.
+       */
+      double frac = r ? (double)stale / (double)r : 0.0;
+
+      if (stale >= min_stale && (frac > best_frac || (frac == best_frac && stale > best_gain))) {
+        best = n;
+        best_frac = frac;
+        best_gain = stale;
+      }
+      continue;
+    }
     p = centree_lu_parent(n);
-    if (cfg.migrate_th > 0 && v > 0 && node_is_internal(p) &&
+    if (want_migrate && v > 0 && node_is_internal(p) &&
         !atomic_load_explicit(&p->value.slab->superseded, memory_order_acquire)) {
       size_t pr, pv;
 
@@ -823,7 +844,7 @@ int tnt_compact_once(void) {
         continue; /* migration dominates compacting X alone */
       }
     }
-    if (cfg.compact_ratio > 0 && r > 0 && stale >= min_gain &&
+    if (want_ratio && r > 0 && stale >= min_gain &&
         (double)stale / (double)r >= cfg.compact_ratio && stale > best_gain) {
       best = n;
       best_gain = stale;

@@ -66,6 +66,15 @@ struct runtime_config {
     double             compact_ratio;
     double             migrate_th;
     unsigned long      compact_rate_mb;
+    /*
+     * --compact-target e: global target for stale/reserved. While the ratio is
+     * above e the worker rebuilds the internal node with the highest stale
+     * fraction (there is always one at or above the global ratio), spending
+     * --compact-rate-mb per second at most. --compact-hard-cap h: above h the
+     * budget is bypassed and the cleaner runs unthrottled. 0 = off.
+     */
+    double             compact_target;
+    double             compact_hard_cap;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;

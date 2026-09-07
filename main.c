@@ -38,6 +38,8 @@ static void print_help(char *n) {
   puts("      --compact-ratio <0..1>      segment compaction: rebuild an internal node whose stale fraction >= r (0 = off)");
   puts("      --migrate-th <0..1>         migration: move a node into its history parent when both fit in t * capacity (0 = off)");
   puts("      --compact-rate-mb <n>       byte budget for rebuild writes, MB/s (0 = unlimited)");
+  puts("      --compact-target <0..1>     keep stale/reserved <= this: rebuild the most-stale internal node while above (0 = off)");
+  puts("      --compact-hard-cap <0..1>   above this stale/reserved ratio the byte budget is ignored (0 = none)");
   puts("  -n, --items <number>            set number of items in DB");
   puts("  -q, --requests <number>         set number of requests");
   puts("  -c, --chunk <number>            chunk size for shuffling");
@@ -76,6 +78,8 @@ int main(int argc, char **argv) {
         {"compact-ratio",   required_argument, 0, 1013},
         {"migrate-th",      required_argument, 0, 1014},
         {"compact-rate-mb", required_argument, 0, 1015},
+        {"compact-target",  required_argument, 0, 1016},
+        {"compact-hard-cap", required_argument, 0, 1017},
         {"items",           required_argument, 0, 'n'},
         {"requests",        required_argument, 0, 'q'},
         {"chunk",           required_argument, 0, 'c'},
@@ -131,6 +135,8 @@ int main(int argc, char **argv) {
         case 1013: cfg.compact_ratio   = strtod(optarg, NULL);   break;
         case 1014: cfg.migrate_th      = strtod(optarg, NULL);   break;
         case 1015: cfg.compact_rate_mb = strtoul(optarg, NULL, 0); break;
+        case 1016: cfg.compact_target  = strtod(optarg, NULL);   break;
+        case 1017: cfg.compact_hard_cap = strtod(optarg, NULL);  break;
         case 'n': cfg.nb_items_in_db  = strtoull(optarg, NULL, 0); break;
         case 'q': cfg.nb_requests     = strtoull(optarg, NULL, 0); break;
         case 'c': cfg.chunk_for_shuffle = strtoull(optarg, NULL, 0); break;
@@ -206,10 +212,13 @@ int main(int argc, char **argv) {
   if (cfg.prune_auto)
     printf("# \tPruning trigger: stale ratio >= %.2f, measured every %lu ms\n",
            cfg.prune_stale_ratio, cfg.prune_period_ms);
-  if (cfg.compact_ratio > 0 || cfg.migrate_th > 0)
+  if (cfg.compact_ratio > 0 || cfg.migrate_th > 0 || cfg.compact_target > 0)
     printf("# \tSegment compaction: compact at stale >= %.2f, migrate when fit <= %.2f, "
            "budget %lu MB/s (0 = unlimited), checked every %lu ms\n",
            cfg.compact_ratio, cfg.migrate_th, cfg.compact_rate_mb, cfg.prune_period_ms);
+  if (cfg.compact_target > 0)
+    printf("# \tCompaction target: stale/reserved <= %.2f (hard cap %.2f, 0 = none)\n",
+           cfg.compact_target, cfg.compact_hard_cap);
   if (cfg.with_rebal) {
     printf("# \tRebalancing threshold: depth > ceil(log2(nodes+1)) * %.2f "
            "(checked every %lu ms; utilization gate %s)\n",
@@ -285,7 +294,7 @@ int main(int argc, char **argv) {
 
   /* One thread runs both maintenance operations, so they exclude each other. */
   if (cfg.with_rebal || cfg.with_prune || cfg.compact_ratio > 0 ||
-      cfg.migrate_th > 0) {
+      cfg.migrate_th > 0 || cfg.compact_target > 0) {
     int worker_status = restructuring_worker_init();
 
     if (worker_status < 0)

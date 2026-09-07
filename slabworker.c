@@ -723,55 +723,115 @@ static void *worker_restructuring_init(void *pdata) {
     }
 
     /*
-     * Segment compaction before pruning: migrations empty internal nodes,
-     * which is what makes ILI triples fit. Runs until nothing qualifies or
-     * the byte budget for this period is spent (--compact-rate-mb; the
-     * allowance accrues per period and may bank up to two periods' worth).
+     * Segment compaction before pruning, one period of it per wake so the
+     * ILI pruner keeps its turn (under churn candidates never run out).
+     *   1. one migration if an adjacent pair fits (structural: empties a
+     *      node for ILI);
+     *   2. the global-target cleaner: while stale/reserved > --compact-target
+     *      rebuild the most-stale internal node (or the legacy best-gain pick
+     *      with the absolute --compact-ratio gate);
+     * both charged to the byte budget (--compact-rate-mb, accrued by wall
+     * clock, banked up to two seconds). Above --compact-hard-cap the budget
+     * is bypassed. If the period ran out with work left, the next wake
+     * follows immediately instead of after the timed wait.
      */
-    if (cfg.compact_ratio > 0 || cfg.migrate_th > 0) {
+    if (cfg.compact_ratio > 0 || cfg.migrate_th > 0 || cfg.compact_target > 0) {
       static double allowance = 0.0;
+      static uint64_t last_accrual_ms = 0;
       uint64_t before = __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED);
       uint64_t t_start = now_ms();
+      struct prune_stale m;
+      double ratio0, ratio;
       size_t done = 0;
-      int status = TNT_COMPACT_NOOP;
+      int status = TNT_COMPACT_NOOP, unthrottled = 0;
+      const char *stop = "no more candidates";
 
       if (cfg.compact_rate_mb) {
-        double per_period = cfg.compact_rate_mb * 1e6 * cfg.prune_period_ms / 1000.0;
+        double per_ms = cfg.compact_rate_mb * 1e6 / 1000.0;
 
-        allowance += per_period;
-        if (allowance > 2 * per_period)
-          allowance = 2 * per_period;
+        if (last_accrual_ms == 0)
+          last_accrual_ms = t_start;
+        allowance += per_ms * (double)(t_start - last_accrual_ms);
+        last_accrual_ms = t_start;
+        if (allowance > per_ms * 2000.0)
+          allowance = per_ms * 2000.0;
       }
-      /*
-       * Time-boxed to one period: under churn new candidates appear as fast
-       * as they are consumed, and a loop that runs "until none qualify"
-       * would never hand the worker back to the ILI pruner (it did not, in
-       * the first measurement). The next wake continues where this stopped.
-       */
-      while ((!cfg.compact_rate_mb || allowance > 0) &&
-             now_ms() - t_start < cfg.prune_period_ms) {
-        status = tnt_compact_once();
-        if (status != TNT_COMPACT_DONE)
-          break;
-        done++;
-        if (cfg.compact_rate_mb) {
-          uint64_t now = __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED);
+      prune_stale_measure(&m);
+      ratio0 = ratio = prune_stale_ratio(&m);
+      unthrottled = cfg.compact_hard_cap > 0 && ratio > cfg.compact_hard_cap;
+      if (unthrottled)
+        RSTAT_INC(compact_hard_cap_hits);
 
-          allowance -= (double)(now - before);
-          before = now;
+#define BUDGET_OK() (!cfg.compact_rate_mb || unthrottled || allowance > 0)
+#define CHARGE()                                                              \
+      do {                                                                    \
+        uint64_t now_b = __atomic_load_n(&rstats.rebuild_bytes_written,       \
+                                         __ATOMIC_RELAXED);                   \
+        allowance -= (double)(now_b - before);                                \
+        before = now_b;                                                       \
+      } while (0)
+
+      /* 1. one migration per wake */
+      if (cfg.migrate_th > 0 && BUDGET_OK()) {
+        status = tnt_compact_once(TNT_COMPACT_MIGRATE);
+        if (status == TNT_COMPACT_DONE) {
+          done++;
+          CHARGE();
+          prune_stale_measure(&m);
+          ratio = prune_stale_ratio(&m);
         }
       }
+      /*
+       * 2. the cleaner, with its own time-box: a single 64 MiB rebuild takes
+       * longer than the period, so the box is checked after each rebuild, not
+       * before the first -- while over target at least one rebuild runs per
+       * wake whatever the migration above cost.
+       */
+      t_start = now_ms();
+      for (;;) {
+        if (!BUDGET_OK())
+          break;
+        if (cfg.compact_target > 0) {
+          if (ratio <= cfg.compact_target) {
+            stop = "at target";
+            break;
+          }
+          status = tnt_compact_once(TNT_COMPACT_TARGET);
+        } else if (cfg.compact_ratio > 0) {
+          status = tnt_compact_once(TNT_COMPACT_ANY);
+        } else {
+          break;
+        }
+        if (status != TNT_COMPACT_DONE) {
+          stop = status == TNT_COMPACT_NOOP ? "no more candidates" : strerror(-status);
+          break;
+        }
+        done++;
+        CHARGE();
+        prune_stale_measure(&m);
+        ratio = prune_stale_ratio(&m);
+        stop = "period over";
+        if (now_ms() - t_start >= cfg.prune_period_ms)
+          break;
+      }
+      if (cfg.compact_rate_mb && !unthrottled && allowance <= 0)
+        stop = "budget spent";
       if (done) {
         RSTAT_INC(compact_bursts);
-        printf("Compact trigger: %zu rebuilds (%s)\n", done,
-               status == TNT_COMPACT_NOOP ? "no more candidates"
-               : status == TNT_COMPACT_DONE
-                     ? (cfg.compact_rate_mb && allowance <= 0 ? "budget spent" : "period over")
-                     : strerror(-status));
+        printf("Compact trigger: %zu rebuilds, stale/reserved %.3f -> %.3f (%s%s)\n",
+               done, ratio0, ratio, stop, unthrottled ? ", hard cap, unthrottled" : "");
+      }
+      /* Work left and the period is what stopped us: do not wait for the next tick. */
+      if (!strcmp(stop, "period over")) {
+        pthread_mutex_lock(&restructuring_lock);
+        restructuring_requested = 1;
+        pthread_mutex_unlock(&restructuring_lock);
       }
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&
           status != -ENOSPC && status != -ECANCELED)
         fprintf(stderr, "Background compaction failed: %s\n", strerror(-status));
+#undef BUDGET_OK
+#undef CHARGE
     }
 
     /*

@@ -91,6 +91,8 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->compact_ratio = 0.0;
     cfg->migrate_th = 0.0;
     cfg->compact_rate_mb = 0;
+    cfg->compact_target = 0.0;
+    cfg->compact_hard_cap = 0.0;
     cfg->reins_on_read   = 0;
     cfg->reins_sample    = 16;
     cfg->reins_depth_ratio = 0.0;

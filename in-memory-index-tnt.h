@@ -221,7 +221,15 @@ int tnt_migrate_up(centree_node child);        /* child, parent internal; parent
  * capacity, else self-compaction at stale fraction >= cfg.compact_ratio) and
  * perform it. TNT_COMPACT_NOOP when nothing qualifies.
  */
-int tnt_compact_once(void);
+enum tnt_compact_kind { TNT_COMPACT_ANY = 0, TNT_COMPACT_MIGRATE, TNT_COMPACT_TARGET };
+/*
+ * TNT_COMPACT_MIGRATE: one migration if an adjacent pair fits cfg.migrate_th.
+ * TNT_COMPACT_TARGET: self-compact the internal node with the highest stale
+ * fraction (the global-target cleaner; the caller decides that the ratio is
+ * above target). TNT_COMPACT_ANY: the legacy best-gain pick over both kinds
+ * with the absolute cfg.compact_ratio gate.
+ */
+int tnt_compact_once(enum tnt_compact_kind kind);
 /* Take the write marks of all leaves: the next scan ranks by writes since now. */
 void prune_mark_writes(void);
 int prune_key_held_above(centree_node from, uint64_t key);
