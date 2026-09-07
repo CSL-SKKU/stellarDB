@@ -74,6 +74,7 @@ struct slab {
 
   size_t item_size;
   size_t nb_items;   // Number of non freed items
+  _Atomic size_t nb_tombstones; // tombstones published into this slab (diagnostic, never decremented)
   size_t nb_max_items;
   _Atomic size_t last_item;  // Total number of items, including freed
 

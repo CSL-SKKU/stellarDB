@@ -22,6 +22,15 @@ struct runtime_config {
     int                util_gate;
     /* --latency-series <ms>: per-interval latency lines ("#L"); 0 = off. */
     unsigned long      latency_series_ms;
+    /* --churn-mix U/I/D: percentages of updates, inserts of new keys (top of
+     * the key space) and deletes of the oldest live key; the rest are reads.
+     * Inserts and deletes balance, so the live key count stays constant while
+     * the key window slides upward. */
+    int                churn_upd, churn_ins, churn_del;
+    /* --dump-slabs <s>: heavy monitoring; "#S" line per node every <s> seconds
+     * and at the end of the run (seq, kind, history parent, pivot, key range,
+     * reserved/valid/stale, tombstones written). 0 = off. */
+    unsigned long      dump_slabs_s;
     /*
      * --reins-on-read <levels>: reinsertion decided at read completion by the
      * I/O worker that owns the page, per record, for records found at least

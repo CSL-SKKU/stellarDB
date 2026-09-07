@@ -960,6 +960,8 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   }
 
   tnt_index_add(cb, item);
+  if (item_is_tombstone(meta))
+    atomic_fetch_add_explicit(&s->nb_tombstones, 1, memory_order_relaxed);
 
   if (!alrdy) {
     __sync_fetch_and_add(&nb_totals, 1);

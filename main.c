@@ -24,6 +24,8 @@ static void print_help(char *n) {
   puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
   puts("      --latency-series <ms>       print per-interval latency lines (#L); off by default");
+  puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
+  puts("      --dump-slabs <s>            heavy monitoring: one #S line per slab every <s> s and at the end (0 = off)");
   puts("      --reins-on-read <levels>    reinsert at read completion, per record found >= <levels> above the leaf (0 = off)");
   puts("      --reins-sample <N>          on-read: copy on one in N qualifying reads (16)");
   puts("      --reins-depth-ratio <th>    on-read: copy when upward walk > th * ceil(log2(nodes+1)) (0 = use levels)");
@@ -57,6 +59,8 @@ int main(int argc, char **argv) {
         {"rebalance-threshold", required_argument, 0, 1004},
         {"util-gate",       no_argument,       0, 1005},
         {"latency-series",  required_argument, 0, 1006},
+        {"churn-mix",       required_argument, 0, 1011},
+        {"dump-slabs",      required_argument, 0, 1012},
         {"reins-on-read",   required_argument, 0, 1008},
         {"reins-sample",    required_argument, 0, 1009},
         {"reins-depth-ratio", required_argument, 0, 1010},
@@ -99,6 +103,14 @@ int main(int argc, char **argv) {
                    break;
         case 1008: cfg.reins_on_read = strtoul(optarg, NULL, 0);
                    if (cfg.reins_on_read) cfg.with_reins = 1;
+                   break;
+        case 1012: cfg.dump_slabs_s = strtoul(optarg, NULL, 0); break;
+        case 1011: if (sscanf(optarg, "%d/%d/%d", &cfg.churn_upd, &cfg.churn_ins,
+                              &cfg.churn_del) != 3 ||
+                       cfg.churn_upd + cfg.churn_ins + cfg.churn_del > 100) {
+                     fprintf(stderr, "--churn-mix wants U/I/D percentages summing to <= 100\n");
+                     return 1;
+                   }
                    break;
         case 1006: cfg.latency_series_ms = strtoul(optarg, NULL, 0);
                    if (cfg.latency_series_ms && cfg.latency_series_ms < 100)
@@ -247,6 +259,7 @@ int main(int argc, char **argv) {
 
   print_restructuring_stats("load");
   prune_scan_report("load");
+  prune_stale_distribution_report("load");
   reset_restructuring_stats();
 
   //if (w.api == &BGWORK) {

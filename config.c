@@ -17,6 +17,7 @@ static const struct { const char *name; bench_t b; } bench_table[] = {
     {"ycsb_d_latest",       ycsb_d_latest},
     {"ycsb_f_uniform",      ycsb_f_uniform},
     {"ycsb_f_zipfian",      ycsb_f_zipfian},
+    {"ycsb_churn",          ycsb_churn},
     {"prod1",               prod1},
     {"prod2",               prod2},
     {"dbbench_all_random",  dbbench_all_random},
@@ -85,6 +86,8 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->rebalance_threshold = REBALANCE_THRESHOLD;
     cfg->util_gate       = 0;
     cfg->latency_series_ms = 0;
+    cfg->churn_upd = 50; cfg->churn_ins = 25; cfg->churn_del = 25;
+    cfg->dump_slabs_s = 0;
     cfg->reins_on_read   = 0;
     cfg->reins_sample    = 16;
     cfg->reins_depth_ratio = 0.0;

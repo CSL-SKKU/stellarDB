@@ -124,6 +124,62 @@ static void _launch_ycsb_d(int nb_requests) {
 }
 
 /*
+ * Churn: a sliding window of live keys [lo, hi). An insert takes key hi++
+ * (new keys at the top of the key space, like D), a delete removes key lo++
+ * (the oldest live key), an update rewrites a uniformly random live key, and
+ * the rest are uniform reads of live keys. With inserts == deletes the live
+ * count stays at nb_items while the window climbs: every kind of garbage at
+ * once -- moves, tombstones, whole old slabs draining to zero live records --
+ * plus key-space growth at the top. Percentages from --churn-mix.
+ */
+static _Atomic uint64_t churn_lo, churn_hi;
+
+static void _launch_ycsb_churn(int nb_requests) {
+  declare_periodic_count;
+  long upd = 0, ins = 0, del = 0, reads = 0;
+  int p_upd = cfg.churn_upd, p_ins = p_upd + cfg.churn_ins,
+      p_del = p_ins + cfg.churn_del;
+
+  for (size_t i = 0; i < nb_requests; i++) {
+    struct slab_callback *cb = bench_cb();
+    long r = uniform_next() % 100;
+
+    if (r < p_upd || r >= p_del) {
+      uint64_t lo = atomic_load_explicit(&churn_lo, memory_order_relaxed);
+      uint64_t hi = atomic_load_explicit(&churn_hi, memory_order_relaxed);
+      uint64_t span = hi > lo ? hi - lo : 1;
+      uint64_t key = lo + ((uint64_t)uniform_next() * 2654435761ULL) % span;
+
+      cb->item = _create_unique_item_ycsb(key);
+      if (r < p_upd) {
+        upd++;
+        kv_upsert_async(cb);
+      } else {
+        reads++;
+        kv_read_async(cb);
+      }
+    } else if (r < p_ins) {
+      uint64_t key = atomic_fetch_add_explicit(&churn_hi, 1, memory_order_relaxed);
+
+      cb->item = _create_unique_item_ycsb(key);
+      ins++;
+      kv_upsert_async(cb);
+    } else {
+      uint64_t key = atomic_fetch_add_explicit(&churn_lo, 1, memory_order_relaxed);
+
+      cb->item = _create_unique_item_ycsb(key);
+      del++;
+      kv_remove_async(cb);
+    }
+    periodic_count(1000, "YCSB Load Injector (%lu%%)", i * 100LU / nb_requests);
+  }
+  printf("YCSB churn: %ld updates, %ld inserts, %ld deletes, %ld reads (live window "
+         "[%lu, %lu))\n", upd, ins, del, reads,
+         atomic_load_explicit(&churn_lo, memory_order_relaxed),
+         atomic_load_explicit(&churn_hi, memory_order_relaxed));
+}
+
+/*
  * YCSB F: 50% reads, 50% read-modify-write. An RMW reads the record, changes a
  * byte of the value and writes the whole record back to the same key. As in
  * YCSB the two halves are separate requests with no atomicity; the latency of
@@ -224,6 +280,8 @@ static void launch_ycsb(struct workload *w, bench_t b) {
   uint64_t zero = 0;
 
   atomic_compare_exchange_strong(&ycsb_next_new_key, &zero, w->nb_items_in_db);
+  zero = 0;
+  atomic_compare_exchange_strong(&churn_hi, &zero, w->nb_items_in_db);
   switch (b) {
     case ycsb_a_uniform:
       return _launch_ycsb(0, w->nb_requests_per_thread, 0);
@@ -247,6 +305,8 @@ static void launch_ycsb(struct workload *w, bench_t b) {
       return _launch_ycsb_f(w->nb_requests_per_thread, 0);
     case ycsb_f_zipfian:
       return _launch_ycsb_f(w->nb_requests_per_thread, 1);
+    case ycsb_churn:
+      return _launch_ycsb_churn(w->nb_requests_per_thread);
     default:
       die("Unsupported workload\n");
   }
@@ -277,6 +337,8 @@ static const char *name_ycsb(bench_t w) {
       return "YCSB F - Uniform";
     case ycsb_f_zipfian:
       return "YCSB F - Zipf";
+    case ycsb_churn:
+      return "YCSB churn (update/insert/delete)";
     default:
       return "??";
   }
@@ -295,6 +357,7 @@ static int handles_ycsb(bench_t w) {
     case ycsb_d_latest:
     case ycsb_f_uniform:
     case ycsb_f_zipfian:
+    case ycsb_churn:
       return 1;
     default:
       return 0;

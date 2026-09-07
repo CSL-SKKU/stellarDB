@@ -780,6 +780,13 @@ static void *utilization_sampler(void *pdata) {
   while (1) {
     struct prune_stale m;
 
+    if (tick_ms > 0 && tick_ms % 60000 == 0) {
+      if (cfg.with_prune)
+        prune_scan_report("periodic");
+      prune_stale_distribution_report("periodic");
+    }
+    if (cfg.dump_slabs_s && tick_ms > 0 && tick_ms % (cfg.dump_slabs_s * 1000) == 0)
+      prune_dump_slabs(tick_ms / 1000.0);
     if (cfg.latency_series_ms && tick_ms >= next_l_ms) {
       struct timeval nowl;
 

@@ -181,8 +181,17 @@ static enum prune_reject prune_select_why(centree_node leaf,
     return PRUNE_NOT_HISTORY_CHILD;
 
   /* Opposite sides: only then is the triple consecutive in-order. */
-  if (outer->lu_child[!side] != inner)
+  if (outer->lu_child[!side] != inner) {
+    if (overflow) {
+      /* Diagnostic only: would the three fit, adjacency aside? */
+      struct slab *ls_ = leaf->value.slab, *is_ = inner->value.slab,
+                  *os_ = outer->value.slab;
+      size_t need = is_->nb_items + os_->nb_items + ls_->nb_items + cfg.prune_margin;
+
+      *overflow = need > ls_->nb_max_items ? need - ls_->nb_max_items : 0;
+    }
     return PRUNE_SAME_SIDE;
+  }
 
   sib = inner->lu_child[!side];
   star = outer->lu_child[side];
@@ -305,7 +314,7 @@ void prune_scan_report(const char *phase) {
   struct prune_candidate candidate;
   centree_node *leaves;
   size_t capacity, nb = 0, hist[PRUNE_NB_REASONS] = {0};
-  size_t overflow, min_overflow = (size_t)-1, nb_max = 0;
+  size_t overflow, min_overflow = (size_t)-1, nb_max = 0, same_side_fits = 0;
 
   if (tree == NULL)
     return;
@@ -320,8 +329,11 @@ void prune_scan_report(const char *phase) {
   centree_read_out(tree);
 
   for (size_t i = 0; i < nb; i++) {
+    overflow = (size_t)-1;
     enum prune_reject why = prune_select_why(leaves[i], &candidate, &overflow);
     hist[why]++;
+    if (why == PRUNE_SAME_SIDE && overflow == 0)
+      same_side_fits++;
     if (why == PRUNE_NO_FIT && overflow < min_overflow) {
       min_overflow = overflow;
       nb_max = leaves[i]->value.slab->nb_max_items;
@@ -334,7 +346,143 @@ void prune_scan_report(const char *phase) {
     printf(" %s=%zu", prune_reject_name[r], hist[r]);
   if (hist[PRUNE_NO_FIT])
     printf(" closest_overflow_slots=%zu slab_slots=%zu", min_overflow, nb_max);
-  printf("\n");
+  printf(" same_side_would_fit=%zu\n", same_side_fits);
+}
+
+/*
+ * Diagnostic: where do the stale slots live? For every node (leaf and
+ * internal separately): stale fraction per slab, a histogram by decile, the
+ * share of all stale slots that sit in slabs above 50/80/90% stale, and how
+ * the stale-heavy slabs line up along history (parent also stale-heavy, and
+ * the longest such chain). Nothing mutates.
+ */
+static void collect_nodes(centree tree, centree_node n, centree_node *out,
+                          size_t capacity, size_t *nb) {
+  if (n == NULL)
+    return;
+  if (*nb < capacity)
+    out[(*nb)++] = n;
+  collect_nodes(tree, centree_read_left(tree, n), out, capacity, nb);
+  collect_nodes(tree, centree_read_right(tree, n), out, capacity, nb);
+}
+
+static double node_stale_frac(centree_node n, size_t *reserved_out,
+                              size_t *stale_out) {
+  struct slab *s = n->value.slab;
+  size_t reserved = atomic_load_explicit(&s->last_item, memory_order_acquire);
+  size_t valid = s->nb_items;
+
+  if (reserved > s->nb_max_items) reserved = s->nb_max_items;
+  if (valid > reserved) valid = reserved;
+  *reserved_out = reserved;
+  *stale_out = reserved - valid;
+  return reserved ? (double)(reserved - valid) / reserved : 0.0;
+}
+
+void prune_stale_distribution_report(const char *phase) {
+  centree tree = tnt_centree();
+  centree_node *nodes;
+  size_t capacity, nb = 0;
+  /* [0] internal, [1] leaf */
+  size_t cnt[2] = {0}, hist[2][10] = {{0}}, stale_tot[2] = {0}, res_tot[2] = {0};
+  size_t stale_ge50[2] = {0}, stale_ge80[2] = {0}, stale_ge90[2] = {0};
+  size_t slabs_ge50[2] = {0}, slabs_ge80[2] = {0}, slabs_ge90[2] = {0};
+  size_t pairs50 = 0, heavy50 = 0, longest = 0;
+
+  if (tree == NULL)
+    return;
+  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
+  nodes = malloc(capacity * sizeof(*nodes));
+  if (nodes == NULL)
+    return;
+  centree_read_in(tree);
+  collect_nodes(tree, centree_read_root(tree), nodes, capacity, &nb);
+  centree_read_out(tree);
+
+  for (size_t i = 0; i < nb; i++) {
+    size_t reserved, stale;
+    double f = node_stale_frac(nodes[i], &reserved, &stale);
+    int k = child_flag(nodes[i]) == 1 ? 0 : 1;
+    int b = (int)(f * 10); if (b > 9) b = 9;
+
+    cnt[k]++; hist[k][b]++; stale_tot[k] += stale; res_tot[k] += reserved;
+    if (f >= 0.5) { slabs_ge50[k]++; stale_ge50[k] += stale; }
+    if (f >= 0.8) { slabs_ge80[k]++; stale_ge80[k] += stale; }
+    if (f >= 0.9) { slabs_ge90[k]++; stale_ge90[k] += stale; }
+    if (k == 0 && f >= 0.5) {
+      /* history adjacency among stale-heavy internal nodes */
+      centree_node p = centree_lu_parent(nodes[i]);
+      size_t chain = 1, r2, s2;
+
+      heavy50++;
+      if (p && node_stale_frac(p, &r2, &s2) >= 0.5)
+        pairs50++;
+      while (p && node_stale_frac(p, &r2, &s2) >= 0.5) {
+        chain++;
+        p = centree_lu_parent(p);
+      }
+      if (chain > longest) longest = chain;
+    }
+  }
+  free(nodes);
+
+  for (int k = 0; k < 2; k++) {
+    const char *kind = k ? "leaf" : "internal";
+    double tot = stale_tot[k] ? (double)stale_tot[k] : 1.0;
+
+    printf("#R %s stale-dist %s: slabs=%zu reserved=%zu stale=%zu (%.1f%%) "
+           "hist_decile=%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu "
+           "ge50: slabs=%zu stale_share=%.1f%% ge80: slabs=%zu stale_share=%.1f%% "
+           "ge90: slabs=%zu stale_share=%.1f%%\n",
+           phase, kind, cnt[k], res_tot[k], stale_tot[k],
+           res_tot[k] ? 100.0 * stale_tot[k] / res_tot[k] : 0.0,
+           hist[k][0], hist[k][1], hist[k][2], hist[k][3], hist[k][4],
+           hist[k][5], hist[k][6], hist[k][7], hist[k][8], hist[k][9],
+           slabs_ge50[k], 100.0 * stale_ge50[k] / tot,
+           slabs_ge80[k], 100.0 * stale_ge80[k] / tot,
+           slabs_ge90[k], 100.0 * stale_ge90[k] / tot);
+  }
+  printf("#R %s stale-adjacency: internal_ge50=%zu with_parent_ge50=%zu "
+         "longest_ge50_chain=%zu\n", phase, heavy50, pairs50, longest);
+}
+
+/*
+ * Heavy monitoring (--dump-slabs): one line per node.
+ *   #S <t_s> seq kind hist_parent_seq level pivot min max reserved valid stale tombstones
+ * kind: I internal, L leaf. min/max are the slab's own stored key range.
+ */
+void prune_dump_slabs(double t_s) {
+  centree tree = tnt_centree();
+  centree_node *nodes;
+  size_t capacity, nb = 0;
+
+  if (tree == NULL)
+    return;
+  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
+  nodes = malloc(capacity * sizeof(*nodes));
+  if (nodes == NULL)
+    return;
+  centree_read_in(tree);
+  collect_nodes(tree, centree_read_root(tree), nodes, capacity, &nb);
+  centree_read_out(tree);
+  printf("#S t_s seq kind parent level pivot min max reserved valid stale tombstones (%zu nodes)\n", nb);
+  for (size_t i = 0; i < nb; i++) {
+    centree_node n = nodes[i], p = centree_lu_parent(n);
+    struct slab *s = n->value.slab;
+    size_t reserved = atomic_load_explicit(&s->last_item, memory_order_acquire);
+    size_t valid = s->nb_items;
+
+    if (reserved > s->nb_max_items) reserved = s->nb_max_items;
+    if (valid > reserved) valid = reserved;
+    printf("#S %.0f %lu %c %lu %lu %lu %lu %lu %zu %zu %zu %zu\n", t_s, s->seq,
+           child_flag(n) == 1 ? 'I' : 'L', p ? p->value.slab->seq : 0,
+           (unsigned long)atomic_load_explicit(&n->value.level, memory_order_relaxed),
+           (unsigned long)centree_pivot_load(n), (unsigned long)s->min,
+           (unsigned long)s->max, reserved, valid, reserved - valid,
+           atomic_load_explicit(&s->nb_tombstones, memory_order_relaxed));
+  }
+  fflush(stdout);
+  free(nodes);
 }
 
 size_t prune_count_candidates(void) {

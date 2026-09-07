@@ -464,6 +464,9 @@ void run_workload(struct workload *w, bench_t b) {
   print_stats();
   print_restructuring_stats("run");
   prune_scan_report("run");
+  prune_stale_distribution_report("run");
+  if (cfg.dump_slabs_s)
+    prune_dump_slabs(-1); /* -1: end of run */
 
   free(pdata);
 }

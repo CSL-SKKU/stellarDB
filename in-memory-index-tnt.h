@@ -108,6 +108,8 @@ uint64_t tnt_get_depth(void);
 uint64_t tnt_get_node_count(void);
 bool tnt_rebalancing_needed(void);
 void prune_scan_report(const char *phase);
+void prune_stale_distribution_report(const char *phase);
+void prune_dump_slabs(double t_s);
 void tnt_print(void);
 
 enum tnt_rebalance_status {
