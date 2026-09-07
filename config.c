@@ -1,5 +1,6 @@
 // config.c
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include "config.h"
 
@@ -84,6 +85,12 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->rebalance_threshold = REBALANCE_THRESHOLD;
     cfg->util_gate       = 0;
     cfg->latency_series_ms = 0;
+    cfg->write_window_us = 0;
+    {
+        /* Tests cannot pass flags; STELLAR_WRITE_WINDOW_US turns holding on. */
+        const char *env = getenv("STELLAR_WRITE_WINDOW_US");
+        if (env && *env) cfg->write_window_us = strtoul(env, NULL, 0);
+    }
     cfg->with_prune      = 0;
     cfg->prune_margin    = 0;
     cfg->prune_min_age   = 0;

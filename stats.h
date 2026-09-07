@@ -31,6 +31,7 @@ struct restructuring_stats {
   uint64_t prune_bursts, prune_calls, prune_done, prune_noop, prune_dropped;
   uint64_t prune_failed, prune_us, prune_max_us;
   uint64_t prune_stale_last, prune_reserved_last; /* last -C measurement */
+  uint64_t writes_issued, writes_absorbed, writes_forced; /* group commit */
 };
 extern struct restructuring_stats rstats;
 #define RSTAT_ADD(field, n) __atomic_fetch_add(&rstats.field, (uint64_t)(n), __ATOMIC_RELAXED)

@@ -22,6 +22,13 @@ struct runtime_config {
     int                util_gate;
     /* --latency-series <ms>: per-interval latency lines ("#L"); 0 = off. */
     unsigned long      latency_series_ms;
+    /*
+     * --write-window-us: group commit for page writes. A dirty page is held
+     * for up to this long so later updates to it ride the same write; every
+     * absorbed update is acknowledged when that one write completes. 0 = off
+     * (write-through, one page write per update, the original behaviour).
+     */
+    unsigned long      write_window_us;
     int                with_prune;
     /* Slots kept free in a merged slab. */
     unsigned long      prune_margin;

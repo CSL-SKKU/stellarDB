@@ -497,6 +497,7 @@ static void *worker_slab_init(void *pdata) {
   while (1) {
     ctx->rdt++;
 
+    io_release_due_writes(ctx->io_ctx, 0);
     while (io_pending(ctx->io_ctx)) {
       worker_ioengine_enqueue_ios(ctx->io_ctx);
       __1 worker_ioengine_get_completed_ios(ctx->io_ctx);
@@ -505,7 +506,8 @@ static void *worker_slab_init(void *pdata) {
     }
 
     volatile size_t pending = ctx->sent_callbacks - ctx->processed_callbacks;
-    while (!pending && !io_pending(ctx->io_ctx)) {
+    while (!pending && !io_pending(ctx->io_ctx) &&
+           !io_has_due_writes(ctx->io_ctx)) {
       if (!PINNING) {
         usleep(2);
       } else {

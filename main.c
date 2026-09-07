@@ -24,6 +24,7 @@ static void print_help(char *n) {
   puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
   puts("      --latency-series <ms>       print per-interval latency lines (#L); off by default");
+  puts("      --write-window-us <us>      hold dirty pages up to <us> so updates share one page write (0 = off)");
   puts("  -p, --with-prune                enable pruning logic");
   puts("      --prune-margin <slots>      slots kept free in a merged slab");
   puts("      --prune-min-age <slabs>     skip triples whose leaf is newer than this");
@@ -54,6 +55,7 @@ int main(int argc, char **argv) {
         {"rebalance-threshold", required_argument, 0, 1004},
         {"util-gate",       no_argument,       0, 1005},
         {"latency-series",  required_argument, 0, 1006},
+        {"write-window-us", required_argument, 0, 1007},
         {"with-prune",      no_argument,       0, 'p'},
         {"prune-margin",    required_argument, 0, 1000},
         {"prune-min-age",   required_argument, 0, 1001},
@@ -82,6 +84,7 @@ int main(int argc, char **argv) {
         case 'R': cfg.with_rebal      = 1;                       break;
         case 1004: cfg.rebalance_threshold = strtod(optarg, NULL); break;
         case 1005: cfg.util_gate = 1; break;
+        case 1007: cfg.write_window_us = strtoul(optarg, NULL, 0); break;
         case 1006: cfg.latency_series_ms = strtoul(optarg, NULL, 0);
                    if (cfg.latency_series_ms && cfg.latency_series_ms < 100)
                      cfg.latency_series_ms = 100;
@@ -151,6 +154,9 @@ int main(int argc, char **argv) {
   if (cfg.latency_series_ms)
     printf("# \tLatency series: every %lu ms (#L lines, histogram percentiles)\n",
            cfg.latency_series_ms);
+  printf("# \tWrite window: %lu us (%s)\n", cfg.write_window_us,
+         cfg.write_window_us ? "group commit: dirty pages held, updates share one write"
+                             : "off, write-through");
   if (cfg.with_prune)
     printf("# \tPruning: margin %lu slots, minimum leaf age %lu slabs\n",
            cfg.prune_margin, cfg.prune_min_age);

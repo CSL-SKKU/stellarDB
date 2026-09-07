@@ -1,5 +1,6 @@
 #include "headers.h"
 
+extern int load;
 int cache_hit = 0;
 int merged = 0;
 
@@ -36,8 +37,26 @@ struct linked_callbacks {
   struct slab_callback *callback;
   struct linked_callbacks *next;
 };
+/*
+ * Group commit. A page's first write in a window is parked here instead of
+ * the submission ring; later writes to the same page (lru_entry->dirty, not
+ * yet submitted) attach to the entry. On release the first write goes into the
+ * ring and the attached ones become linked callbacks, so every absorbed update
+ * completes when that single page write completes -- the same durability rule
+ * as write-through, one page write instead of many.
+ */
+#define HELD_MAX 128
+struct held_write {
+  struct lru *lru_entry;
+  struct slab_callback *first;
+  struct linked_callbacks *attached;
+  uint64_t since; /* cycles */
+};
+
 struct io_context {
   aio_context_t ctx __attribute__((aligned(64)));
+  struct held_write held[HELD_MAX];
+  int nb_held;
   volatile size_t sent_io;
   volatile size_t processed_io;
   size_t max_pending_io;
@@ -231,12 +250,37 @@ char *write_page_async(struct slab_callback *callback) {
     struct linked_callbacks *linked_cb;
     linked_cb = malloc(sizeof(*linked_cb));
     linked_cb->callback = callback;
+    /* Held page: ride its pending write; complete when it does. */
+    for (int i = 0; i < ctx->nb_held; i++) {
+      if (ctx->held[i].lru_entry == lru_entry) {
+        linked_cb->next = ctx->held[i].attached;
+        ctx->held[i].attached = linked_cb;
+        RSTAT_INC(writes_absorbed);
+        return disk_page;
+      }
+    }
     linked_cb->next = ctx->linked_callbacks;
     ctx->linked_callbacks = linked_cb;  // link our callback
     return disk_page;
   }
 
   lru_entry->dirty = 1;
+
+  if (cfg.write_window_us && !load) {
+    struct held_write *h;
+
+    if (ctx->nb_held == HELD_MAX) {
+      RSTAT_INC(writes_forced);
+      io_release_due_writes(ctx, 1);
+    }
+    h = &ctx->held[ctx->nb_held++];
+    h->lru_entry = lru_entry;
+    h->first = callback;
+    h->attached = NULL;
+    rdtscll(h->since);
+    return disk_page;
+  }
+  RSTAT_INC(writes_issued);
 
   int buffer_idx = ctx->sent_io % ctx->max_pending_io;
   struct iocb *_iocb = &ctx->iocb[buffer_idx];
@@ -253,6 +297,64 @@ char *write_page_async(struct slab_callback *callback) {
   ctx->sent_io++;
 
   return NULL;
+}
+
+/* Put one held write into the submission ring (the write_page_async tail). */
+static void io_submit_held(struct io_context *ctx, struct held_write *h) {
+  struct slab_callback *callback = h->first;
+  struct lru *lru_entry = h->lru_entry;
+  uint64_t page_num = item_page_num(callback->slab, callback->slab_idx);
+  int buffer_idx = ctx->sent_io % ctx->max_pending_io;
+  struct iocb *_iocb = &ctx->iocb[buffer_idx];
+
+  memset(_iocb, 0, sizeof(*_iocb));
+  _iocb->aio_fildes = callback->slab->fd;
+  _iocb->aio_lio_opcode = IOCB_CMD_PWRITE;
+  _iocb->aio_buf = (uint64_t)lru_entry->page;
+  _iocb->aio_data = (uint64_t)callback;
+  _iocb->aio_offset = page_num * PAGE_SIZE;
+  _iocb->aio_nbytes = PAGE_SIZE;
+  if (ctx->sent_io - ctx->processed_io >= ctx->max_pending_io)
+    die("Sent %lu ios, processed %lu (> %lu waiting), IO buffer is too full!\n",
+        ctx->sent_io, ctx->processed_io, ctx->max_pending_io);
+  ctx->sent_io++;
+  RSTAT_INC(writes_issued);
+  /* The absorbed updates complete with this write (same submission batch). */
+  while (h->attached) {
+    struct linked_callbacks *l = h->attached;
+
+    h->attached = l->next;
+    l->next = ctx->linked_callbacks;
+    ctx->linked_callbacks = l;
+  }
+}
+
+int io_has_due_writes(struct io_context *ctx) {
+  uint64_t now;
+
+  if (ctx->nb_held == 0)
+    return 0;
+  rdtscll(now);
+  for (int i = 0; i < ctx->nb_held; i++)
+    if (cycles_to_us(now - ctx->held[i].since) >= cfg.write_window_us)
+      return 1;
+  return 0;
+}
+
+void io_release_due_writes(struct io_context *ctx, int all) {
+  uint64_t now;
+
+  if (ctx->nb_held == 0)
+    return;
+  rdtscll(now);
+  for (int i = 0; i < ctx->nb_held;) {
+    if (all || cycles_to_us(now - ctx->held[i].since) >= cfg.write_window_us) {
+      io_submit_held(ctx, &ctx->held[i]);
+      ctx->held[i] = ctx->held[--ctx->nb_held];
+    } else {
+      i++;
+    }
+  }
 }
 
 /*
