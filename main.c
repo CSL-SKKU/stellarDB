@@ -12,6 +12,7 @@ extern int try_fsst;
 static void print_help(char *n) {
   printf("Usage: %s [options] <nb_disks> <nb_workers> <nb_distributors>\n", n);
   puts("Options:");
+  puts("  -D, --directory <path>         database directory (default /scratch0/kvell; created if missing)");
   puts("  -P, --page-cache-size <bytes>   set page cache size");
   puts("  -b, --bench <bench_name>        select workload (e.g. ycsb_c_zipfian)");
   puts("  -a, --api <api_name>            select API (ycsb, dbbench, bgwork, locality, latprobe)");
@@ -39,11 +40,65 @@ static void print_help(char *n) {
   puts("  -h, --help                      show this help message");
 }
 
+static int prepare_directory(const char *directory) {
+  char *path;
+
+  if (directory == NULL || directory[0] == '\0') {
+    fprintf(stderr, "-D/--directory requires a nonempty path\n");
+    return 0;
+  }
+  path = strdup(directory);
+  if (path == NULL) {
+    perror("Cannot allocate database directory path");
+    return 0;
+  }
+
+  /* Create missing parents too; leave existing directories and modes alone. */
+  for (char *p = path + 1;; p++) {
+    if (*p != '/' && *p != '\0')
+      continue;
+    char separator = *p;
+    struct stat st;
+
+    *p = '\0';
+    if (stat(path, &st) != 0) {
+      if (errno != ENOENT)
+        goto error;
+      if (mkdir(path, 0777) == 0) {
+        printf("Created database directory: %s\n", path);
+        fflush(stdout);
+      } else if (errno != EEXIST) {
+        goto error;
+      }
+      if (stat(path, &st) != 0)
+        goto error;
+    }
+    if (!S_ISDIR(st.st_mode)) {
+      errno = ENOTDIR;
+      goto error;
+    }
+    *p = separator;
+    if (separator == '\0')
+      break;
+  }
+  if (faccessat(AT_FDCWD, directory, R_OK | W_OK | X_OK, AT_EACCESS) != 0)
+    goto error;
+  free(path);
+  return 1;
+
+error:
+  fprintf(stderr, "Cannot use database directory '%s': %s\n",
+          path, strerror(errno));
+  free(path);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   declare_timer;
     init_default_config(&cfg);
 
     static struct option long_opts[] = {
+        {"directory",       required_argument, 0, 'D'},
         {"page-cache-size", required_argument, 0, 'P'},
         {"bench",           required_argument, 0, 'b'},
         {"api",             required_argument, 0, 'a'},
@@ -70,8 +125,9 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:r::R::p:M:n:q:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "D:P:b:a:k:m:i:o:e:r::R::p:M:n:q:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
+        case 'D': cfg.directory       = optarg;                 break;
         case 'P': cfg.page_cache_size = strtoul(optarg, NULL, 0); break;
         case 'b': cfg.bench           = parse_bench(optarg);     break;
         case 'a': cfg.api             = parse_api(optarg);      break;
@@ -171,6 +227,8 @@ int main(int argc, char **argv) {
 
     if (!validate_runtime_config(&cfg))
         return EXIT_FAILURE;
+    if (!prepare_directory(cfg.directory))
+        return EXIT_FAILURE;
 
     // --- 워크로드 초기화 예시 ---
     struct workload w;
@@ -185,6 +243,7 @@ int main(int argc, char **argv) {
 
   /* Pretty printing useful info */
   printf("# Configuration:\n");
+  printf("# \tDirectory: %s\n", cfg.directory);
   printf("# \tPage cache size: %lu GB\n", cfg.page_cache_size / 1024 / 1024 / 1024);
   printf("# \tDisks: %d, I/O Workers: %d, Distributors: %d\n",
          nb_disks, nb_workers_per_disk, nb_distributors_per_disk);

@@ -5,8 +5,7 @@
 #define DEBUG 0
 #endif
 #define PINNING 1
-#define PATH "/scratch%lu/kvell/slab-%lu"
-#define ROOT_PATH "/scratch%lu/kvell/ROOT"
+#define DEFAULT_DIRECTORY "/scratch0/kvell"
 
 #define WITH_FILTER 0
 

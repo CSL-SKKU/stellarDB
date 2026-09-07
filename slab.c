@@ -7,6 +7,7 @@
 #include "pagecache.h"
 #include "slabworker.h"
 #include <errno.h>
+#include <limits.h>
 
 extern int print;
 extern int load;
@@ -156,6 +157,14 @@ void mark_page_hot(struct slab *s, size_t page_idx) {
     //     연산 전(old value)을 반환. (반환 값이 필요 없으면 쓰지 않아도 됨)
 }
 
+static char *slab_path(const char *name) {
+  char *path;
+
+  if (asprintf(&path, "%s/%s", cfg.directory, name) < 0)
+    die("Cannot allocate slab path\n");
+  return path;
+}
+
 /*
  * Create a slab: a file that only contains items of a given size.
  * @callback is a callback that will be called on all previously existing items
@@ -174,7 +183,8 @@ struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
 
   if (data_size > cfg.max_file_size)
     die("create_slab_sized: %zu data pages exceed a regular slab\n", data_pages);
-  char path[512];
+  char filename[32];
+  char *path;
   struct slab *s = calloc(1, sizeof(*s));
   uint64_t cur_seq = 0;
   int flag = O_RDWR | O_DIRECT;
@@ -189,10 +199,11 @@ struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
    * consumed here.
    */
   if (rebuild) {
-    sprintf(path, "/scratch0/kvell/%s", name);
+    path = slab_path(name);
   } else {
     cur_seq = __sync_add_and_fetch(&create_sequence, 1);
-    sprintf(path, PATH, 0LU, cur_seq);
+    snprintf(filename, sizeof(filename), "slab-%lu", cur_seq);
+    path = slab_path(filename);
   }
 
   s->fd = open(path, flag, 0777);
@@ -200,7 +211,6 @@ struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
   if (s->fd == -1) {
       perr("Cannot allocate slab %s", path);
   } 
-
   /*
    * cfg.max_file_size is the data size; the header page comes on top of it,
    * so the slot count a configuration implies is unchanged by the header.
@@ -250,6 +260,7 @@ struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
   if (!rebuild && slab_write_header_raw(s, key, level, 0, 0) != 0)
     perr("Cannot write the header of slab %s", path);
 
+  free(path);
   return s;
 }
 
@@ -315,13 +326,10 @@ int slab_read_header(int fd, size_t size_on_disk, struct slab_header *out) {
 /*
  * Every operation on the database directory goes through a descriptor opened
  * with open(): that is the one call tests interpose to redirect
- * /scratch0/kvell, and rename/unlink on absolute paths would escape it.
+ * the default directory, and rename/unlink on absolute paths would escape it.
  */
 static int kvell_dirfd(void) {
-  char path[128];
-
-  snprintf(path, sizeof(path), "/scratch%lu/kvell", 0LU);
-  return open(path, O_RDONLY | O_DIRECTORY);
+  return open(cfg.directory, O_RDONLY | O_DIRECTORY);
 }
 
 int slab_root_write(uint64_t id) {
@@ -439,14 +447,17 @@ int rebuild_slabs(int filenum, struct dirent **file_list) {
     char *name = file_list[i]->d_name;
     struct slab_header hdr;
     struct stat sb;
-    char path[512];
+    char *path;
     int fd, dup = 0;
 
     if (file_list[i]->d_type != DT_REG || strncmp(name, "slab-", 5) != 0)
       continue;
-    snprintf(path, sizeof(path), "/scratch0/kvell/%s", name);
-    fd = open(path, O_RDONLY); /* absolute: open() is the redirected call */
-    if (fd < 0 || fstat(fd, &sb) != 0 ||
+    path = slab_path(name);
+    fd = open(path, O_RDONLY); /* open() is the redirected call in tests */
+    if (fd < 0)
+      perr("Cannot open slab %s for recovery", path);
+    free(path);
+    if (fstat(fd, &sb) != 0 ||
         slab_read_header(fd, (size_t)sb.st_size, &hdr) != 0) {
       if (fd >= 0)
         close(fd);
@@ -505,18 +516,20 @@ static int root_exists(void) {
   DIR *dir;
   struct dirent *entry;
 
-  if (slab_root_read(&id) == 0)
+  int status = slab_root_read(&id);
+  if (status == 0)
     return 1;
-  dir = opendir("/scratch0/kvell");
-  if (dir == NULL) {
-    perror("Unable to open directory");
-    return -1;
-  }
+  if (status != -ENOENT)
+    die("Cannot read ROOT in '%s': %s\n", cfg.directory, strerror(-status));
+  dir = opendir(cfg.directory);
+  if (dir == NULL)
+    perr("Unable to open database directory %s", cfg.directory);
   while ((entry = readdir(dir)) != NULL) {
     if (strncmp(entry->d_name, "slab-", 5) == 0) {
       closedir(dir);
-      die("Slab files present in /scratch0/kvell but no ROOT file: the "
-          "layout predates headers or ROOT was lost; not recoverable\n");
+      die("Slab files present in %s but no ROOT file: the "
+          "layout predates headers or ROOT was lost; not recoverable\n",
+          cfg.directory);
     }
   }
   closedir(dir);
@@ -893,7 +906,7 @@ void slab_retire(struct slab *s) {
 
 void slab_release_if_idle(struct slab *s) {
   centree_node node = (centree_node)s->centree_node;
-  char proc[64], path[512];
+  char proc[64], path[PATH_MAX];
   int expected = 0;
   int len;
 

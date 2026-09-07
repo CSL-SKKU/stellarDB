@@ -6,6 +6,7 @@
 #include "workload-common.h"  // bench_t, YCSB, BGWORK, DBBENCH, PRODUCTION, ...
 
 struct runtime_config {
+    const char        *directory;
     unsigned long      page_cache_size;
     bench_t            bench;           // enum으로
     struct workload_api *api;           // 포인터로

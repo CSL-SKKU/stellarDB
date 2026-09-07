@@ -31,6 +31,7 @@
 #include "tnt_centree.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <time.h>
 #include <stdbool.h>
 
@@ -1418,7 +1419,7 @@ void prune_build_discard(struct prune_build *b) {
   size_t buffer_len = b->buffer != NULL ? pages_for_capacity(b) * PAGE_SIZE : 0;
 
   if (b->slab != NULL) {
-    char proc[64], path[512];
+    char proc[64], path[PATH_MAX];
     int len;
 
     /* The file was never referenced by anything else. */

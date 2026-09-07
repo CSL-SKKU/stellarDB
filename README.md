@@ -24,13 +24,19 @@ make PAGE_CACHE_SIZE='(PAGE_SIZE * 1048576)'
 
 ## Running
 
-StellarDB stores its local files under `/scratch0/kvell/` by default. Create the
-directory and ensure that the current user can write to it before running:
+StellarDB stores its local files under `/scratch0/kvell/` by default. Use `-D`
+or `--directory` to select another directory for slab files and recovery metadata:
 
 ```bash
-sudo mkdir -p /scratch0/kvell
-sudo chown "$(id -un):$(id -gn)" /scratch0/kvell
+./main --directory ./data -n 1000000 -q 1000000 1 4 2
 ```
+
+Startup creates missing directories, including parent directories, and logs each
+creation to stdout. Permissions follow the process's umask. Existing directories
+are reused for recovery. Startup exits with an error if the path is not a
+directory or the current user lacks read, write, or search permission. Relative
+paths are resolved from the working directory; use the same directory to reopen
+a database.
 
 CPU pinning is controlled in `options.h`; the affinity implementation is in
 `utils.c`. Other runtime defaults are defined in `config.c` and `options.h`.
@@ -57,6 +63,7 @@ make REALKEY_FILE_PATH=/path/to/key-trace
 ### Options
 
 ```
+  -D, --directory <path>         Database directory (default /scratch0/kvell; created if missing)
   -P, --page-cache-size <bytes>   Set page cache size
   -b, --bench <bench_name>        Select workload (e.g., ycsb_c_zipfian)
   -a, --api <api_name>            Select API (ycsb, dbbench, bgwork, locality, latprobe)

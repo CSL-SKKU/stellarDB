@@ -1086,12 +1086,12 @@ static void *worker_rebuild_init(void *pdata) {
   int last_insert;
   if (ctx->worker_id == 0) {
     DIR *dir;
-    char *path = "/scratch0/kvell";
+    const char *path = cfg.directory;
     if ((dir = opendir(path)) != NULL) {
       // Sort the entries by name
       rebuild_totals = scandir(path, &rebuild_list, NULL, numeric_sort);
       if (rebuild_totals < 0) {
-        perror("scandir");
+        perr("Cannot scan database directory %s", path);
       } else {
         // both trees from the headers; unreachable files are deleted here
         rebuild_slabs(rebuild_totals, rebuild_list);
@@ -1099,8 +1099,9 @@ static void *worker_rebuild_init(void *pdata) {
       nb_live_slabs = slab_recovered(&live_slabs);
       next_live_slab = 0;
       leaf_slab_list = malloc((nb_live_slabs + 1) * sizeof(struct slab*));
+      closedir(dir);
     } else {
-      perror("Could not open directory");
+      perr("Cannot open database directory %s", path);
     }
     INIT_LOCK(&rebuild_lock, NULL);
     __sync_add_and_fetch(&rebuild_ready, 1);

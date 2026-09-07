@@ -73,6 +73,7 @@ struct workload_api *parse_api(const char *s) {
 struct runtime_config cfg;
 
 void init_default_config(struct runtime_config *cfg) {
+    cfg->directory       = DEFAULT_DIRECTORY;
     cfg->page_cache_size = PAGE_CACHE_SIZE;
     cfg->bench           = SELECTED_BENCH;
     cfg->api             = &YCSB;  // 기본
