@@ -41,6 +41,15 @@ void process_memory_kb(uint64_t *rss, uint64_t *vsz, uint64_t *hwm);
 void reset_restructuring_stats(void);
 
 void add_timing_stat(uint64_t elapsed);
+
+/*
+ * Opt-in per-interval latency series (--latency-series). Completions update a
+ * thread-local counter set; the sampler thread diffs the totals per interval
+ * and prints "#L t_s count avg_us p50_us p99_us p999_us max_us". Percentiles
+ * come from a log histogram (4 buckets per octave), so they are approximate.
+ */
+void lat_series_record(uint64_t cycles, int is_write);
+void lat_series_report(double t_s);
 void print_stats(void);
 
 uint64_t cycles_to_us(uint64_t cycles);

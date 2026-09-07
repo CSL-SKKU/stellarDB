@@ -677,12 +677,32 @@ static void *utilization_sampler(void *pdata) {
   struct timeval t0, now;
   (void)pdata;
 
+  uint64_t tick_ms = 0, next_u_ms = 0, next_l_ms = 0;
+
   gettimeofday(&t0, NULL);
+  if (cfg.latency_series_ms)
+    printf("#L t_s count avg_us p50_us p99_us p999_us max_us "
+           "rd_count rd_avg_us rd_p99_us wr_count wr_avg_us wr_p99_us\n");
   printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
          "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb "
          "reserved_slots valid_slots\n");
   while (1) {
     struct prune_stale m;
+
+    if (cfg.latency_series_ms && tick_ms >= next_l_ms) {
+      struct timeval nowl;
+
+      gettimeofday(&nowl, NULL);
+      lat_series_report((nowl.tv_sec - t0.tv_sec) +
+                        (nowl.tv_usec - t0.tv_usec) / 1e6);
+      next_l_ms += cfg.latency_series_ms;
+    }
+    if (tick_ms < next_u_ms) {
+      usleep(100000);
+      tick_ms += 100;
+      continue;
+    }
+    next_u_ms += 1000;
     unsigned int dist = get_distributor_utilization();
     unsigned int io = get_io_worker_utilization();
     int gate = dist >= DISTRIBUTOR_HIGH_UTIL && io <= IO_WORKER_LOW_UTIL;
@@ -702,7 +722,8 @@ static void *utilization_sampler(void *pdata) {
            __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED),
            rss_kb / 1024, vsz_kb / 1024, m.reserved, m.valid);
     fflush(stdout);
-    usleep(1000000);
+    usleep(100000);
+    tick_ms += 100;
   }
   return NULL;
 }

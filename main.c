@@ -23,6 +23,7 @@ static void print_help(char *n) {
   puts("  -R, --with-rebal                enable rebalancing logic");
   puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
+  puts("      --latency-series <ms>       print per-interval latency lines (#L); off by default");
   puts("  -p, --with-prune                enable pruning logic");
   puts("      --prune-margin <slots>      slots kept free in a merged slab");
   puts("      --prune-min-age <slabs>     skip triples whose leaf is newer than this");
@@ -52,6 +53,7 @@ int main(int argc, char **argv) {
         {"with-rebal",      no_argument,       0, 'R'},
         {"rebalance-threshold", required_argument, 0, 1004},
         {"util-gate",       no_argument,       0, 1005},
+        {"latency-series",  required_argument, 0, 1006},
         {"with-prune",      no_argument,       0, 'p'},
         {"prune-margin",    required_argument, 0, 1000},
         {"prune-min-age",   required_argument, 0, 1001},
@@ -80,6 +82,10 @@ int main(int argc, char **argv) {
         case 'R': cfg.with_rebal      = 1;                       break;
         case 1004: cfg.rebalance_threshold = strtod(optarg, NULL); break;
         case 1005: cfg.util_gate = 1; break;
+        case 1006: cfg.latency_series_ms = strtoul(optarg, NULL, 0);
+                   if (cfg.latency_series_ms && cfg.latency_series_ms < 100)
+                     cfg.latency_series_ms = 100;
+                   break;
         case 'p': cfg.with_prune      = 1;                       break;
         case 1000: cfg.prune_margin   = strtoul(optarg, NULL, 0); break;
         case 1001: cfg.prune_min_age  = strtoul(optarg, NULL, 0); break;
@@ -142,6 +148,9 @@ int main(int argc, char **argv) {
   printf("# \tReinsertion: %s\n", cfg.with_reins ? "enabled" : "disabled");
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
   printf("# \tPruning: %s\n", cfg.with_prune ? "enabled" : "disabled");
+  if (cfg.latency_series_ms)
+    printf("# \tLatency series: every %lu ms (#L lines, histogram percentiles)\n",
+           cfg.latency_series_ms);
   if (cfg.with_prune)
     printf("# \tPruning: margin %lu slots, minimum leaf age %lu slabs\n",
            cfg.prune_margin, cfg.prune_min_age);

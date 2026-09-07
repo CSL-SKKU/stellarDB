@@ -20,6 +20,8 @@ struct runtime_config {
     double             rebalance_threshold;
     /* --util-gate: also require the (distributor busy, I/O idle) gate. Off. */
     int                util_gate;
+    /* --latency-series <ms>: per-interval latency lines ("#L"); 0 = off. */
+    unsigned long      latency_series_ms;
     int                with_prune;
     /* Slots kept free in a merged slab. */
     unsigned long      prune_margin;

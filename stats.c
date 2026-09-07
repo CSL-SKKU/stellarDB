@@ -11,6 +11,118 @@ struct stats {
   size_t max_timing_idx;
 } stats;
 
+/* ---- latency series ---- */
+#define LAT_BUCKETS 128
+#define LAT_MAX_THREADS 512
+struct lat_set {
+  uint64_t count, sum_cycles;
+  uint64_t hist[LAT_BUCKETS];
+};
+struct lat_tl {
+  struct lat_set op[2]; /* [0] reads, [1] writes */
+};
+static struct lat_tl *lat_threads[LAT_MAX_THREADS];
+static _Atomic int lat_nb_threads;
+static __thread struct lat_tl *my_lat;
+
+static inline unsigned lat_bucket(uint64_t us) {
+  if (us < 4)
+    return (unsigned)us;                         /* 0..3 exact */
+  unsigned exp = 63 - __builtin_clzll(us);       /* >= 2 */
+  unsigned sub = (unsigned)((us >> (exp - 2)) & 3);
+  unsigned idx = exp * 4 + sub;
+  return idx < LAT_BUCKETS ? idx : LAT_BUCKETS - 1;
+}
+
+static inline uint64_t lat_bucket_low_us(unsigned idx) {
+  if (idx < 4)
+    return idx;
+  unsigned exp = idx / 4, sub = idx % 4;
+  return (uint64_t)(4 + sub) << (exp - 2);
+}
+
+void lat_series_record(uint64_t cycles, int is_write) {
+  struct lat_tl *t = my_lat;
+
+  if (t == NULL) {
+    int slot = atomic_fetch_add_explicit(&lat_nb_threads, 1, memory_order_relaxed);
+
+    if (slot >= LAT_MAX_THREADS)
+      return;
+    t = calloc(1, sizeof(*t));
+    if (t == NULL)
+      return;
+    my_lat = t;
+    __atomic_store_n(&lat_threads[slot], t, __ATOMIC_RELEASE);
+  }
+  struct lat_set *s = &t->op[is_write ? 1 : 0];
+
+  s->count++;
+  s->sum_cycles += cycles;
+  s->hist[lat_bucket(cycles_to_us(cycles))]++;
+}
+
+/* Percentiles of the interval (cur - prev) for one counter set. */
+static void lat_set_stats(const struct lat_set *cur, const struct lat_set *prev,
+                          uint64_t *count, uint64_t *avg, uint64_t *p50,
+                          uint64_t *p99, uint64_t *p999, uint64_t *max_us) {
+  uint64_t acc = 0, sum = cur->sum_cycles - prev->sum_cycles;
+
+  *count = cur->count - prev->count;
+  *avg = *count ? cycles_to_us(sum / *count) : 0;
+  *p50 = *p99 = *p999 = *max_us = 0;
+  for (unsigned b = 0; b < LAT_BUCKETS && *count; b++) {
+    uint64_t in_bucket = cur->hist[b] - prev->hist[b];
+
+    if (!in_bucket)
+      continue;
+    *max_us = lat_bucket_low_us(b);
+    acc += in_bucket;
+    if (!*p50 && acc * 2 >= *count) *p50 = lat_bucket_low_us(b);
+    if (!*p99 && acc * 100 >= *count * 99) *p99 = lat_bucket_low_us(b);
+    if (!*p999 && acc * 1000 >= *count * 999) *p999 = lat_bucket_low_us(b);
+  }
+}
+
+void lat_series_report(double t_s) {
+  static struct lat_set prev_all, prev_rd, prev_wr;
+  struct lat_set all = {0}, rd = {0}, wr = {0};
+  int n = atomic_load_explicit(&lat_nb_threads, memory_order_relaxed);
+  uint64_t c, avg, p50, p99, p999, mx, rc, ravg, rp50, rp99, rp999, rmx, wc,
+      wavg, wp50, wp99, wp999, wmx;
+
+  if (n > LAT_MAX_THREADS)
+    n = LAT_MAX_THREADS;
+  for (int i = 0; i < n; i++) {
+    struct lat_tl *t = __atomic_load_n(&lat_threads[i], __ATOMIC_ACQUIRE);
+
+    if (t == NULL)
+      continue;
+    for (int k = 0; k < 2; k++) {
+      struct lat_set *dst = k ? &wr : &rd;
+
+      dst->count += t->op[k].count;
+      dst->sum_cycles += t->op[k].sum_cycles;
+      for (unsigned b = 0; b < LAT_BUCKETS; b++)
+        dst->hist[b] += t->op[k].hist[b];
+    }
+  }
+  all.count = rd.count + wr.count;
+  all.sum_cycles = rd.sum_cycles + wr.sum_cycles;
+  for (unsigned b = 0; b < LAT_BUCKETS; b++)
+    all.hist[b] = rd.hist[b] + wr.hist[b];
+
+  lat_set_stats(&all, &prev_all, &c, &avg, &p50, &p99, &p999, &mx);
+  lat_set_stats(&rd, &prev_rd, &rc, &ravg, &rp50, &rp99, &rp999, &rmx);
+  lat_set_stats(&wr, &prev_wr, &wc, &wavg, &wp50, &wp99, &wp999, &wmx);
+  printf("#L %.1f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n", t_s, c, avg,
+         p50, p99, p999, mx, rc, ravg, rp99, wc, wavg, wp99);
+  fflush(stdout);
+  prev_all = all;
+  prev_rd = rd;
+  prev_wr = wr;
+}
+
 void add_timing_stat(uint64_t elapsed) {
   if (!stats.timing_value) {
     stats.timing_time = malloc(MAX_STATS * sizeof(*stats.timing_time));
