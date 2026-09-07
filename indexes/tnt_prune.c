@@ -130,6 +130,7 @@ static size_t pages_for_capacity(struct prune_build *b);
 static size_t full_slab_pages(void);
 static size_t full_slab_items(void);
 static int rebuild_begin(centree_node n, size_t entries, struct prune_build *out);
+static void node_slots(centree_node n, size_t *reserved, size_t *valid);
 
 /* Does any history node from `from` upward hold `key` (stale copies count)? */
 int prune_key_held_above(centree_node from, uint64_t key) {
@@ -327,11 +328,76 @@ bool prune_scan_for_candidate(struct prune_candidate *out) {
   collect_leaves(tree, centree_read_root(tree), leaves, capacity, &nb);
   centree_read_out(tree);
 
-  for (size_t i = 0; i < nb && !found; i++)
-    found = prune_select(leaves[i], out);
+  /*
+   * Cold leaves first: among the prunable triples take the one whose leaf saw
+   * the fewest client writes since the scheduler's last mark, then the one
+   * that frees the most slots. A hot leaf is not excluded -- when every
+   * candidate is hot the busiest region still gets pruned -- it just loses to
+   * any colder one.
+   */
+  {
+    struct prune_candidate c;
+    uint64_t best_hot = 0;
+    size_t best_reclaim = 0;
+
+    for (size_t i = 0; i < nb; i++) {
+      struct slab *ls;
+      uint64_t hot;
+      size_t reclaim = 0, r, v;
+      centree_node trip[3];
+
+      if (!prune_select(leaves[i], &c))
+        continue;
+      ls = c.leaf->value.slab;
+      hot = atomic_load_explicit(&ls->nb_writes, memory_order_relaxed) -
+            atomic_load_explicit(&ls->nb_writes_mark, memory_order_relaxed);
+      trip[0] = c.leaf; trip[1] = c.inner; trip[2] = c.outer;
+      for (int k = 0; k < 3; k++) {
+        node_slots(trip[k], &r, &v);
+        reclaim += r - v;
+      }
+      if (!found || hot < best_hot ||
+          (hot == best_hot && reclaim > best_reclaim)) {
+        *out = c;
+        best_hot = hot;
+        best_reclaim = reclaim;
+        found = true;
+      }
+    }
+    if (found) {
+      if (best_hot == 0)
+        RSTAT_INC(prune_cold_picks);
+      else
+        RSTAT_INC(prune_hot_picks);
+    }
+  }
 
   free(leaves);
   return found;
+}
+
+void prune_mark_writes(void) {
+  centree tree = tnt_centree();
+  centree_node *leaves;
+  size_t capacity, nb = 0;
+
+  if (tree == NULL)
+    return;
+  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
+  leaves = malloc(capacity * sizeof(*leaves));
+  if (leaves == NULL)
+    return;
+  centree_read_in(tree);
+  collect_leaves(tree, centree_read_root(tree), leaves, capacity, &nb);
+  centree_read_out(tree);
+  for (size_t i = 0; i < nb; i++) {
+    struct slab *s = leaves[i]->value.slab;
+
+    atomic_store_explicit(&s->nb_writes_mark,
+                          atomic_load_explicit(&s->nb_writes, memory_order_relaxed),
+                          memory_order_relaxed);
+  }
+  free(leaves);
 }
 
 /*
@@ -700,6 +766,82 @@ int tnt_migrate_up(centree_node child) {
   return TNT_COMPACT_DONE;
 }
 
+/*
+ * One scheduler step. Every live internal node is scored by the slots its
+ * rebuild frees on disk:
+ *   migration   -- reserved(X) + stale(P): X's whole file goes, P loses its
+ *                  stale slots; allowed when valid(P) + valid(X) fits
+ *                  cfg.migrate_th * capacity, so each one frees at least a
+ *                  slab's worth and X becomes an empty node an ILI prune can
+ *                  absorb;
+ *   compaction  -- stale(X), when the stale fraction is >= cfg.compact_ratio.
+ * The best-scoring operation runs; a migration wins a tie. Below one page of
+ * slots nothing is done. The scan takes no lock (the operations re-check
+ * their nodes under the maintenance lock and refuse what no longer fits).
+ */
+int tnt_compact_once(void) {
+  centree tree = tnt_centree();
+  centree_node *nodes, best = NULL;
+  size_t capacity, nb = 0, best_gain = 0, min_gain = PAGE_SIZE / cfg.kv_size;
+  int best_migrate = 0, status;
+
+  if (tree == NULL)
+    return -EINVAL;
+  RSTAT_INC(compact_calls);
+  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
+  nodes = malloc(capacity * sizeof(*nodes));
+  if (nodes == NULL)
+    return -ENOMEM;
+  centree_read_in(tree);
+  collect_nodes(tree, centree_read_root(tree), nodes, capacity, &nb);
+  centree_read_out(tree);
+
+  for (size_t i = 0; i < nb; i++) {
+    centree_node n = nodes[i], p;
+    size_t r, v, stale;
+
+    if (!node_is_internal(n) ||
+        atomic_load_explicit(&n->value.slab->superseded, memory_order_acquire))
+      continue;
+    node_slots(n, &r, &v);
+    stale = r - v;
+    p = centree_lu_parent(n);
+    if (cfg.migrate_th > 0 && v > 0 && node_is_internal(p) &&
+        !atomic_load_explicit(&p->value.slab->superseded, memory_order_acquire)) {
+      size_t pr, pv;
+
+      node_slots(p, &pr, &pv);
+      if ((double)(pv + v) <= cfg.migrate_th * (double)full_slab_items()) {
+        size_t gain = r + (pr - pv);
+
+        if (gain >= min_gain &&
+            (gain > best_gain || (gain == best_gain && !best_migrate))) {
+          best = n;
+          best_gain = gain;
+          best_migrate = 1;
+        }
+        continue; /* migration dominates compacting X alone */
+      }
+    }
+    if (cfg.compact_ratio > 0 && r > 0 && stale >= min_gain &&
+        (double)stale / (double)r >= cfg.compact_ratio && stale > best_gain) {
+      best = n;
+      best_gain = stale;
+      best_migrate = 0;
+    }
+  }
+  free(nodes);
+  if (best == NULL) {
+    RSTAT_INC(compact_noop);
+    return TNT_COMPACT_NOOP;
+  }
+  status = best_migrate ? tnt_migrate_up(best) : tnt_compact_node(best);
+  if (status < 0 && status != -ENOSPC && status != -EAGAIN &&
+      status != -EBUSY && status != -ECANCELED)
+    RSTAT_INC(compact_failed);
+  return status;
+}
+
 size_t prune_count_candidates(void) {
   centree tree = tnt_centree();
   struct prune_candidate candidate;
@@ -730,19 +872,26 @@ size_t prune_count_candidates(void) {
  * The stale-slot estimate (see in-memory-index-tnt.h)
  * ===================================================================== */
 
+/* Slots handed out and slots still valid in n's slab (nb_items is an upper bound). */
+static void node_slots(centree_node n, size_t *reserved, size_t *valid) {
+  struct slab *s = n->value.slab;
+  size_t r = atomic_load_explicit(&s->last_item, memory_order_acquire), v;
+
+  if (r > s->nb_max_items)
+    r = s->nb_max_items;
+  v = s->nb_items;
+  if (v > r)
+    v = r;
+  *reserved = r;
+  *valid = v;
+}
+
 static void sum_stale(centree tree, centree_node n, struct prune_stale *acc) {
-  struct slab *s;
   size_t reserved, valid;
 
   if (n == NULL)
     return;
-  s = n->value.slab;
-  reserved = atomic_load_explicit(&s->last_item, memory_order_acquire);
-  if (reserved > s->nb_max_items)
-    reserved = s->nb_max_items;
-  valid = s->nb_items;
-  if (valid > reserved)
-    valid = reserved;
+  node_slots(n, &reserved, &valid);
   acc->nodes++;
   acc->reserved += reserved;
   acc->valid += valid;

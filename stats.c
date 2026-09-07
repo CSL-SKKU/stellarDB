@@ -211,9 +211,13 @@ void print_restructuring_stats(const char *phase) {
            rss / 1024, vsz / 1024, hwm / 1024);
   }
   printf("#R %s compaction: compactions=%lu migrations=%lu entries_dropped=%lu "
-         "index_entries_freed=%lu bytes_read=%lu bytes_written=%lu\n", phase,
+         "index_entries_freed=%lu bytes_read=%lu bytes_written=%lu "
+         "bursts=%lu calls=%lu noop=%lu failed=%lu\n", phase,
          r.compactions, r.migrations, r.rebuild_entries_dropped, r.rebuild_index_freed,
-         r.rebuild_bytes_read, r.rebuild_bytes_written);
+         r.rebuild_bytes_read, r.rebuild_bytes_written, r.compact_bursts,
+         r.compact_calls, r.compact_noop, r.compact_failed);
+  printf("#R %s prune-pick: cold=%lu hot=%lu\n", phase, r.prune_cold_picks,
+         r.prune_hot_picks);
   printf("#R %s prune-stale: stale=%lu reserved=%lu ratio=%.3f\n", phase,
          r.prune_stale_last, r.prune_reserved_last,
          r.prune_reserved_last ? (double)r.prune_stale_last / r.prune_reserved_last : 0.0);

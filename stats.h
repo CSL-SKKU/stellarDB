@@ -34,6 +34,8 @@ struct restructuring_stats {
   /* segment compaction */
   uint64_t compactions, migrations, rebuild_entries_dropped, rebuild_index_freed,
       rebuild_bytes_read, rebuild_bytes_written;
+  uint64_t compact_bursts, compact_calls, compact_noop, compact_failed;
+  uint64_t prune_cold_picks, prune_hot_picks; /* ILI candidate had 0 / >0 recent writes */
   uint64_t reins_or_seen, reins_or_deep, reins_or_deferred, reins_or_dropped; /* on-read */
 };
 extern struct restructuring_stats rstats;

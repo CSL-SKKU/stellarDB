@@ -77,6 +77,9 @@ struct slab {
   _Atomic size_t nb_tombstones; // tombstones published into this slab (diagnostic, never decremented)
   size_t nb_max_items;
   _Atomic size_t last_item;  // Total number of items, including freed
+  /* Client writes completed into this slab; the scheduler's mark gives the
+   * writes since its last pass (the cold-leaf priority of the ILI pruner). */
+  _Atomic uint64_t nb_writes, nb_writes_mark;
 
   // For Reinsertion
   _Atomic int queued;

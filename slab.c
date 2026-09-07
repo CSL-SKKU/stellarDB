@@ -948,6 +948,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   index_entry_t *e = NULL;
 
   add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
+  atomic_fetch_add_explicit(&s->nb_writes, 1, memory_order_relaxed);
   W_LOCK(&s->tree_lock);
     // CASE 2에서 여러 쓰레드가 여기 도달 가능.
     // 두 쓰레드들 중 가장 최신의 애가 먼저 lock 잡고 추가했다면

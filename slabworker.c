@@ -716,6 +716,48 @@ static void *worker_restructuring_init(void *pdata) {
     }
 
     /*
+     * Segment compaction before pruning: migrations empty internal nodes,
+     * which is what makes ILI triples fit. Runs until nothing qualifies or
+     * the byte budget for this period is spent (--compact-rate-mb; the
+     * allowance accrues per period and may bank up to two periods' worth).
+     */
+    if (cfg.compact_ratio > 0 || cfg.migrate_th > 0) {
+      static double allowance = 0.0;
+      uint64_t before = __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED);
+      size_t done = 0;
+      int status = TNT_COMPACT_NOOP;
+
+      if (cfg.compact_rate_mb) {
+        double per_period = cfg.compact_rate_mb * 1e6 * cfg.prune_period_ms / 1000.0;
+
+        allowance += per_period;
+        if (allowance > 2 * per_period)
+          allowance = 2 * per_period;
+      }
+      while (!cfg.compact_rate_mb || allowance > 0) {
+        status = tnt_compact_once();
+        if (status != TNT_COMPACT_DONE)
+          break;
+        done++;
+        if (cfg.compact_rate_mb) {
+          uint64_t now = __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED);
+
+          allowance -= (double)(now - before);
+          before = now;
+        }
+      }
+      if (done) {
+        RSTAT_INC(compact_bursts);
+        printf("Compact trigger: %zu rebuilds (%s)\n", done,
+               status == TNT_COMPACT_NOOP ? "no more candidates"
+               : status == TNT_COMPACT_DONE ? "budget spent" : strerror(-status));
+      }
+      if (status < 0 && status != -EAGAIN && status != -EBUSY &&
+          status != -ENOSPC && status != -ECANCELED)
+        fprintf(stderr, "Background compaction failed: %s\n", strerror(-status));
+    }
+
+    /*
      * Both maintenance operations run on this thread, which is what keeps them
      * exclusive; the mutex is there for the callers in main.c and the tests.
      *
@@ -754,6 +796,9 @@ static void *worker_restructuring_init(void *pdata) {
           status != -ENOSPC)
         fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
     }
+    /* Writes from here to the next wake are what the next scan calls "hot". */
+    if (cfg.with_prune)
+      prune_mark_writes();
   }
 
   return NULL;
@@ -776,7 +821,7 @@ static void *utilization_sampler(void *pdata) {
            "rd_count rd_avg_us rd_p99_us wr_count wr_avg_us wr_p99_us\n");
   printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
          "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb "
-         "reserved_slots valid_slots\n");
+         "reserved_slots valid_slots compactions migrations rebuild_mb_written\n");
   while (1) {
     struct prune_stale m;
 
@@ -810,7 +855,7 @@ static void *utilization_sampler(void *pdata) {
     uint64_t rss_kb, vsz_kb, hwm_kb;
 
     process_memory_kb(&rss_kb, &vsz_kb, &hwm_kb);
-    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu\n",
+    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu %lu %lu %.1f\n",
            (now.tv_sec - t0.tv_sec) + (now.tv_usec - t0.tv_usec) / 1e6, dist,
            io, gate, tnt_rebalancing_needed() ? 1 : 0, tnt_get_node_count(),
            tnt_get_depth(), prune_stale_ratio(&m),
@@ -818,7 +863,10 @@ static void *utilization_sampler(void *pdata) {
            __atomic_load_n(&rstats.reins_slabs, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.prune_done, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED),
-           rss_kb / 1024, vsz_kb / 1024, m.reserved, m.valid);
+           rss_kb / 1024, vsz_kb / 1024, m.reserved, m.valid,
+           __atomic_load_n(&rstats.compactions, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.migrations, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED) / 1e6);
     fflush(stdout);
     usleep(100000);
     tick_ms += 100;

@@ -56,6 +56,16 @@ struct runtime_config {
     int                prune_auto;
     double             prune_stale_ratio;
     unsigned long      prune_period_ms;
+    /*
+     * Segment compaction (all 0 = off). --compact-ratio r: rebuild an internal
+     * node whose stale-slot fraction is >= r. --migrate-th t: move a node's
+     * valid entries into its history parent when valid(parent) + valid(node)
+     * <= t * slab capacity, leaving the node empty. --compact-rate-mb n: byte
+     * budget for rebuild writes, MB/s (0 = unlimited).
+     */
+    double             compact_ratio;
+    double             migrate_th;
+    unsigned long      compact_rate_mb;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;
