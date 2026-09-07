@@ -149,6 +149,14 @@ struct slab_callback {
   uint64_t user_start;  /* client use: start cycle of a chained request */
   uint32_t upward_len;  /* READ: levels walked from the leaf to find the record (1 = at leaf) */
   uint32_t page_was_hot; /* READ_NO_LOOKUP: the page's hot bit was already set */
+  /*
+   * Stage stamps (rdtsc) at DEBUG=0, filled by add_time_in_payload():
+   * [0] first dequeue (the distributor starts), [1] second enqueue (hand-off
+   * to the I/O worker: routing done), [2] second dequeue (the I/O worker
+   * starts). payload holds the client's enqueue; the completion computes
+   * queue wait, distributor service and I/O service from the four.
+   */
+  uint64_t t_stage[3];
 };
 
 /*

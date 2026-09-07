@@ -55,6 +55,7 @@ void add_timing_stat(uint64_t elapsed);
  * come from a log histogram (4 buckets per octave), so they are approximate.
  */
 void lat_series_record(uint64_t cycles, int is_write);
+void lat_series_record_stages(struct slab_callback *c, uint64_t end);
 void lat_series_report(double t_s);
 void print_stats(void);
 

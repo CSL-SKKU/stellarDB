@@ -20,10 +20,12 @@ struct lat_set {
 };
 struct lat_tl {
   struct lat_set op[2]; /* [0] reads, [1] writes */
+  struct lat_set stage[3]; /* [0] queue wait, [1] distributor service, [2] I/O service */
 };
 static struct lat_tl *lat_threads[LAT_MAX_THREADS];
 static _Atomic int lat_nb_threads;
 static __thread struct lat_tl *my_lat;
+static struct lat_tl *lat_mine(void);
 
 static inline unsigned lat_bucket(uint64_t us) {
   if (us < 4)
@@ -42,24 +44,64 @@ static inline uint64_t lat_bucket_low_us(unsigned idx) {
 }
 
 void lat_series_record(uint64_t cycles, int is_write) {
+  struct lat_tl *t = lat_mine();
+
+  if (t == NULL)
+    return;
+  struct lat_set *s = &t->op[is_write ? 1 : 0];
+
+  s->count++;
+  s->sum_cycles += cycles;
+  s->hist[lat_bucket(cycles_to_us(cycles))]++;
+}
+
+static struct lat_tl *lat_mine(void) {
   struct lat_tl *t = my_lat;
 
   if (t == NULL) {
     int slot = atomic_fetch_add_explicit(&lat_nb_threads, 1, memory_order_relaxed);
 
     if (slot >= LAT_MAX_THREADS)
-      return;
+      return NULL;
     t = calloc(1, sizeof(*t));
     if (t == NULL)
-      return;
+      return NULL;
     my_lat = t;
     __atomic_store_n(&lat_threads[slot], t, __ATOMIC_RELEASE);
   }
-  struct lat_set *s = &t->op[is_write ? 1 : 0];
+  return t;
+}
 
-  s->count++;
-  s->sum_cycles += cycles;
-  s->hist[lat_bucket(cycles_to_us(cycles))]++;
+/*
+ * Per-stage service times of one completed request, from the stamps the
+ * enqueue/dequeue sites left on the callback (see add_time_in_payload()).
+ * A request that never reached an I/O worker (a read miss answered by the
+ * distributor) has no second queue and no I/O stage.
+ */
+void lat_series_record_stages(struct slab_callback *c, uint64_t end) {
+  struct lat_tl *t = lat_mine();
+  uint64_t t0 = (uint64_t)c->payload, t1 = c->t_stage[0], t2 = c->t_stage[1],
+           t3 = c->t_stage[2];
+  uint64_t q = 0, d = 0, io = 0;
+
+  if (t == NULL || !t0 || !t1 || t1 < t0)
+    return;
+  q = t1 - t0;
+  if (t2 && t3 && t2 >= t1 && t3 >= t2 && end >= t3) {
+    d = t2 - t1;
+    q += t3 - t2;
+    io = end - t3;
+  } else if (end >= t1) {
+    d = end - t1;
+  }
+  uint64_t v[3] = {q, d, io};
+  for (int k = 0; k < 3; k++) {
+    struct lat_set *s = &t->stage[k];
+
+    s->count++;
+    s->sum_cycles += v[k];
+    s->hist[lat_bucket(cycles_to_us(v[k]))]++;
+  }
 }
 
 /* Percentiles of the interval (cur - prev) for one counter set. */
@@ -85,8 +127,9 @@ static void lat_set_stats(const struct lat_set *cur, const struct lat_set *prev,
 }
 
 void lat_series_report(double t_s) {
-  static struct lat_set prev_all, prev_rd, prev_wr;
-  struct lat_set all = {0}, rd = {0}, wr = {0};
+  static struct lat_set prev_all, prev_rd, prev_wr, prev_st[3];
+  struct lat_set all = {0}, rd = {0}, wr = {0}, st[3] = {{0}};
+  uint64_t sc[3], savg[3], sp50[3], sp99[3], sp999[3], smx[3];
   int n = atomic_load_explicit(&lat_nb_threads, memory_order_relaxed);
   uint64_t c, avg, p50, p99, p999, mx, rc, ravg, rp50, rp99, rp999, rmx, wc,
       wavg, wp50, wp99, wp999, wmx;
@@ -106,6 +149,12 @@ void lat_series_report(double t_s) {
       for (unsigned b = 0; b < LAT_BUCKETS; b++)
         dst->hist[b] += t->op[k].hist[b];
     }
+    for (int k = 0; k < 3; k++) {
+      st[k].count += t->stage[k].count;
+      st[k].sum_cycles += t->stage[k].sum_cycles;
+      for (unsigned b = 0; b < LAT_BUCKETS; b++)
+        st[k].hist[b] += t->stage[k].hist[b];
+    }
   }
   all.count = rd.count + wr.count;
   all.sum_cycles = rd.sum_cycles + wr.sum_cycles;
@@ -115,12 +164,18 @@ void lat_series_report(double t_s) {
   lat_set_stats(&all, &prev_all, &c, &avg, &p50, &p99, &p999, &mx);
   lat_set_stats(&rd, &prev_rd, &rc, &ravg, &rp50, &rp99, &rp999, &rmx);
   lat_set_stats(&wr, &prev_wr, &wc, &wavg, &wp50, &wp99, &wp999, &wmx);
-  printf("#L %.1f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n", t_s, c, avg,
-         p50, p99, p999, mx, rc, ravg, rp99, wc, wavg, wp99);
+  for (int k = 0; k < 3; k++)
+    lat_set_stats(&st[k], &prev_st[k], &sc[k], &savg[k], &sp50[k], &sp99[k], &sp999[k], &smx[k]);
+  /* ... q_avg q_p99 dist_avg dist_p99 io_avg io_p99: the stages of the same requests */
+  printf("#L %.1f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
+         t_s, c, avg, p50, p99, p999, mx, rc, ravg, rp99, wc, wavg, wp99,
+         savg[0], sp99[0], savg[1], sp99[1], savg[2], sp99[2]);
   fflush(stdout);
   prev_all = all;
   prev_rd = rd;
   prev_wr = wr;
+  for (int k = 0; k < 3; k++)
+    prev_st[k] = st[k];
 }
 
 void add_timing_stat(uint64_t elapsed) {
@@ -269,14 +324,30 @@ void add_time_in_payload(struct slab_callback *c, enum timing_stage origin) {
   payload[pos].origin = origin;
 #else
   /*
-   * Write-once: a request is enqueued twice (client -> distributor, then
-   * distributor -> I/O worker after the center-tree descent). Overwriting
-   * here dropped the whole distributor stage from every latency number.
+   * A request is enqueued twice (client -> distributor, then distributor ->
+   * I/O worker after the center-tree descent) and dequeued twice. The first
+   * enqueue is the client's stamp (write-once: overwriting it dropped the
+   * whole distributor stage from every latency number); the others fill the
+   * stage stamps so the completion can split the latency into queue wait,
+   * distributor service and I/O service.
    */
-  if (origin != TIMING_STAGE_REQUEST_ENQUEUED || c->payload) return;
   uint64_t t;
-  rdtscll(t);
-  c->payload = (void *)t;
+
+  if (origin == TIMING_STAGE_REQUEST_ENQUEUED) {
+    rdtscll(t);
+    if (!c->payload) {
+      c->payload = (void *)t;
+      c->t_stage[0] = c->t_stage[1] = c->t_stage[2] = 0;
+    } else if (!c->t_stage[1]) {
+      c->t_stage[1] = t;
+    }
+  } else if (origin == TIMING_STAGE_REQUEST_DEQUEUED && c->payload) {
+    rdtscll(t);
+    if (!c->t_stage[0])
+      c->t_stage[0] = t;
+    else if (!c->t_stage[2])
+      c->t_stage[2] = t;
+  }
 #endif
 }
 

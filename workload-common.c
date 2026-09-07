@@ -326,8 +326,10 @@ void compute_stats(struct slab_callback *cb, void *item) {
     rdtscll(end);
     uint64_t diff = end - start;
     add_timing_stat(diff);
-    if (cfg.latency_series_ms)
+    if (cfg.latency_series_ms) {
       lat_series_record(diff, cb->action != READ && cb->action != READ_NO_LOOKUP);
+      lat_series_record_stages(cb, end);
+    }
 
 #if DEBUG
     unsigned char kept = add_slow_entry(diff, cb);
