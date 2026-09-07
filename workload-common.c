@@ -391,6 +391,7 @@ struct slab_callback *bench_cb(void) {
   cb->payload = allocate_payload();
   cb->fsst_slab = NULL;
   cb->fsst_idx = -1;
+  cb->user_start = 0;
   return cb;
 }
 

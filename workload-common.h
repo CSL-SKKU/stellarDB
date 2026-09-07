@@ -20,6 +20,9 @@ typedef enum available_bench {
   ycsb_b_zipfian,
   ycsb_c_zipfian,
   ycsb_e_zipfian,
+  ycsb_d_latest,   /* 95% read-latest / 5% insert of new keys */
+  ycsb_f_uniform,  /* 50% read / 50% read-modify-write */
+  ycsb_f_zipfian,
   prod1,
   prod2,
   dbbench_all_random,

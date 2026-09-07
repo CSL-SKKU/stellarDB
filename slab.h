@@ -135,6 +135,7 @@ struct slab_callback {
     uint64_t item_nums;
   };
   struct slab_context *ctx;
+  uint64_t user_start;  /* client use: start cycle of a chained request */
 };
 
 /*
