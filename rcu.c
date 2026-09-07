@@ -33,9 +33,19 @@ rcu_finish(
     struct rcu_ctx *ctx,
     unsigned phase)
 {
-    assert(__atomic_load_n(
+    /*
+     * Not an assertion: a reader that loaded the old epoch just before the
+     * flip registers into this phase, sees the epoch change and unregisters
+     * again without ever dereferencing a pointer (rcu_read_in). The writer's
+     * drain loop can observe zero between two such stragglers, so the count
+     * may be transiently non-zero here. Wait it out; it cannot grow again,
+     * because every reader that validates after the flip is in the other
+     * phase. (Seen once as an abort after ~1 h of a 2B-request run.)
+     */
+    while (__atomic_load_n(
                &ctx->readers[phase],
-               __ATOMIC_SEQ_CST) == 0);
+               __ATOMIC_SEQ_CST) != 0)
+        cpu_relax();
     assert(__atomic_load_n(
                &ctx->pending_phase,
                __ATOMIC_SEQ_CST) == (int)phase);
