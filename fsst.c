@@ -42,6 +42,7 @@ static void *fsst_worker(void *pdata) {
        */
       R_LOCK(&s->tree_lock);
       if (atomic_load_explicit(&node->removed, memory_order_acquire) ||
+          atomic_load_explicit(&s->superseded, memory_order_acquire) ||
           !atomic_load_explicit(&s->full, memory_order_acquire)) {
         R_UNLOCK(&s->tree_lock);
         atomic_store_explicit(&s->queued, 0, memory_order_relaxed);
@@ -128,7 +129,8 @@ static void *fsst_worker(void *pdata) {
              * were already copied into the replacement node.
              */
             R_LOCK(&s->tree_lock);
-            if (atomic_load_explicit(&node->removed, memory_order_acquire)) {
+            if (atomic_load_explicit(&node->removed, memory_order_acquire) ||
+                atomic_load_explicit(&s->superseded, memory_order_acquire)) {
               R_UNLOCK(&s->tree_lock);
               free(cb->item);
               free(cb);

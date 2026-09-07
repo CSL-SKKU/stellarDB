@@ -1410,9 +1410,41 @@ static int prune_one(void) {
   return -1;
 }
 
+/*
+ * PRUNE_STRESS_COMPACT=1: every round also rebuilds a random internal node,
+ * alternating compaction (the node from itself) and migration (the node's
+ * entries into its history parent), under the readers and writers. The model
+ * check is the correctness test: a swap that loses or misroutes an entry
+ * shows up as a disagreement.
+ */
+static int compact_one(unsigned *seed, size_t *compactions, size_t *migrations) {
+  size_t cap = tnt_get_node_count() + 8, nb = 0;
+  centree_node *order = calloc(cap, sizeof(*order));
+
+  collect_routing(routing_root(), order, cap, &nb);
+  if (nb > cap) nb = cap;
+  for (int tries = 0; tries < 8 && nb > 0; tries++) {
+    centree_node n = order[(size_t)rand_r(seed) % nb];
+    int migrate, r;
+
+    if (atomic_load(&n->child_flag) != 1 || atomic_load(&n->removed)) continue;
+    migrate = rand_r(seed) & 1;
+    r = migrate ? tnt_migrate_up(n) : tnt_compact_node(n);
+    if (r == TNT_COMPACT_DONE) {
+      if (migrate) (*migrations)++; else (*compactions)++;
+      free(order);
+      return 1;
+    }
+    check(r == TNT_COMPACT_NOOP || r == -ECANCELED || r == -ENOSPC || r == -EAGAIN,
+          "%s failed with %d", migrate ? "tnt_migrate_up()" : "tnt_compact_node()", r);
+  }
+  free(order);
+  return 0;
+}
+
 static void check_concurrent_prune(void) {
   pthread_t readers[4], writers[2];
-  size_t prunes = 0, rejects = 0, idle = 0;
+  size_t prunes = 0, rejects = 0, idle = 0, compactions = 0, migrations = 0;
 
   atomic_store(&stress_stop, 0);
   for (size_t i = 0; i < 4; i++)
@@ -1426,6 +1458,7 @@ static void check_concurrent_prune(void) {
     int r = getenv("PRUNE_STRESS_NOPRUNE") ? 0 : prune_one();
 
     if (cfg.with_reins) queue_for_reinsertion(&seed);
+    if (getenv("PRUNE_STRESS_COMPACT")) compact_one(&seed, &compactions, &migrations);
 
     if (r > 0) prunes++;
     else if (r < 0) rejects++;
@@ -1494,6 +1527,11 @@ static void check_concurrent_prune(void) {
    * phase already asserts that pruning works. What this phase asserts is
    * consistency under concurrent pruning.
    */
+  if (getenv("PRUNE_STRESS_COMPACT")) {
+    printf("  %-34s %zu compactions, %zu migrations during the stress phase\n",
+           "segment compaction", compactions, migrations);
+    check(compactions + migrations > 0, "no compaction or migration ever ran");
+  }
   if (prunes == 0 && !getenv("PRUNE_STRESS_NOPRUNE"))
     printf("    NOTE no candidate came up during the stress phase this run\n");
   check(centree_validate_locked(tnt_centree()),

@@ -20,6 +20,9 @@ int main(void) {
   };
   struct slab slabs[15];
 
+  /* The threshold is read from cfg; unset it is 0 and every tree is "deep". */
+  init_default_config(&cfg);
+
   assert(get_distributor_utilization() == 0);
   assert(get_io_worker_utilization() == 0);
   assert(tnt_rebalancing() == -EINVAL);

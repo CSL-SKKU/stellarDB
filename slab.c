@@ -173,7 +173,17 @@ uint64_t slab_create_sequence(void) {
  */
 struct slab *create_slab(struct slab_context *ctx, uint64_t level,
                          uint64_t key, int rebuild, char *name) {
+  return create_slab_sized(ctx, level, key, rebuild, name, 0);
+}
+
+struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
+                               uint64_t key, int rebuild, char *name,
+                               size_t data_pages) {
   struct stat sb;
+  size_t data_size = data_pages ? data_pages * PAGE_SIZE : cfg.max_file_size;
+
+  if (data_size > cfg.max_file_size)
+    die("create_slab_sized: %zu data pages exceed a regular slab\n", data_pages);
   char path[512];
   struct slab *s = calloc(1, sizeof(*s));
   uint64_t cur_seq = 0;
@@ -207,9 +217,9 @@ struct slab *create_slab(struct slab_context *ctx, uint64_t level,
    */
   fstat(s->fd, &sb);
   s->size_on_disk = sb.st_size;
-  if (!rebuild && s->size_on_disk < cfg.max_file_size + PAGE_SIZE) {
-    fallocate(s->fd, 0, 0, cfg.max_file_size + PAGE_SIZE);
-    s->size_on_disk = cfg.max_file_size + PAGE_SIZE;
+  if (!rebuild && s->size_on_disk < data_size + PAGE_SIZE) {
+    fallocate(s->fd, 0, 0, data_size + PAGE_SIZE);
+    s->size_on_disk = data_size + PAGE_SIZE;
   }
   if (s->size_on_disk < 2 * PAGE_SIZE || s->size_on_disk % PAGE_SIZE != 0)
     die("Slab %s has size %lu; need at least a data page and the header page\n",
@@ -900,7 +910,8 @@ void slab_release_if_idle(struct slab *s) {
   int len;
 
   if (node == NULL ||
-      !atomic_load_explicit(&node->removed, memory_order_acquire))
+      (!atomic_load_explicit(&node->removed, memory_order_acquire) &&
+       !atomic_load_explicit(&s->superseded, memory_order_acquire)))
     return;
   /*
    * No new reference can appear on a retired slab: readers and the
@@ -986,6 +997,14 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
 
   add_time_in_payload(cb, TIMING_STAGE_NEW_INDEX_PUBLISHED);
 
+  /*
+   * The older copy may have been rebuilt into a fresh slab meanwhile
+   * (compaction / migration): invalidate it where it lives now, so the stale
+   * hint is not lost. A retired node (min == -1, not superseded) is gone.
+   */
+  if (atomic_load_explicit(&old_s->superseded, memory_order_acquire) &&
+      old_s->centree_node != NULL)
+    old_s = ((centree_node)old_s->centree_node)->value.slab;
   R_LOCK(&old_s->tree_lock);
   if (old_s->min == -1)
     removed = 1;

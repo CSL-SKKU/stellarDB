@@ -31,6 +31,9 @@ struct restructuring_stats {
   uint64_t prune_bursts, prune_calls, prune_done, prune_noop, prune_dropped;
   uint64_t prune_failed, prune_us, prune_max_us;
   uint64_t prune_stale_last, prune_reserved_last; /* last -C measurement */
+  /* segment compaction */
+  uint64_t compactions, migrations, rebuild_entries_dropped, rebuild_index_freed,
+      rebuild_bytes_read, rebuild_bytes_written;
   uint64_t reins_or_seen, reins_or_deep, reins_or_deferred, reins_or_dropped; /* on-read */
 };
 extern struct restructuring_stats rstats;

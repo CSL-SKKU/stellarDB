@@ -1,4 +1,5 @@
 #include "headers.h"
+#include <errno.h>
 
 int cache_hit = 0;
 int merged = 0;
@@ -117,6 +118,28 @@ static void worker_do_io(struct io_context *ctx) {
   //    %lu processed)\n", ret, pending, ctx->sent_io, ctx->processed_io); ret
   //    += io_submit(ctx->ctx, pending-ret, ctx->iocbs + ret);
   // }
+  if (ret != pending) {
+    int err = errno;
+    for (size_t i = 0; i < pending; i++) {
+      struct iocb *ic = ctx->iocbs[i];
+      struct slab_callback *cb = (void *)ic->aio_data;
+      struct slab *s = cb ? cb->slab : NULL;
+      centree_node n = s ? (centree_node)s->centree_node : NULL;
+      fprintf(stderr,
+              "  iocb[%zu] op=%u fd=%d off=%lld nbytes=%llu action=%d "
+              "slab=%p seq=%lu slab_fd=%d idx=%lu superseded=%d released=%d "
+              "removed=%d fsst_slab=%p\n",
+              i, ic->aio_lio_opcode, ic->aio_fildes, (long long)ic->aio_offset,
+              (unsigned long long)ic->aio_nbytes, cb ? (int)cb->action : -1,
+              (void *)s, s ? s->seq : 0, s ? s->fd : -2,
+              cb ? (unsigned long)cb->slab_idx : 0,
+              s ? atomic_load(&s->superseded) : -1,
+              s ? atomic_load(&s->released) : -1,
+              n ? atomic_load(&n->removed) : -1,
+              cb ? (void *)cb->fsst_slab : NULL);
+    }
+    errno = err;
+  }
   if (ret != pending)
     perr(
         "Couldn't submit all io requests! %d submitted / %lu (%lu sent, %lu "

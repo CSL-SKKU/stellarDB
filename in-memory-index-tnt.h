@@ -198,10 +198,24 @@ struct prune_build {
    * skipped too (sources are merged newest first).
    */
   int drop_tombstones;
+  /* Tombstone check origin for rebuilds: a tombstone is dead when no history
+   * node from here upward holds its key. NULL = unconditional (root triple). */
+  centree_node tomb_check_from;
   uint64_t *dead;          /* open-addressing set of dropped keys */
   size_t dead_cap, dead_nb;
   int dead_has_zero;
+  int node_owned;          /* 1: b->node is N, unpublished, freed on discard */
 };
+
+/*
+ * Segment compaction (COMPACTION_PLAN.md, chosen path). Both run under
+ * tnt_maintenance_lock(), replace a node's slab with a fresh one holding
+ * only valid entries, and retire the old slab (superseded).
+ */
+enum { TNT_COMPACT_DONE = 0, TNT_COMPACT_NOOP = 1 };
+int tnt_compact_node(centree_node n);          /* n internal; rebuild from {n} */
+int tnt_migrate_up(centree_node child);        /* child, parent internal; parent <- {child, parent}; child emptied */
+int prune_key_held_above(centree_node from, uint64_t key);
 
 /*
  * begin -> add_source (newest first) -> finish. Every step returns 0 or a

@@ -210,6 +210,10 @@ void print_restructuring_stats(const char *phase) {
     printf("#R %s mem: rss_mb=%lu vsz_mb=%lu peak_rss_mb=%lu\n", phase,
            rss / 1024, vsz / 1024, hwm / 1024);
   }
+  printf("#R %s compaction: compactions=%lu migrations=%lu entries_dropped=%lu "
+         "index_entries_freed=%lu bytes_read=%lu bytes_written=%lu\n", phase,
+         r.compactions, r.migrations, r.rebuild_entries_dropped, r.rebuild_index_freed,
+         r.rebuild_bytes_read, r.rebuild_bytes_written);
   printf("#R %s prune-stale: stale=%lu reserved=%lu ratio=%.3f\n", phase,
          r.prune_stale_last, r.prune_reserved_last,
          r.prune_reserved_last ? (double)r.prune_stale_last / r.prune_reserved_last : 0.0);

@@ -1000,6 +1000,11 @@ restart:
     struct slab *s2 = cur->value.slab;
     index_entry_t *e2 = NULL;
     R_LOCK(&s2->tree_lock);
+    if (atomic_load_explicit(&s2->superseded, memory_order_acquire)) {
+      R_UNLOCK(&s2->tree_lock);
+      s2 = cur->value.slab; /* rebuilt meanwhile: use the current slab */
+      R_LOCK(&s2->tree_lock);
+    }
     if (!atomic_load_explicit(&cur->removed, memory_order_acquire) &&
         key <= s2->max && key >= s2->min)
     	e2 = subtree_worker_lookup_utree(s2->subtree, item);
@@ -1116,6 +1121,15 @@ restart:
       R_UNLOCK(&s->tree_lock);
       goto restart;
     }
+    /*
+     * The node is live but this slab was rebuilt into a fresh one
+     * (compaction / migration): its entries live in n->value.slab now.
+     * superseded is monotone and set after the new pointer is published.
+     */
+    if (atomic_load_explicit(&s->superseded, memory_order_acquire)) {
+      R_UNLOCK(&s->tree_lock);
+      continue; /* same n, reload s */
+    }
     tmp_try++;
     tmp = NULL;
     if (s->min == -1) goto quick_skip;
@@ -1201,6 +1215,10 @@ int tnt_index_invalid(void *item) {
     int comp_result;
 
     R_LOCK(&s->tree_lock);
+    if (atomic_load_explicit(&s->superseded, memory_order_acquire)) {
+      R_UNLOCK(&s->tree_lock);
+      continue; /* same n, reload s */
+    }
     if (s->min != -1) {
 #if WITH_FILTER
       if (filter_contain(s->filter, (unsigned char *)&key)) {

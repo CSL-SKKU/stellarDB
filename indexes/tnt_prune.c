@@ -125,6 +125,35 @@ static bool retired(centree_node n) {
   return atomic_load_explicit(&n->removed, memory_order_acquire) != 0;
 }
 
+/* Defined further down with the build; used by the compaction operations above them. */
+static size_t pages_for_capacity(struct prune_build *b);
+static size_t full_slab_pages(void);
+static size_t full_slab_items(void);
+static int rebuild_begin(centree_node n, size_t entries, struct prune_build *out);
+
+/* Does any history node from `from` upward hold `key` (stale copies count)? */
+int prune_key_held_above(centree_node from, uint64_t key) {
+  for (centree_node cur = from; cur != NULL; cur = centree_lu_parent(cur)) {
+    struct slab *s = cur->value.slab;
+    index_entry_t e;
+    int found = 0;
+
+    R_LOCK(&s->tree_lock);
+    if (atomic_load_explicit(&s->superseded, memory_order_acquire)) {
+      R_UNLOCK(&s->tree_lock);
+      s = cur->value.slab;
+      R_LOCK(&s->tree_lock);
+    }
+    if (s->min != (uint64_t)-1 && s->subtree != NULL && key >= s->min &&
+        key <= s->max)
+      found = subtree_find(s->subtree, (unsigned char *)&key, sizeof(key), &e);
+    R_UNLOCK(&s->tree_lock);
+    if (found)
+      return 1;
+  }
+  return 0;
+}
+
 static int child_flag(centree_node n) {
   return atomic_load_explicit(&n->child_flag, memory_order_acquire);
 }
@@ -485,6 +514,192 @@ void prune_dump_slabs(double t_s) {
   free(nodes);
 }
 
+/* ===================================================================== *
+ * Segment compaction: rebuild a node's slab without touching the tree
+ * ===================================================================== */
+
+/* Header of `s` for node `n`, with `replace` child id swapped for `with`. */
+static int write_header_children(struct slab *s, centree_node n,
+                                 uint64_t replace, uint64_t with) {
+  uint64_t child[2] = {0, 0};
+
+  for (int i = 0; i < 2; i++)
+    if (n->lu_child[i] != NULL) {
+      child[i] = n->lu_child[i]->value.slab->seq;
+      if (replace && child[i] == replace)
+        child[i] = with;
+    }
+  return slab_write_header_raw(s, centree_pivot_load(n),
+                               atomic_load_explicit(&n->value.level, memory_order_relaxed),
+                               child[0], child[1]);
+}
+
+/*
+ * Commit point of a rebuild: the node's history parent (or ROOT) names the
+ * fresh slab instead of the old one. Before it, the fresh file is unreachable
+ * garbage; after it, the old file is. Recovery deletes whichever is
+ * unreachable (both carry valid headers, different ids).
+ */
+static int rebuild_commit(centree_node n, struct slab *old, struct slab *fresh) {
+  centree_node up = centree_lu_parent(n);
+
+  if (up == NULL)
+    return slab_root_write(fresh->seq) == 0 ? 0 : -EIO;
+  return write_header_children(up->value.slab, up, old->seq, fresh->seq);
+}
+
+/* Publish the fresh slab on the node and retire the old one. */
+static void rebuild_swap(centree_node n, struct slab *old, struct slab *fresh) {
+  fresh->centree_node = n;
+  n->value.seq = fresh->seq;
+  __atomic_store_n(&n->value.slab, fresh, __ATOMIC_RELEASE);
+  atomic_store_explicit(&old->superseded, 1, memory_order_seq_cst);
+  /* Waits for readers inside the old slab's lock, then frees its index. */
+  slab_retire(old);
+  RSTAT_ADD(rebuild_index_freed, old->nb_items);
+}
+
+static size_t slab_valid(struct slab *s) { return s->nb_items; }
+
+static int node_is_internal(centree_node n) {
+  return n != NULL && child_flag(n) == 1 && !retired(n);
+}
+
+/* Rebuild n's slab from `srcs` (newest first); n internal, lock held. */
+static int rebuild_node(centree_node n, centree_node *srcs, int nsrc,
+                        uint64_t child_replace, uint64_t child_with,
+                        struct slab **fresh_out) {
+  struct prune_build b;
+  struct slab *old = n->value.slab;
+  size_t entries = 0;
+  int error;
+
+  for (int i = 0; i < nsrc; i++) {
+    /* Known bugs 22: in-flight writes into an internal slab publish late. */
+    slab_drain_updates(srcs[i]->value.slab);
+    entries += slab_valid(srcs[i]->value.slab);
+  }
+  /* The merged node must fit one regular slab; otherwise this move is not made. */
+  if (entries > full_slab_items())
+    return -ENOSPC;
+  error = rebuild_begin(n, entries, &b);
+  if (error)
+    return error;
+  b.drop_tombstones = 1;
+  b.tomb_check_from = centree_lu_parent(n);
+  for (int i = 0; i < nsrc && !error; i++)
+    error = prune_build_add_source(&b, srcs[i], 0);
+  if (error == -ENOSPC && entries < full_slab_items()) {
+    /* nb_items is an upper bound, but concurrent publishes can add: retry full size. */
+    prune_build_discard(&b);
+    error = rebuild_begin(n, full_slab_items(), &b);
+    if (!error) {
+      b.drop_tombstones = 1;
+      b.tomb_check_from = centree_lu_parent(n);
+      for (int i = 0; i < nsrc && !error; i++)
+        error = prune_build_add_source(&b, srcs[i], 0);
+    }
+  }
+  if (!error)
+    error = prune_build_finish(&b);
+  if (error) {
+    prune_build_discard(&b);
+    return error;
+  }
+  if (write_header_children(b.slab, n, child_replace, child_with) != 0) {
+    prune_build_discard(&b);
+    return -EIO;
+  }
+  RSTAT_ADD(rebuild_entries_dropped, entries > b.count ? entries - b.count : 0);
+  RSTAT_ADD(rebuild_bytes_written, (uint64_t)pages_for_capacity(&b) * PAGE_SIZE);
+  RSTAT_ADD(rebuild_bytes_read, entries * (uint64_t)old->item_size); /* records copied; page reads are batched */
+  *fresh_out = b.slab;
+  prune_build_release_buffer(&b);
+  return 0;
+}
+
+int tnt_compact_node(centree_node n) {
+  struct slab *old, *fresh = NULL;
+  centree_node srcs[1] = {n};
+  int error;
+
+  if (tnt_centree() == NULL)
+    return -EINVAL;
+  tnt_maintenance_lock();
+  if (!node_is_internal(n)) {
+    tnt_maintenance_unlock();
+    return TNT_COMPACT_NOOP;
+  }
+  old = n->value.slab;
+  error = rebuild_node(n, srcs, 1, 0, 0, &fresh);
+  if (!error)
+    error = rebuild_commit(n, old, fresh);
+  if (error) {
+    tnt_maintenance_unlock();
+    return error;
+  }
+  rebuild_swap(n, old, fresh);
+  tnt_maintenance_unlock();
+  RSTAT_INC(compactions);
+  printf("Compact: %lu -> %lu (%zu valid of %zu reserved)\n", old->seq, fresh->seq,
+         fresh->nb_items, (size_t)atomic_load_explicit(&old->last_item, memory_order_relaxed));
+  return TNT_COMPACT_DONE;
+}
+
+/*
+ * Migration: the child's valid entries move into its history parent (always
+ * safe: nothing lies between adjacent nodes; the child's copy is younger and
+ * wins), the child becomes an empty one-page slab. On disk, the fresh parent
+ * names the fresh (empty) child, and the grandparent (or ROOT) names the fresh
+ * parent: one commit. In memory the parent is swapped first, so a reader
+ * between the two swaps sees the key in both, identical.
+ */
+int tnt_migrate_up(centree_node child) {
+  centree_node parent;
+  struct slab *old_c, *old_p, *fresh_c = NULL, *fresh_p = NULL;
+  centree_node srcs[2];
+  int error;
+
+  if (tnt_centree() == NULL)
+    return -EINVAL;
+  tnt_maintenance_lock();
+  parent = centree_lu_parent(child);
+  if (!node_is_internal(child) || !node_is_internal(parent)) {
+    tnt_maintenance_unlock();
+    return TNT_COMPACT_NOOP;
+  }
+  old_c = child->value.slab;
+  old_p = parent->value.slab;
+  /* Empty child first (nothing to copy): its id goes into the parent's header. */
+  error = rebuild_node(child, NULL, 0, 0, 0, &fresh_c);
+  if (error) {
+    tnt_maintenance_unlock();
+    return error;
+  }
+  srcs[0] = child;   /* younger: wins on a shared key */
+  srcs[1] = parent;
+  error = rebuild_node(parent, srcs, 2, old_c->seq, fresh_c->seq, &fresh_p);
+  if (!error)
+    error = rebuild_commit(parent, old_p, fresh_p);
+  if (error) {
+    /* fresh_c is unreachable garbage on disk; drop it here. */
+    struct prune_build tmp = {0};
+
+    tmp.slab = fresh_c;
+    tmp.node_owned = 0;
+    prune_build_discard(&tmp);
+    tnt_maintenance_unlock();
+    return error;
+  }
+  rebuild_swap(parent, old_p, fresh_p);
+  rebuild_swap(child, old_c, fresh_c);
+  tnt_maintenance_unlock();
+  RSTAT_INC(migrations);
+  printf("Migrate: %lu -> %lu (parent %lu -> %lu, %zu valid)\n", old_c->seq,
+         fresh_c->seq, old_p->seq, fresh_p->seq, fresh_p->nb_items);
+  return TNT_COMPACT_DONE;
+}
+
 size_t prune_count_candidates(void) {
   centree tree = tnt_centree();
   struct prune_candidate candidate;
@@ -681,6 +896,59 @@ int prune_build_begin(const struct prune_candidate *c, centree_node pivot_from,
   out->node = centree_node_new((void *)(uintptr_t)value.key, &value);
   atomic_store_explicit(&out->node->value.level, level, memory_order_release);
   out->slab->centree_node = out->node;
+  out->node_owned = 1;
+  return 0;
+}
+
+/*
+ * Begin a rebuild of an existing node's slab: a fresh slab (new id) sized for
+ * `entries` slots (0 -> one data page), a fresh subtree, no new centree node.
+ * The node keeps its routing position, pivot, level and history links; only
+ * value.slab changes, at swap time.
+ */
+static size_t full_slab_pages(void) { return cfg.max_file_size / PAGE_SIZE; }
+static size_t full_slab_items(void) {
+  return full_slab_pages() * (PAGE_SIZE / cfg.kv_size);
+}
+
+static int rebuild_begin(centree_node n, size_t entries, struct prune_build *out) {
+  size_t items_per_page = PAGE_SIZE / cfg.kv_size;
+  size_t data_pages = entries ? (entries + items_per_page - 1) / items_per_page : 1;
+  size_t pages;
+
+  memset(out, 0, sizeof(*out));
+  out->dirty_lo = (size_t)-1;
+  /*
+   * Never larger than a regular slab: every buffer sized from
+   * cfg.max_file_size (the reinsertion read buffer, the recovery key arrays)
+   * assumes that bound. A rebuild that needs more does not happen.
+   */
+  if (data_pages > full_slab_pages())
+    return -ENOSPC;
+  out->slab = create_slab_sized(NULL, atomic_load_explicit(&n->value.level, memory_order_acquire),
+                                centree_pivot_load(n), 0, NULL, data_pages);
+  if (out->slab == NULL || out->slab->fd < 0) {
+    free(out->slab);
+    memset(out, 0, sizeof(*out));
+    return -EIO;
+  }
+  out->slab->subtree = tnt_subtree_create();
+  subtree_set_slab(out->slab->subtree, out->slab);
+  out->capacity = out->slab->nb_max_items;
+  pages = pages_for(out->slab, out->capacity);
+  if (pages == 0)
+    pages = 1;
+  out->buffer = mmap(NULL, pages * PAGE_SIZE, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (out->buffer == MAP_FAILED) {
+    out->buffer = NULL;
+    prune_build_discard(out);
+    return -ENOMEM;
+  }
+  out->pivot_from = n;
+  out->node = n;               /* existing, published node: not ours to free */
+  out->node_owned = 0;
+  out->slab->centree_node = n; /* so slab_write_header() sees n's children */
   return 0;
 }
 
@@ -810,7 +1078,8 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
    */
   uint64_t t0 = now_us();
   R_LOCK(&src->tree_lock);
-  if (retired(source)) {
+  if (retired(source) ||
+      atomic_load_explicit(&src->superseded, memory_order_acquire)) {
     R_UNLOCK(&src->tree_lock);
     error = -ECANCELED;
     goto out;
@@ -916,7 +1185,8 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
       continue;
     }
 
-    if (b->drop_tombstones && item_is_tombstone(meta)) {
+    if (b->drop_tombstones && item_is_tombstone(meta) &&
+        (b->tomb_check_from == NULL || !prune_key_held_above(b->tomb_check_from, key))) {
       /*
        * Root triple: nothing older than the triple exists for this key, so
        * the tombstone only has to defeat copies *inside* the triple. Those
@@ -1024,6 +1294,9 @@ void prune_build_release_buffer(struct prune_build *b) {
 }
 
 void prune_build_discard(struct prune_build *b) {
+  /* Sized from the slab, so taken before the slab is freed. */
+  size_t buffer_len = b->buffer != NULL ? pages_for_capacity(b) * PAGE_SIZE : 0;
+
   if (b->slab != NULL) {
     char proc[64], path[512];
     int len;
@@ -1044,9 +1317,10 @@ void prune_build_discard(struct prune_build *b) {
     free(b->slab);
   }
   /* Unpublished, so unlike a live node this one may be freed (I-4). */
-  free(b->node);
+  if (b->node_owned)
+    free(b->node);
   if (b->buffer != NULL)
-    munmap(b->buffer, pages_for_capacity(b) * PAGE_SIZE);
+    munmap(b->buffer, buffer_len);
   free(b->dead);
   memset(b, 0, sizeof(*b));
 }
