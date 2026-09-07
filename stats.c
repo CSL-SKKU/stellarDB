@@ -20,7 +20,7 @@ struct lat_set {
 };
 struct lat_tl {
   struct lat_set op[2]; /* [0] reads, [1] writes */
-  struct lat_set stage[3]; /* [0] queue wait, [1] distributor service, [2] I/O service */
+  struct lat_set stage[5]; /* [0] queue wait, [1] distributor service, [2] I/O service, [3] routing descent, [4] history walk */
 };
 static struct lat_tl *lat_threads[LAT_MAX_THREADS];
 static _Atomic int lat_nb_threads;
@@ -81,8 +81,8 @@ static struct lat_tl *lat_mine(void) {
 void lat_series_record_stages(struct slab_callback *c, uint64_t end) {
   struct lat_tl *t = lat_mine();
   uint64_t t0 = (uint64_t)c->payload, t1 = c->t_stage[0], t2 = c->t_stage[1],
-           t3 = c->t_stage[2];
-  uint64_t q = 0, d = 0, io = 0;
+           t3 = c->t_stage[2], tl = c->t_stage[3];
+  uint64_t q = 0, d = 0, io = 0, desc = 0, walk = 0, d_end;
 
   if (t == NULL || !t0 || !t1 || t1 < t0)
     return;
@@ -91,11 +91,20 @@ void lat_series_record_stages(struct slab_callback *c, uint64_t end) {
     d = t2 - t1;
     q += t3 - t2;
     io = end - t3;
+    d_end = t2;
   } else if (end >= t1) {
     d = end - t1;
+    d_end = end;
+  } else {
+    d_end = t1;
   }
-  uint64_t v[3] = {q, d, io};
-  for (int k = 0; k < 3; k++) {
+  /* The distributor stage split at LEAF_FOUND: routing descent, then the history walk. */
+  if (tl && tl >= t1 && tl <= d_end) {
+    desc = tl - t1;
+    walk = d_end - tl;
+  }
+  uint64_t v[5] = {q, d, io, desc, walk};
+  for (int k = 0; k < 5; k++) {
     struct lat_set *s = &t->stage[k];
 
     s->count++;
@@ -127,9 +136,9 @@ static void lat_set_stats(const struct lat_set *cur, const struct lat_set *prev,
 }
 
 void lat_series_report(double t_s) {
-  static struct lat_set prev_all, prev_rd, prev_wr, prev_st[3];
-  struct lat_set all = {0}, rd = {0}, wr = {0}, st[3] = {{0}};
-  uint64_t sc[3], savg[3], sp50[3], sp99[3], sp999[3], smx[3];
+  static struct lat_set prev_all, prev_rd, prev_wr, prev_st[5];
+  struct lat_set all = {0}, rd = {0}, wr = {0}, st[5] = {{0}};
+  uint64_t sc[5], savg[5], sp50[5], sp99[5], sp999[5], smx[5];
   int n = atomic_load_explicit(&lat_nb_threads, memory_order_relaxed);
   uint64_t c, avg, p50, p99, p999, mx, rc, ravg, rp50, rp99, rp999, rmx, wc,
       wavg, wp50, wp99, wp999, wmx;
@@ -149,7 +158,7 @@ void lat_series_report(double t_s) {
       for (unsigned b = 0; b < LAT_BUCKETS; b++)
         dst->hist[b] += t->op[k].hist[b];
     }
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < 5; k++) {
       st[k].count += t->stage[k].count;
       st[k].sum_cycles += t->stage[k].sum_cycles;
       for (unsigned b = 0; b < LAT_BUCKETS; b++)
@@ -164,17 +173,18 @@ void lat_series_report(double t_s) {
   lat_set_stats(&all, &prev_all, &c, &avg, &p50, &p99, &p999, &mx);
   lat_set_stats(&rd, &prev_rd, &rc, &ravg, &rp50, &rp99, &rp999, &rmx);
   lat_set_stats(&wr, &prev_wr, &wc, &wavg, &wp50, &wp99, &wp999, &wmx);
-  for (int k = 0; k < 3; k++)
+  for (int k = 0; k < 5; k++)
     lat_set_stats(&st[k], &prev_st[k], &sc[k], &savg[k], &sp50[k], &sp99[k], &sp999[k], &smx[k]);
-  /* ... q_avg q_p99 dist_avg dist_p99 io_avg io_p99: the stages of the same requests */
-  printf("#L %.1f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
+  /* ... q_avg q_p99 dist_avg dist_p99 io_avg io_p99 desc_avg desc_p99 walk_avg walk_p99 */
+  printf("#L %.1f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
          t_s, c, avg, p50, p99, p999, mx, rc, ravg, rp99, wc, wavg, wp99,
-         savg[0], sp99[0], savg[1], sp99[1], savg[2], sp99[2]);
+         savg[0], sp99[0], savg[1], sp99[1], savg[2], sp99[2],
+         savg[3], sp99[3], savg[4], sp99[4]);
   fflush(stdout);
   prev_all = all;
   prev_rd = rd;
   prev_wr = wr;
-  for (int k = 0; k < 3; k++)
+  for (int k = 0; k < 5; k++)
     prev_st[k] = st[k];
 }
 
@@ -337,7 +347,7 @@ void add_time_in_payload(struct slab_callback *c, enum timing_stage origin) {
     rdtscll(t);
     if (!c->payload) {
       c->payload = (void *)t;
-      c->t_stage[0] = c->t_stage[1] = c->t_stage[2] = 0;
+      c->t_stage[0] = c->t_stage[1] = c->t_stage[2] = c->t_stage[3] = 0;
     } else if (!c->t_stage[1]) {
       c->t_stage[1] = t;
     }
@@ -347,6 +357,10 @@ void add_time_in_payload(struct slab_callback *c, enum timing_stage origin) {
       c->t_stage[0] = t;
     else if (!c->t_stage[2])
       c->t_stage[2] = t;
+  } else if (origin == TIMING_STAGE_LEAF_FOUND && c->payload && c->t_stage[0] &&
+             !c->t_stage[3]) {
+    rdtscll(t);
+    c->t_stage[3] = t;
   }
 #endif
 }

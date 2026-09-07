@@ -931,7 +931,8 @@ static void *utilization_sampler(void *pdata) {
   if (cfg.latency_series_ms)
     printf("#L t_s count avg_us p50_us p99_us p999_us max_us "
            "rd_count rd_avg_us rd_p99_us wr_count wr_avg_us wr_p99_us "
-           "q_avg_us q_p99_us dist_avg_us dist_p99_us io_avg_us io_p99_us\n");
+           "q_avg_us q_p99_us dist_avg_us dist_p99_us io_avg_us io_p99_us "
+           "desc_avg_us desc_p99_us walk_avg_us walk_p99_us\n");
   printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
          "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb "
          "reserved_slots valid_slots compactions migrations rebuild_mb_written\n");

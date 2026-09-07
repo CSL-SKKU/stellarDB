@@ -153,10 +153,12 @@ struct slab_callback {
    * Stage stamps (rdtsc) at DEBUG=0, filled by add_time_in_payload():
    * [0] first dequeue (the distributor starts), [1] second enqueue (hand-off
    * to the I/O worker: routing done), [2] second dequeue (the I/O worker
-   * starts). payload holds the client's enqueue; the completion computes
-   * queue wait, distributor service and I/O service from the four.
+   * starts), [3] routing descent done (LEAF_FOUND: the leaf is known, the
+   * history walk starts). payload holds the client's enqueue; the completion
+   * computes queue wait, distributor service (split into descent and history
+   * walk) and I/O service from them.
    */
-  uint64_t t_stage[3];
+  uint64_t t_stage[4];
 };
 
 /*
