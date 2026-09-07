@@ -284,7 +284,8 @@ int main(int argc, char **argv) {
 
 
   /* One thread runs both maintenance operations, so they exclude each other. */
-  if (cfg.with_rebal || cfg.with_prune) {
+  if (cfg.with_rebal || cfg.with_prune || cfg.compact_ratio > 0 ||
+      cfg.migrate_th > 0) {
     int worker_status = restructuring_worker_init();
 
     if (worker_status < 0)

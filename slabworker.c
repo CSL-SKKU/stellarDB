@@ -664,6 +664,13 @@ static void *worker_distributor_init(void *pdata) {
   return NULL;
 }
 
+static uint64_t now_ms(void) {
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static void *worker_restructuring_init(void *pdata) {
   (void)pdata;
 
@@ -724,6 +731,7 @@ static void *worker_restructuring_init(void *pdata) {
     if (cfg.compact_ratio > 0 || cfg.migrate_th > 0) {
       static double allowance = 0.0;
       uint64_t before = __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED);
+      uint64_t t_start = now_ms();
       size_t done = 0;
       int status = TNT_COMPACT_NOOP;
 
@@ -734,7 +742,14 @@ static void *worker_restructuring_init(void *pdata) {
         if (allowance > 2 * per_period)
           allowance = 2 * per_period;
       }
-      while (!cfg.compact_rate_mb || allowance > 0) {
+      /*
+       * Time-boxed to one period: under churn new candidates appear as fast
+       * as they are consumed, and a loop that runs "until none qualify"
+       * would never hand the worker back to the ILI pruner (it did not, in
+       * the first measurement). The next wake continues where this stopped.
+       */
+      while ((!cfg.compact_rate_mb || allowance > 0) &&
+             now_ms() - t_start < cfg.prune_period_ms) {
         status = tnt_compact_once();
         if (status != TNT_COMPACT_DONE)
           break;
@@ -750,7 +765,9 @@ static void *worker_restructuring_init(void *pdata) {
         RSTAT_INC(compact_bursts);
         printf("Compact trigger: %zu rebuilds (%s)\n", done,
                status == TNT_COMPACT_NOOP ? "no more candidates"
-               : status == TNT_COMPACT_DONE ? "budget spent" : strerror(-status));
+               : status == TNT_COMPACT_DONE
+                     ? (cfg.compact_rate_mb && allowance <= 0 ? "budget spent" : "period over")
+                     : strerror(-status));
       }
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&
           status != -ENOSPC && status != -ECANCELED)
