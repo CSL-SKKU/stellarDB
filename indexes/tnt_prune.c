@@ -146,7 +146,7 @@ static bool retired(centree_node n) {
   return atomic_load_explicit(&n->removed, memory_order_acquire) != 0;
 }
 
-/* Defined further down with the build; used by the compaction operations above them. */
+/* Defined further down with the build; used by the migration operations above them. */
 static size_t pages_for_capacity(struct prune_build *b);
 static size_t full_slab_pages(void);
 static size_t full_slab_items(void);
@@ -193,13 +193,12 @@ enum prune_reject {
   PRUNE_RETIRED,
   PRUNE_LEAF_FULL,
   PRUNE_NO_FIT,
-  PRUNE_TOO_YOUNG,
   PRUNE_NB_REASONS
 };
 static const char *prune_reject_name[PRUNE_NB_REASONS] = {
   "ok", "no_inner", "no_outer", "not_history_child", "same_side",
   "no_sib_star", "internal_splitting", "leaf_splitting", "retired",
-  "leaf_full", "no_fit", "too_young"
+  "leaf_full", "no_fit"
 };
 
 /*
@@ -237,7 +236,7 @@ static enum prune_reject prune_select_why(centree_node leaf,
       /* Diagnostic only: would the three fit, adjacency aside? */
       struct slab *ls_ = leaf->value.slab, *is_ = inner->value.slab,
                   *os_ = outer->value.slab;
-      size_t need = is_->nb_items + os_->nb_items + ls_->nb_items + cfg.prune_margin;
+      size_t need = is_->nb_items + os_->nb_items + ls_->nb_items;
 
       *overflow = need > ls_->nb_max_items ? need - ls_->nb_max_items : 0;
     }
@@ -275,20 +274,11 @@ static enum prune_reject prune_select_why(centree_node leaf,
    * count actually copied.
    */
   cold_bound = is->nb_items + os->nb_items;
-  if (cold_bound + ls->nb_items + cfg.prune_margin > ls->nb_max_items) {
+  if (cold_bound + ls->nb_items > ls->nb_max_items) {
     if (overflow)
-      *overflow = cold_bound + ls->nb_items + cfg.prune_margin - ls->nb_max_items;
+      *overflow = cold_bound + ls->nb_items - ls->nb_max_items;
     return PRUNE_NO_FIT;
   }
-
-  /*
-   * A leaf that was created a moment ago is where the writes are going, and
-   * it is attractive to the fit test precisely because it is still nearly
-   * empty. Skipping the newest slabs keeps the pruner off the hot spot.
-   */
-  if (cfg.prune_min_age &&
-      slab_create_sequence() - ls->seq < cfg.prune_min_age)
-    return PRUNE_TOO_YOUNG;
 
   out->leaf = leaf;
   out->inner = inner;
@@ -602,7 +592,7 @@ void prune_dump_slabs(double t_s) {
 }
 
 /* ===================================================================== *
- * Segment compaction: rebuild a node's slab without touching the tree
+ * Migration rebuilds slabs without changing the tree topology
  * ===================================================================== */
 
 /* Header of `s` for node `n`, with `replace` child id swapped for `with`. */
@@ -705,34 +695,6 @@ static int rebuild_node(centree_node n, centree_node *srcs, int nsrc,
   return 0;
 }
 
-int tnt_compact_node(centree_node n) {
-  struct slab *old, *fresh = NULL;
-  centree_node srcs[1] = {n};
-  int error;
-
-  if (tnt_centree() == NULL)
-    return -EINVAL;
-  tnt_maintenance_lock();
-  if (!node_is_internal(n)) {
-    tnt_maintenance_unlock();
-    return TNT_COMPACT_NOOP;
-  }
-  old = n->value.slab;
-  error = rebuild_node(n, srcs, 1, 0, 0, &fresh);
-  if (!error)
-    error = rebuild_commit(n, old, fresh);
-  if (error) {
-    tnt_maintenance_unlock();
-    return error;
-  }
-  rebuild_swap(n, old, fresh);
-  tnt_maintenance_unlock();
-  RSTAT_INC(compactions);
-  printf("Compact: %lu -> %lu (%zu valid of %zu reserved)\n", old->seq, fresh->seq,
-         fresh->nb_items, (size_t)atomic_load_explicit(&old->last_item, memory_order_relaxed));
-  return TNT_COMPACT_DONE;
-}
-
 /*
  * Migration: the child's valid entries move into its history parent (always
  * safe: nothing lies between adjacent nodes; the child's copy is younger and
@@ -753,7 +715,7 @@ int tnt_migrate_up(centree_node child) {
   parent = centree_lu_parent(child);
   if (!node_is_internal(child) || !node_is_internal(parent)) {
     tnt_maintenance_unlock();
-    return TNT_COMPACT_NOOP;
+    return TNT_MIGRATE_NOOP;
   }
   old_c = child->value.slab;
   old_p = parent->value.slab;
@@ -784,37 +746,29 @@ int tnt_migrate_up(centree_node child) {
   RSTAT_INC(migrations);
   printf("Migrate: %lu -> %lu (parent %lu -> %lu, %zu valid)\n", old_c->seq,
          fresh_c->seq, old_p->seq, fresh_p->seq, fresh_p->nb_items);
-  return TNT_COMPACT_DONE;
+  return TNT_MIGRATE_DONE;
 }
 
 /*
- * One scheduler step. Every live internal node is scored by the slots its
- * rebuild frees on disk:
- *   migration   -- reserved(X) + stale(P): X's whole file goes, P loses its
- *                  stale slots; allowed when valid(P) + valid(X) fits
- *                  cfg.migrate_th * capacity, so each one frees at least a
- *                  slab's worth and X becomes an empty node an ILI prune can
- *                  absorb;
- *   compaction  -- stale(X), when the stale fraction is >= cfg.compact_ratio.
- * The best-scoring operation runs; a migration wins a tie. Below one page of
- * slots nothing is done. The scan takes no lock (the operations re-check
- * their nodes under the maintenance lock and refuse what no longer fits).
+ * Pick the migration with the greatest estimated reclaim:
+ * reserved(child) + stale(parent). The child's valid entries must be nonzero
+ * and fit with the parent's within cfg.migrate_th * slab capacity. Require
+ * at least one page of slot gain. The scan takes no lock; migration rechecks
+ * the nodes and their capacity under the maintenance lock.
  */
-int tnt_compact_once(enum tnt_compact_kind kind) {
+int tnt_migrate_once(void) {
   centree tree = tnt_centree();
   centree_node *nodes, best = NULL;
   size_t capacity, nb = 0, best_gain = 0, min_gain = PAGE_SIZE / cfg.kv_size;
-  /* Target cleaner: skip nodes whose stale space is not worth a header commit. */
-  size_t min_stale = full_slab_items() / 64 > min_gain ? full_slab_items() / 64 : min_gain;
-  double best_frac = 0.0;
-  int best_migrate = 0, status;
-  int want_migrate = kind != TNT_COMPACT_TARGET && cfg.migrate_th > 0;
-  int want_ratio = kind == TNT_COMPACT_ANY && cfg.compact_ratio > 0;
-  int want_target = kind == TNT_COMPACT_TARGET;
+  int status;
 
   if (tree == NULL)
     return -EINVAL;
-  RSTAT_INC(compact_calls);
+  RSTAT_INC(migrate_calls);
+  if (cfg.migrate_th <= 0) {
+    RSTAT_INC(migrate_noop);
+    return TNT_MIGRATE_NOOP;
+  }
   capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
   nodes = malloc(capacity * sizeof(*nodes));
   if (nodes == NULL)
@@ -825,30 +779,14 @@ int tnt_compact_once(enum tnt_compact_kind kind) {
 
   for (size_t i = 0; i < nb; i++) {
     centree_node n = nodes[i], p;
-    size_t r, v, stale;
+    size_t r, v;
 
     if (!node_is_internal(n) ||
         atomic_load_explicit(&n->value.slab->superseded, memory_order_acquire))
       continue;
     node_slots(n, &r, &v);
-    stale = r - v;
-    if (want_target) {
-      /*
-       * Highest stale fraction: by the pigeonhole over internal nodes it is at
-       * least the global ratio, so each rebuild frees at least target *
-       * reserved(X) for (1 - target) * reserved(X) written.
-       */
-      double frac = r ? (double)stale / (double)r : 0.0;
-
-      if (stale >= min_stale && (frac > best_frac || (frac == best_frac && stale > best_gain))) {
-        best = n;
-        best_frac = frac;
-        best_gain = stale;
-      }
-      continue;
-    }
     p = centree_lu_parent(n);
-    if (want_migrate && v > 0 && node_is_internal(p) &&
+    if (v > 0 && node_is_internal(p) &&
         !atomic_load_explicit(&p->value.slab->superseded, memory_order_acquire)) {
       size_t pr, pv;
 
@@ -856,31 +794,22 @@ int tnt_compact_once(enum tnt_compact_kind kind) {
       if ((double)(pv + v) <= cfg.migrate_th * (double)full_slab_items()) {
         size_t gain = r + (pr - pv);
 
-        if (gain >= min_gain &&
-            (gain > best_gain || (gain == best_gain && !best_migrate))) {
+        if (gain >= min_gain && gain > best_gain) {
           best = n;
           best_gain = gain;
-          best_migrate = 1;
         }
-        continue; /* migration dominates compacting X alone */
       }
-    }
-    if (want_ratio && r > 0 && stale >= min_gain &&
-        (double)stale / (double)r >= cfg.compact_ratio && stale > best_gain) {
-      best = n;
-      best_gain = stale;
-      best_migrate = 0;
     }
   }
   free(nodes);
   if (best == NULL) {
-    RSTAT_INC(compact_noop);
-    return TNT_COMPACT_NOOP;
+    RSTAT_INC(migrate_noop);
+    return TNT_MIGRATE_NOOP;
   }
-  status = best_migrate ? tnt_migrate_up(best) : tnt_compact_node(best);
+  status = tnt_migrate_up(best);
   if (status < 0 && status != -ENOSPC && status != -EAGAIN &&
       status != -EBUSY && status != -ECANCELED)
-    RSTAT_INC(compact_failed);
+    RSTAT_INC(migrate_failed);
   return status;
 }
 

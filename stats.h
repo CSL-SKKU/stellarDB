@@ -30,11 +30,11 @@ struct restructuring_stats {
   uint64_t reins_published, reins_abandoned;
   uint64_t prune_bursts, prune_calls, prune_done, prune_noop, prune_dropped;
   uint64_t prune_failed, prune_us, prune_max_us;
-  uint64_t prune_stale_last, prune_reserved_last; /* last -C measurement */
-  /* segment compaction */
-  uint64_t compactions, migrations, rebuild_entries_dropped, rebuild_index_freed,
+  uint64_t prune_stale_last, prune_reserved_last; /* last -p measurement */
+  /* migration */
+  uint64_t migrations, rebuild_entries_dropped, rebuild_index_freed,
       rebuild_bytes_read, rebuild_bytes_written;
-  uint64_t compact_bursts, compact_calls, compact_noop, compact_failed, compact_hard_cap_hits;
+  uint64_t migrate_calls, migrate_noop, migrate_failed;
   uint64_t prune_cold_picks, prune_hot_picks; /* ILI candidate had 0 / >0 recent writes */
   uint64_t reins_or_seen, reins_or_deep, reins_or_deferred, reins_or_dropped; /* on-read */
 };

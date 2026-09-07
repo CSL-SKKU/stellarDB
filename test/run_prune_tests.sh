@@ -7,7 +7,8 @@
 set -u
 cd "$(dirname "$0")/.."
 
-make -j"$(nproc)" test/test_prune_freeze test/test_prune_links test/test_split_skip >/dev/null || exit 1
+make -j"$(nproc)" test/test_prune_freeze test/test_prune_links test/test_split_skip \
+  test/test_rebalance test/test_rebalance_api >/dev/null || exit 1
 
 # Runs a binary with a throwaway /scratch0/kvell. $DBDIR is reused when set,
 # which is how the recovery case re-opens the database it just wrote.
@@ -56,7 +57,20 @@ PRUNE_REINS=1 sandboxed env PRUNE_REINS=1 ./test/test_prune_links 2>&1 | filter 
 report "prune with reinsertion" "${PIPESTATUS[0]}"
 
 echo
-echo "== the automatic trigger (-C) =="
+echo "== migration with ILI pruning and recovery =="
+DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
+export DBDIR
+sandboxed env PRUNE_STRESS_MIGRATE=1 ./test/test_prune_links 2>&1 | filter | grep -E "FAIL|migration|prunes under load|tests passed"
+report "migration with ILI pruning under load" "${PIPESTATUS[0]}"
+sandboxed ./test/test_prune_links verify 2>&1 | filter | tail -2
+report "read back after migration and pruning recovery" "${PIPESTATUS[0]}"
+unset DBDIR
+
+echo
+echo "== the automatic trigger (-p) =="
+# Even with eligible triples, enabled pruning must wait below the threshold.
+sandboxed ./test/test_prune_links auto-wait 2>&1 | filter | grep -E "FAIL|automatic|stale"
+report "automatic pruning waits below the stale-ratio threshold" "${PIPESTATUS[0]}"
 # The restructuring worker, woken on a timer, must bring the stale-slot ratio
 # under the threshold on its own, and every key must still read correctly.
 sandboxed ./test/test_prune_links auto 2>&1 | filter | grep -E "FAIL|automatic|stale"

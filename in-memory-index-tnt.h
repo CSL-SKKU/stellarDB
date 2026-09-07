@@ -208,28 +208,17 @@ struct prune_build {
 };
 
 /*
- * Segment compaction (COMPACTION_PLAN.md, chosen path). Both run under
- * tnt_maintenance_lock(), replace a node's slab with a fresh one holding
- * only valid entries, and retire the old slab (superseded).
+ * Migration runs under tnt_maintenance_lock(). Both nodes must be internal:
+ * the history parent receives {child, parent}, and the child is emptied.
+ * Fresh slabs replace both old slabs without changing either tree's links.
  */
-enum { TNT_COMPACT_DONE = 0, TNT_COMPACT_NOOP = 1 };
-int tnt_compact_node(centree_node n);          /* n internal; rebuild from {n} */
-int tnt_migrate_up(centree_node child);        /* child, parent internal; parent <- {child, parent}; child emptied */
+enum { TNT_MIGRATE_DONE = 0, TNT_MIGRATE_NOOP = 1 };
+int tnt_migrate_up(centree_node child);
 /*
- * Scheduler step: pick the internal node whose rebuild frees the most slots
- * (migration into its history parent when the pair fits cfg.migrate_th *
- * capacity, else self-compaction at stale fraction >= cfg.compact_ratio) and
- * perform it. TNT_COMPACT_NOOP when nothing qualifies.
+ * Pick the migration with the greatest estimated slot reclaim whose pair
+ * fits cfg.migrate_th * slab capacity. TNT_MIGRATE_NOOP if nothing qualifies.
  */
-enum tnt_compact_kind { TNT_COMPACT_ANY = 0, TNT_COMPACT_MIGRATE, TNT_COMPACT_TARGET };
-/*
- * TNT_COMPACT_MIGRATE: one migration if an adjacent pair fits cfg.migrate_th.
- * TNT_COMPACT_TARGET: self-compact the internal node with the highest stale
- * fraction (the global-target cleaner; the caller decides that the ratio is
- * above target). TNT_COMPACT_ANY: the legacy best-gain pick over both kinds
- * with the absolute cfg.compact_ratio gate.
- */
-int tnt_compact_once(enum tnt_compact_kind kind);
+int tnt_migrate_once(void);
 /* Take the write marks of all leaves: the next scan ranks by writes since now. */
 void prune_mark_writes(void);
 int prune_key_held_above(centree_node from, uint64_t key);

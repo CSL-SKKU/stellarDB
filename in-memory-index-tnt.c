@@ -1123,7 +1123,7 @@ restart:
     }
     /*
      * The node is live but this slab was rebuilt into a fresh one
-     * (compaction / migration): its entries live in n->value.slab now.
+     * (migration): its entries live in n->value.slab now.
      * superseded is monotone and set after the new pointer is published.
      */
     if (atomic_load_explicit(&s->superseded, memory_order_acquire)) {

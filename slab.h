@@ -94,7 +94,7 @@ struct slab {
   _Atomic int released;
   /*
    * Set once when this slab's contents were rebuilt into a fresh slab that the
-   * same centree node now points at (compaction / migration). Readers that
+   * same centree node now points at (migration). Readers that
    * loaded the old pointer reload node->value.slab; the old subtree is freed
    * by slab_retire() and the file released when the references drain.
    */
@@ -224,8 +224,6 @@ void slab_release_if_idle(struct slab *s);
 struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
                                uint64_t key, int rebuild, char *name,
                                size_t data_pages);
-
-uint64_t slab_create_sequence(void);
 
 /*
  * A fresh slab file (header written, id assigned), or (rebuild != 0) a

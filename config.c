@@ -88,19 +88,11 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->latency_series_ms = 0;
     cfg->churn_upd = 50; cfg->churn_ins = 25; cfg->churn_del = 25;
     cfg->dump_slabs_s = 0;
-    cfg->compact_ratio = 0.0;
     cfg->migrate_th = 0.0;
-    cfg->compact_rate_mb = 0;
-    cfg->compact_target = 0.0;
-    cfg->compact_hard_cap = 0.0;
-    cfg->compact_ili_share = 0.25;
     cfg->reins_sample    = 16;
     cfg->with_prune      = 0;
-    cfg->prune_margin    = 0;
-    cfg->prune_min_age   = 0;
-    cfg->prune_auto      = 0;
     cfg->prune_stale_ratio = 0.3;
-    cfg->prune_period_ms = 500;
+    cfg->maintenance_period_ms = 500;
     cfg->nb_items_in_db  = 100000000LU;  // 기존 기본값
     cfg->nb_requests     = 0;            // 런타임 결정
     cfg->chunk_for_shuffle = 1;

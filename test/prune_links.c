@@ -1022,27 +1022,6 @@ static void check_prune_link(void) {
 
 static int prune_one(void);
 
-/* The two config knobs must be able to hold the pruner off. */
-static void check_prune_config(void) {
-  size_t nodes = tnt_get_node_count();
-
-  check(prune_count_candidates() > 0, "nothing is prunable to begin with");
-
-  cfg.prune_margin = 1u << 30;
-  check(prune_count_candidates() == 0, "prune_margin did not reject anything");
-  check(tnt_prune_once() == TNT_PRUNE_NOOP, "a prune slipped past the margin");
-  cfg.prune_margin = 0;
-
-  cfg.prune_min_age = 1u << 30;
-  check(prune_count_candidates() == 0, "prune_min_age did not reject anything");
-  check(tnt_prune_once() == TNT_PRUNE_NOOP, "a prune slipped past the min age");
-  cfg.prune_min_age = 0;
-
-  check(tnt_get_node_count() == nodes, "a rejected prune changed the tree");
-  check(prune_count_candidates() > 0, "the knobs did not come back");
-  printf("  %-34s margin and min-age both hold it off\n", "prune config");
-}
-
 /* Prune until nothing is prunable any more. */
 static void check_prune_all(void) {
   struct prune_stale before, after;
@@ -1411,40 +1390,23 @@ static int prune_one(void) {
 }
 
 /*
- * PRUNE_STRESS_COMPACT=1: every round also rebuilds a random internal node,
- * alternating compaction (the node from itself) and migration (the node's
- * entries into its history parent), under the readers and writers. The model
- * check is the correctness test: a swap that loses or misroutes an entry
- * shows up as a disagreement.
+ * PRUNE_STRESS_MIGRATE=1: every round also runs the migration selector under
+ * the readers and writers. The exact model check catches lost or misrouted
+ * entries when slabs are replaced.
  */
-static int compact_one(unsigned *seed, size_t *compactions, size_t *migrations) {
-  size_t cap = tnt_get_node_count() + 8, nb = 0;
-  centree_node *order = calloc(cap, sizeof(*order));
+static void migrate_one(size_t *migrations) {
+  int r = tnt_migrate_once();
 
-  collect_routing(routing_root(), order, cap, &nb);
-  if (nb > cap) nb = cap;
-  for (int tries = 0; tries < 8 && nb > 0; tries++) {
-    centree_node n = order[(size_t)rand_r(seed) % nb];
-    int migrate, r;
-
-    if (atomic_load(&n->child_flag) != 1 || atomic_load(&n->removed)) continue;
-    migrate = rand_r(seed) & 1;
-    r = migrate ? tnt_migrate_up(n) : tnt_compact_node(n);
-    if (r == TNT_COMPACT_DONE) {
-      if (migrate) (*migrations)++; else (*compactions)++;
-      free(order);
-      return 1;
-    }
-    check(r == TNT_COMPACT_NOOP || r == -ECANCELED || r == -ENOSPC || r == -EAGAIN,
-          "%s failed with %d", migrate ? "tnt_migrate_up()" : "tnt_compact_node()", r);
-  }
-  free(order);
-  return 0;
+  if (r == TNT_MIGRATE_DONE)
+    (*migrations)++;
+  else
+    check(r == TNT_MIGRATE_NOOP || r == -ECANCELED || r == -ENOSPC ||
+          r == -EAGAIN || r == -EBUSY, "tnt_migrate_once() failed with %d", r);
 }
 
 static void check_concurrent_prune(void) {
   pthread_t readers[4], writers[2];
-  size_t prunes = 0, rejects = 0, idle = 0, compactions = 0, migrations = 0;
+  size_t prunes = 0, rejects = 0, idle = 0, migrations = 0;
 
   atomic_store(&stress_stop, 0);
   for (size_t i = 0; i < 4; i++)
@@ -1458,7 +1420,7 @@ static void check_concurrent_prune(void) {
     int r = getenv("PRUNE_STRESS_NOPRUNE") ? 0 : prune_one();
 
     if (cfg.with_reins) queue_for_reinsertion(&seed);
-    if (getenv("PRUNE_STRESS_COMPACT")) compact_one(&seed, &compactions, &migrations);
+    if (cfg.migrate_th > 0) migrate_one(&migrations);
 
     if (r > 0) prunes++;
     else if (r < 0) rejects++;
@@ -1527,10 +1489,10 @@ static void check_concurrent_prune(void) {
    * phase already asserts that pruning works. What this phase asserts is
    * consistency under concurrent pruning.
    */
-  if (getenv("PRUNE_STRESS_COMPACT")) {
-    printf("  %-34s %zu compactions, %zu migrations during the stress phase\n",
-           "segment compaction", compactions, migrations);
-    check(compactions + migrations > 0, "no compaction or migration ever ran");
+  if (cfg.migrate_th > 0) {
+    printf("  %-34s %zu migrations during the stress phase\n",
+           "migration", migrations);
+    check(migrations > 0, "no migration ever ran");
   }
   if (prunes == 0 && !getenv("PRUNE_STRESS_NOPRUNE"))
     printf("    NOTE no candidate came up during the stress phase this run\n");
@@ -1746,16 +1708,16 @@ static void hole_verify(void) {
            "state after recovery", seq, nb_before - 1);
 }
 
-/* ------------------------------------------ the automatic trigger (-C) */
+/* ------------------------------------------ the automatic trigger (-p) */
 
 /*
  * The same load and overwrite passes as the main run, then the restructuring
- * worker is started as -C would start it, with a short period and a threshold
+ * worker is started as -p would start it, with a short period and a threshold
  * the sweep is known to reach. Nobody calls tnt_prune_once() here: the worker
  * has to notice the stale ratio on its own timer and bring it under the
  * threshold, and every key must still read as before.
  */
-static void check_auto_trigger(void) {
+static void check_auto_trigger(int below_threshold) {
   struct prune_stale m;
   int waited_ms = 0;
   size_t nodes_before;
@@ -1771,18 +1733,42 @@ static void check_auto_trigger(void) {
   nodes_before = tnt_get_node_count();
 
   cfg.with_prune = 1;
-  cfg.prune_auto = 1;
-  cfg.prune_stale_ratio = 0.2;
-  cfg.prune_period_ms = 50;
+  cfg.prune_stale_ratio = below_threshold ? 1.0 : 0.2;
+  cfg.maintenance_period_ms = 50;
   prune_stale_measure(&m);
-  check(prune_stale_ratio(&m) >= cfg.prune_stale_ratio,
-        "the load left only %.1f%% stale, below the %.0f%% threshold",
-        100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
+  if (below_threshold) {
+    check(prune_stale_ratio(&m) < cfg.prune_stale_ratio,
+          "the fixture has no valid slots for the below-threshold check");
+    check(prune_count_candidates() > 0, "the fixture has no prune candidates");
+  } else {
+    check(prune_stale_ratio(&m) >= cfg.prune_stale_ratio,
+          "the load left only %.1f%% stale, below the %.0f%% threshold",
+          100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
+  }
   printf("  %-34s %zu/%zu stale (%.1f%%), threshold %.0f%%\n",
          "before the automatic trigger", m.stale, m.reserved,
          100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
 
+  uint64_t calls_before = __atomic_load_n(&rstats.prune_calls, __ATOMIC_RELAXED);
+  uint64_t wakeups_before = __atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED);
   check(restructuring_worker_init() == 0, "restructuring worker did not start");
+  if (below_threshold) {
+    /* Separate from the burst test: idle wakes reset candidate write marks. */
+    for (int i = 0; i < 500 &&
+         __atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED) < wakeups_before + 2; i++)
+      usleep(10000);
+    check(__atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED) >= wakeups_before + 2,
+          "the worker did not wake for the below-threshold check");
+    cfg.with_prune = 0;
+    tnt_maintenance_lock();
+    tnt_maintenance_unlock();
+    check(__atomic_load_n(&rstats.prune_calls, __ATOMIC_RELAXED) == calls_before &&
+          tnt_get_node_count() == nodes_before,
+          "-p attempted pruning below the global stale-ratio threshold");
+    verify_reads("reads below the pruning threshold");
+    printf("  automatic pruning below threshold: no prune attempts\n");
+    return;
+  }
   while (waited_ms < 30000) {
     prune_stale_measure(&m);
     if (prune_stale_ratio(&m) < cfg.prune_stale_ratio) break;
@@ -1790,7 +1776,6 @@ static void check_auto_trigger(void) {
     waited_ms += 100;
   }
   /* Park the worker: no more automatic prunes while the checks run. */
-  cfg.prune_auto = 0;
   cfg.with_prune = 0;
   tnt_maintenance_lock(); /* waits for a prune in flight */
   tnt_maintenance_unlock();
@@ -1823,9 +1808,10 @@ int main(int argc, char **argv) {
   int crash_split = argc > 1 && !strcmp(argv[1], "crash-split");
   int crash_prune = argc > 1 && !strncmp(argv[1], "crash-prune", 11);
   int auto_mode = argc > 1 && !strcmp(argv[1], "auto");
+  int auto_wait_mode = argc > 1 && !strcmp(argv[1], "auto-wait");
   int mode_arg = verify_only || verify_crash || verify_consistent ||
                  crash_split || crash_prune || hole_punch_mode ||
-                 hole_verify_mode || auto_mode;
+                 hole_verify_mode || auto_mode || auto_wait_mode;
 
   if (argc > 1 && !mode_arg) nb_keys = strtoull(argv[1], NULL, 0);
   if (argc > 2) nb_keys = strtoull(argv[2], NULL, 0);
@@ -1836,6 +1822,7 @@ int main(int argc, char **argv) {
   cfg.page_cache_size = PAGE_SIZE * 8192; /* 32 MB */
   /* PRUNE_REINS=1 runs the background reinsertion worker alongside. */
   cfg.with_reins = getenv("PRUNE_REINS") ? 1 : 0;
+  cfg.migrate_th = getenv("PRUNE_STRESS_MIGRATE") ? 0.9 : 0.0;
   cfg.with_rebal = 0;
   cfg.nb_items_in_db = nb_keys;
 
@@ -1864,8 +1851,8 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (auto_mode) {
-    check_auto_trigger();
+  if (auto_mode || auto_wait_mode) {
+    check_auto_trigger(auto_wait_mode);
     if (failures) {
       printf("== %lu failures ==\n", failures);
       return 1;
@@ -1937,7 +1924,6 @@ int main(int argc, char **argv) {
   check_blocked_writer(nb_keys / 2 + 1);
   validate("after blocked-writer restart");
 
-  check_prune_config();
   check_prune_link();
   check_retire();
   check_prune_all();

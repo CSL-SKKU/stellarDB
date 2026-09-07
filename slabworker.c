@@ -625,16 +625,6 @@ static void *worker_distributor_init(void *pdata) {
   return NULL;
 }
 
-/* Worker time split between the cleaner and the ILI pruner (see the wake loop). */
-static uint64_t cleaner_ms_last_wake = 0, ili_ms_last_wake = 0, cleaner_box_ms = 0;
-
-static uint64_t now_ms(void) {
-  struct timespec ts;
-
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 static void *worker_restructuring_init(void *pdata) {
   (void)pdata;
 
@@ -643,7 +633,7 @@ static void *worker_restructuring_init(void *pdata) {
     {
       /*
        * Periodic: wake once per period and check the structural conditions
-       * (depth for rebalancing, stale ratio for -C pruning). The utilization
+       * (depth for rebalancing, stale ratio for -p pruning). The utilization
        * gate used to stand in front of both; it measured queue-empty time,
        * which a closed-loop benchmark keeps near zero for every pool, and
        * booked time blocked in io_getevents as busy, so it never opened on a
@@ -653,8 +643,8 @@ static void *worker_restructuring_init(void *pdata) {
       struct timespec deadline;
 
       clock_gettime(CLOCK_REALTIME, &deadline);
-      deadline.tv_sec += cfg.prune_period_ms / 1000;
-      deadline.tv_nsec += (cfg.prune_period_ms % 1000) * 1000000L;
+      deadline.tv_sec += cfg.maintenance_period_ms / 1000;
+      deadline.tv_nsec += (cfg.maintenance_period_ms % 1000) * 1000000L;
       if (deadline.tv_nsec >= 1000000000L) {
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
@@ -686,158 +676,29 @@ static void *worker_restructuring_init(void *pdata) {
       sleep(1);
     }
 
-    /*
-     * Segment compaction before pruning, one period of it per wake so the
-     * ILI pruner keeps its turn (under churn candidates never run out).
-     *   1. one migration if an adjacent pair fits (structural: empties a
-     *      node for ILI);
-     *   2. the global-target cleaner: while stale/reserved > --compact-target
-     *      rebuild the most-stale internal node (or the legacy best-gain pick
-     *      with the absolute --compact-ratio gate);
-     * both charged to the byte budget (--compact-rate-mb, accrued by wall
-     * clock, banked up to two seconds). Above --compact-hard-cap the budget
-     * is bypassed. If the period ran out with work left, the next wake
-     * follows immediately instead of after the timed wait.
-     */
-    if (cfg.compact_ratio > 0 || cfg.migrate_th > 0 || cfg.compact_target > 0) {
-      static double allowance = 0.0;
-      static uint64_t last_accrual_ms = 0;
-      uint64_t before = __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED);
-      uint64_t t_start = now_ms();
-      struct prune_stale m;
-      double ratio0, ratio;
-      size_t done = 0;
-      int status = TNT_COMPACT_NOOP, unthrottled = 0;
-      const char *stop = "no more candidates";
+    /* One migration per wake can empty an internal node for ILI pruning. */
+    if (cfg.migrate_th > 0) {
+      int status = tnt_migrate_once();
 
-      if (cfg.compact_rate_mb) {
-        double per_ms = cfg.compact_rate_mb * 1e6 / 1000.0;
-
-        if (last_accrual_ms == 0)
-          last_accrual_ms = t_start;
-        allowance += per_ms * (double)(t_start - last_accrual_ms);
-        last_accrual_ms = t_start;
-        if (allowance > per_ms * 2000.0)
-          allowance = per_ms * 2000.0;
-      }
-      prune_stale_measure(&m);
-      ratio0 = ratio = prune_stale_ratio(&m);
-      unthrottled = cfg.compact_hard_cap > 0 && ratio > cfg.compact_hard_cap;
-      if (unthrottled)
-        RSTAT_INC(compact_hard_cap_hits);
-
-#define BUDGET_OK() (!cfg.compact_rate_mb || unthrottled || allowance > 0)
-#define CHARGE()                                                              \
-      do {                                                                    \
-        uint64_t now_b = __atomic_load_n(&rstats.rebuild_bytes_written,       \
-                                         __ATOMIC_RELAXED);                   \
-        allowance -= (double)(now_b - before);                                \
-        before = now_b;                                                       \
-      } while (0)
-
-      /* 1. one migration per wake */
-      if (cfg.migrate_th > 0 && BUDGET_OK()) {
-        status = tnt_compact_once(TNT_COMPACT_MIGRATE);
-        if (status == TNT_COMPACT_DONE) {
-          done++;
-          CHARGE();
-          prune_stale_measure(&m);
-          ratio = prune_stale_ratio(&m);
-        }
-      }
-      /*
-       * 2. the cleaner, with its own time-box checked after each rebuild (a
-       * single 64 MiB rebuild exceeds the period, so at least one runs per
-       * wake while over target). The box is the cleaner's share of the
-       * worker: with the ILI burst of the previous wake having taken I ms,
-       * the cleaner gets I * (1 - share) / share, and at least one period.
-       * With the immediate re-wake below this alternates cleaner / ILI in
-       * that proportion for as long as the ratio is above target.
-       */
-      {
-        double share = cfg.compact_ili_share > 0 && cfg.compact_ili_share < 1
-                           ? cfg.compact_ili_share : 0.25;
-        uint64_t box = (uint64_t)((double)ili_ms_last_wake * (1.0 - share) / share);
-
-        cleaner_box_ms = box > cfg.prune_period_ms ? box : cfg.prune_period_ms;
-      }
-      t_start = now_ms();
-      for (;;) {
-        if (!BUDGET_OK())
-          break;
-        if (cfg.compact_target > 0) {
-          if (ratio <= cfg.compact_target) {
-            stop = "at target";
-            break;
-          }
-          status = tnt_compact_once(TNT_COMPACT_TARGET);
-        } else if (cfg.compact_ratio > 0) {
-          status = tnt_compact_once(TNT_COMPACT_ANY);
-        } else {
-          break;
-        }
-        if (status != TNT_COMPACT_DONE) {
-          stop = status == TNT_COMPACT_NOOP ? "no more candidates" : strerror(-status);
-          break;
-        }
-        done++;
-        CHARGE();
-        prune_stale_measure(&m);
-        ratio = prune_stale_ratio(&m);
-        stop = "period over";
-        if (now_ms() - t_start >= cleaner_box_ms)
-          break;
-      }
-      cleaner_ms_last_wake = now_ms() - t_start;
-      if (cfg.compact_rate_mb && !unthrottled && allowance <= 0)
-        stop = "budget spent";
-      if (done) {
-        RSTAT_INC(compact_bursts);
-        printf("Compact trigger: %zu rebuilds, stale/reserved %.3f -> %.3f (%s%s)\n",
-               done, ratio0, ratio, stop, unthrottled ? ", hard cap, unthrottled" : "");
-      }
-      /* Work left and the period is what stopped us: do not wait for the next tick. */
-      if (!strcmp(stop, "period over")) {
-        pthread_mutex_lock(&restructuring_lock);
-        restructuring_requested = 1;
-        pthread_mutex_unlock(&restructuring_lock);
-      }
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&
           status != -ENOSPC && status != -ECANCELED)
-        fprintf(stderr, "Background compaction failed: %s\n", strerror(-status));
-#undef BUDGET_OK
-#undef CHARGE
+        fprintf(stderr, "Background migration failed: %s\n", strerror(-status));
     }
 
     /*
-     * Both maintenance operations run on this thread, which is what keeps them
+     * The maintenance operations run on this thread, which is what keeps them
      * exclusive; the mutex is there for the callers in main.c and the tests.
      *
-     * -C: prune while the stale-slot ratio is at or above the threshold and a
+     * -p: prune while the stale-slot ratio is at or above the threshold and a
      * candidate exists. A dropped candidate (-EAGAIN/-EBUSY/-ENOSPC) ends the
      * burst: the scan would hand back the same triple, and the next period
-     * retries. Without -C (-p): one prune per wake-up.
+     * retries.
      */
-    if (cfg.prune_auto) {
+    if (cfg.with_prune) {
       struct prune_stale m;
       size_t done = 0;
       int status = TNT_PRUNE_NOOP;
-      uint64_t t_ili = now_ms(), ili_box_ms = 0;
 
-      /*
-       * Its share of the worker while the cleaner is active: the burst may
-       * run share / (1 - share) of the cleaner's time this wake, at least one
-       * prune. With the cleaner idle (at target, or not configured) the burst
-       * is bounded only by candidates, as before.
-       */
-      if (cleaner_ms_last_wake > 0) {
-        double share = cfg.compact_ili_share > 0 && cfg.compact_ili_share < 1
-                           ? cfg.compact_ili_share : 0.25;
-
-        ili_box_ms = (uint64_t)((double)cleaner_ms_last_wake * share / (1.0 - share));
-        if (ili_box_ms < 1)
-          ili_box_ms = 1;
-      }
       prune_stale_measure(&m);
       __atomic_store_n(&rstats.prune_stale_last, (uint64_t)m.stale, __ATOMIC_RELAXED);
       __atomic_store_n(&rstats.prune_reserved_last, (uint64_t)m.reserved, __ATOMIC_RELAXED);
@@ -847,22 +708,12 @@ static void *worker_restructuring_init(void *pdata) {
           break;
         done++;
         prune_stale_measure(&m);
-        if (ili_box_ms && now_ms() - t_ili >= ili_box_ms)
-          break;
       }
-      ili_ms_last_wake = now_ms() - t_ili;
-      cleaner_ms_last_wake = 0;
       if (done) {
         RSTAT_INC(prune_bursts);
         printf("Prune trigger: %zu prunes, stale %zu/%zu (%.1f%%)\n", done,
                m.stale, m.reserved, 100.0 * prune_stale_ratio(&m));
       }
-      if (status < 0 && status != -EAGAIN && status != -EBUSY &&
-          status != -ENOSPC)
-        fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
-    } else if (cfg.with_prune) {
-      int status = tnt_prune_once();
-
       if (status < 0 && status != -EAGAIN && status != -EBUSY &&
           status != -ENOSPC)
         fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
@@ -894,7 +745,7 @@ static void *utilization_sampler(void *pdata) {
            "desc_avg_us desc_p99_us walk_avg_us walk_p99_us\n");
   printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
          "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb "
-         "reserved_slots valid_slots compactions migrations rebuild_mb_written\n");
+         "reserved_slots valid_slots migrations rebuild_mb_written\n");
   while (1) {
     struct prune_stale m;
 
@@ -928,7 +779,7 @@ static void *utilization_sampler(void *pdata) {
     uint64_t rss_kb, vsz_kb, hwm_kb;
 
     process_memory_kb(&rss_kb, &vsz_kb, &hwm_kb);
-    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu %lu %lu %.1f\n",
+    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu %lu %.1f\n",
            (now.tv_sec - t0.tv_sec) + (now.tv_usec - t0.tv_usec) / 1e6, dist,
            io, gate, tnt_rebalancing_needed() ? 1 : 0, tnt_get_node_count(),
            tnt_get_depth(), prune_stale_ratio(&m),
@@ -937,7 +788,6 @@ static void *utilization_sampler(void *pdata) {
            __atomic_load_n(&rstats.prune_done, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED),
            rss_kb / 1024, vsz_kb / 1024, m.reserved, m.valid,
-           __atomic_load_n(&rstats.compactions, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.migrations, __ATOMIC_RELAXED),
            __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED) / 1e6);
     fflush(stdout);

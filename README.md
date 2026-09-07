@@ -121,6 +121,24 @@ and deep/hot reads before sampling; `#R run reinsertion` reports copy attempts,
 published copies, and abandoned copies. Slab queue counters stay zero in this
 mode.
 
+## Pruning
+
+`-p RATIO` / `--with-prune RATIO` enables repeated pruning while the global
+stale/reserved slot ratio is at or above `RATIO`. The argument is required and
+must be between `0` and `1`; for example, `-p 0.3` uses a 30% threshold. The worker
+rechecks the ratio after each successful prune and stops when it falls below
+the threshold or no candidate succeeds. `-M` / `--maintenance-period-ms` sets the
+periodic wake interval shared by background maintenance (default `500` ms).
+
+The former `-C` / `--pruning` and `--prune-stale-ratio` options have been removed;
+use `-p RATIO` instead. Setting the maintenance period alone does not enable pruning.
+
+`--migrate-th T` enables migration when an internal node's valid entries fit
+with its history parent's within `T` times the slab capacity (`0` disables it).
+The worker attempts one migration per wake before the ILI pruning burst.
+For example, `-p 0.3 --migrate-th 0.9 -M 500` enables both. Standalone slab
+compaction and all `--compact-*` options have been removed.
+
 ## Index-Only Testing
 
 For index-only microbenchmarking, build and run the test binary:

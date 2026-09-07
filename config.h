@@ -36,37 +36,17 @@ struct runtime_config {
      * key read deep N times is copied with high probability; a key read once
      * almost never is. Zero-memory stand-in for a per-record hit counter. */
     unsigned long      reins_sample;
+    /* -p <ratio>: enable repeated pruning and set prune_stale_ratio. */
     int                with_prune;
-    /* Slots kept free in a merged slab. */
-    unsigned long      prune_margin;
-    /* Skip a triple whose leaf is among the newest N slabs (0: no minimum). */
-    unsigned long      prune_min_age;
-    /* -C: prune automatically when the stale-slot ratio crosses the threshold. */
-    int                prune_auto;
     double             prune_stale_ratio;
-    unsigned long      prune_period_ms;
+    /* -M: shared background maintenance interval, in milliseconds. */
+    unsigned long      maintenance_period_ms;
     /*
-     * Segment compaction (all 0 = off). --compact-ratio r: rebuild an internal
-     * node whose stale-slot fraction is >= r. --migrate-th t: move a node's
-     * valid entries into its history parent when valid(parent) + valid(node)
-     * <= t * slab capacity, leaving the node empty. --compact-rate-mb n: byte
-     * budget for rebuild writes, MB/s (0 = unlimited).
+     * --migrate-th t: move an internal node's valid entries into its history
+     * parent when valid(parent) + valid(node)
+     * <= t * slab capacity, leaving the node empty. 0 = off.
      */
-    double             compact_ratio;
     double             migrate_th;
-    unsigned long      compact_rate_mb;
-    /*
-     * --compact-target e: global target for stale/reserved. While the ratio is
-     * above e the worker rebuilds the internal node with the highest stale
-     * fraction (there is always one at or above the global ratio), spending
-     * --compact-rate-mb per second at most. --compact-hard-cap h: above h the
-     * budget is bypassed and the cleaner runs unthrottled. 0 = off.
-     */
-    double             compact_target;
-    double             compact_hard_cap;
-    /* --compact-ili-share f: while over target the ILI pruner gets this
-     * fraction of the worker's time and the cleaner the rest (0.25). */
-    double             compact_ili_share;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;

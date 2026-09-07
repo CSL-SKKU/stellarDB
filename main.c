@@ -27,18 +27,9 @@ static void print_help(char *n) {
   puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
   puts("      --dump-slabs <s>            heavy monitoring: one #S line per slab every <s> s and at the end (0 = off)");
   puts("      --reins-sample <N>          with -r: attempt a copy on one in N qualifying reads (16; 0 means 1)");
-  puts("  -p, --with-prune                enable pruning logic");
-  puts("      --prune-margin <slots>      slots kept free in a merged slab");
-  puts("      --prune-min-age <slabs>     skip triples whose leaf is newer than this");
-  puts("  -C, --pruning                   prune automatically when stale slots exceed the ratio");
-  puts("      --prune-stale-ratio <0..1>  stale/reserved slot ratio that triggers a prune (0.3)");
-  puts("      --prune-period-ms <ms>      how often the ratio is measured (500)");
-  puts("      --compact-ratio <0..1>      segment compaction: rebuild an internal node whose stale fraction >= r (0 = off)");
+  puts("  -p, --with-prune <0..1>         enable repeated pruning at this global stale/reserved ratio");
+  puts("  -M, --maintenance-period-ms <ms> interval for background maintenance (500)");
   puts("      --migrate-th <0..1>         migration: move a node into its history parent when both fit in t * capacity (0 = off)");
-  puts("      --compact-rate-mb <n>       byte budget for rebuild writes, MB/s (0 = unlimited)");
-  puts("      --compact-target <0..1>     keep stale/reserved <= this: rebuild the most-stale internal node while above (0 = off)");
-  puts("      --compact-hard-cap <0..1>   above this stale/reserved ratio the byte budget is ignored (0 = none)");
-  puts("      --compact-ili-share <0..1>  while over target: worker time share of the ILI pruner, cleaner gets the rest (0.25)");
   puts("  -n, --items <number>            set number of items in DB");
   puts("  -q, --requests <number>         set number of requests");
   puts("  -c, --chunk <number>            chunk size for shuffling");
@@ -66,18 +57,9 @@ int main(int argc, char **argv) {
         {"churn-mix",       required_argument, 0, 1011},
         {"dump-slabs",      required_argument, 0, 1012},
         {"reins-sample",    required_argument, 0, 1009},
-        {"with-prune",      no_argument,       0, 'p'},
-        {"prune-margin",    required_argument, 0, 1000},
-        {"prune-min-age",   required_argument, 0, 1001},
-        {"pruning",         no_argument,       0, 'C'},
-        {"prune-stale-ratio", required_argument, 0, 1002},
-        {"prune-period-ms", required_argument, 0, 1003},
-        {"compact-ratio",   required_argument, 0, 1013},
+        {"with-prune",      required_argument, 0, 'p'},
+        {"maintenance-period-ms", required_argument, 0, 'M'},
         {"migrate-th",      required_argument, 0, 1014},
-        {"compact-rate-mb", required_argument, 0, 1015},
-        {"compact-target",  required_argument, 0, 1016},
-        {"compact-hard-cap", required_argument, 0, 1017},
-        {"compact-ili-share", required_argument, 0, 1018},
         {"items",           required_argument, 0, 'n'},
         {"requests",        required_argument, 0, 'q'},
         {"chunk",           required_argument, 0, 'c'},
@@ -86,7 +68,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:rRpCn:q:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:rRp:M:n:q:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'P': cfg.page_cache_size = strtoul(optarg, NULL, 0); break;
         case 'b': cfg.bench           = parse_bench(optarg);     break;
@@ -115,18 +97,21 @@ int main(int argc, char **argv) {
                    if (cfg.latency_series_ms && cfg.latency_series_ms < 100)
                      cfg.latency_series_ms = 100;
                    break;
-        case 'p': cfg.with_prune      = 1;                       break;
-        case 1000: cfg.prune_margin   = strtoul(optarg, NULL, 0); break;
-        case 1001: cfg.prune_min_age  = strtoul(optarg, NULL, 0); break;
-        case 'C': cfg.with_prune = 1; cfg.prune_auto = 1;        break;
-        case 1002: cfg.prune_stale_ratio = strtod(optarg, NULL);   break;
-        case 1003: cfg.prune_period_ms = strtoul(optarg, NULL, 0); break;
-        case 1013: cfg.compact_ratio   = strtod(optarg, NULL);   break;
+        case 'p': {
+          char *end;
+          double ratio = strtod(optarg, &end);
+
+          if (end == optarg || *end != '\0' || !isfinite(ratio) ||
+              ratio < 0.0 || ratio > 1.0) {
+            fprintf(stderr, "-p/--with-prune requires a ratio between 0 and 1\n");
+            return 1;
+          }
+          cfg.with_prune = 1;
+          cfg.prune_stale_ratio = ratio;
+          break;
+        }
+        case 'M': cfg.maintenance_period_ms = strtoul(optarg, NULL, 0); break;
         case 1014: cfg.migrate_th      = strtod(optarg, NULL);   break;
-        case 1015: cfg.compact_rate_mb = strtoul(optarg, NULL, 0); break;
-        case 1016: cfg.compact_target  = strtod(optarg, NULL);   break;
-        case 1017: cfg.compact_hard_cap = strtod(optarg, NULL);  break;
-        case 1018: cfg.compact_ili_share = strtod(optarg, NULL); break;
         case 'n': cfg.nb_items_in_db  = strtoull(optarg, NULL, 0); break;
         case 'q': cfg.nb_requests     = strtoull(optarg, NULL, 0); break;
         case 'c': cfg.chunk_for_shuffle = strtoull(optarg, NULL, 0); break;
@@ -191,22 +176,16 @@ int main(int argc, char **argv) {
     printf("# \tLatency series: every %lu ms (#L lines, histogram percentiles)\n",
            cfg.latency_series_ms);
   if (cfg.with_prune)
-    printf("# \tPruning: margin %lu slots, minimum leaf age %lu slabs\n",
-           cfg.prune_margin, cfg.prune_min_age);
-  if (cfg.prune_auto)
-    printf("# \tPruning trigger: stale ratio >= %.2f, measured every %lu ms\n",
-           cfg.prune_stale_ratio, cfg.prune_period_ms);
-  if (cfg.compact_ratio > 0 || cfg.migrate_th > 0 || cfg.compact_target > 0)
-    printf("# \tSegment compaction: compact at stale >= %.2f, migrate when fit <= %.2f, "
-           "budget %lu MB/s (0 = unlimited), checked every %lu ms\n",
-           cfg.compact_ratio, cfg.migrate_th, cfg.compact_rate_mb, cfg.prune_period_ms);
-  if (cfg.compact_target > 0)
-    printf("# \tCompaction target: stale/reserved <= %.2f (hard cap %.2f, 0 = none)\n",
-           cfg.compact_target, cfg.compact_hard_cap);
+    printf("# \tPruning trigger: repeat while global stale ratio >= %.2f, checked every %lu ms\n",
+           cfg.prune_stale_ratio, cfg.maintenance_period_ms);
+  if (cfg.migrate_th > 0)
+    printf("# \tMigration: combined valid slots <= %.2f * slab capacity, "
+           "one attempt per maintenance wake (%lu ms)\n",
+           cfg.migrate_th, cfg.maintenance_period_ms);
   if (cfg.with_rebal) {
     printf("# \tRebalancing threshold: depth > ceil(log2(nodes+1)) * %.2f "
            "(checked every %lu ms; utilization gate %s)\n",
-           cfg.rebalance_threshold, cfg.prune_period_ms,
+           cfg.rebalance_threshold, cfg.maintenance_period_ms,
            cfg.util_gate ? "required" : "off, sampled only");
   }
 
@@ -276,9 +255,8 @@ int main(int argc, char **argv) {
   //}
 
 
-  /* One thread runs both maintenance operations, so they exclude each other. */
-  if (cfg.with_rebal || cfg.with_prune || cfg.compact_ratio > 0 ||
-      cfg.migrate_th > 0 || cfg.compact_target > 0) {
+  /* One thread runs the maintenance operations, so they exclude each other. */
+  if (cfg.with_rebal || cfg.with_prune || cfg.migrate_th > 0) {
     int worker_status = restructuring_worker_init();
 
     if (worker_status < 0)
