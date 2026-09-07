@@ -22,6 +22,7 @@ int main(void) {
 
   /* The threshold is read from cfg; unset it is 0 and every tree is "deep". */
   init_default_config(&cfg);
+  assert(!cfg.with_rebal && cfg.rebalance_threshold == REBALANCE_THRESHOLD);
 
   assert(get_distributor_utilization() == 0);
   assert(get_io_worker_utilization() == 0);
@@ -62,12 +63,29 @@ int main(void) {
     add_node(&slabs[i + 3], additional_keys[i]);
   assert(tnt_get_node_count() == 15);
   assert(tnt_get_depth() == 8);
+
+  /* A larger threshold is less sensitive. Equality must not trigger. */
+  cfg.rebalance_threshold = 5.0;
+  assert(!tnt_rebalancing_needed());
+  atomic_store(&tnt_centree()->depth, 20); /* 5 * ceil(log2(16)) */
+  assert(!tnt_rebalancing_needed());
+  atomic_store(&tnt_centree()->depth, 21);
+  assert(tnt_rebalancing_needed());
+  atomic_store(&tnt_centree()->depth, 8);
+  cfg.rebalance_threshold = 2.0;
+  assert(!tnt_rebalancing_needed());
+  cfg.rebalance_threshold = 1.5;
   assert(tnt_rebalancing_needed());
 
   assert(tnt_rebalancing() == TNT_REBALANCE_SUCCESS);
   assert(tnt_get_node_count() == 15);
   assert(tnt_get_depth() == 4);
   assert(!tnt_rebalancing_needed());
+  cfg.rebalance_threshold = 1.0;
+  assert(!tnt_rebalancing_needed());
+  cfg.rebalance_threshold = 0.0;
+  assert(tnt_rebalancing_needed());
+  cfg.rebalance_threshold = REBALANCE_THRESHOLD;
 
   puts("rebalance runtime API tests passed");
   return 0;

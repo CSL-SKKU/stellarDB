@@ -22,8 +22,9 @@ static void print_help(char *n) {
   puts("  -e, --epoch <number>            set EPOCH");
   puts("  -r[<x>], --with-reins[=<x>]     reinsert hot records after >= ceil(x * log2(nodes+1)) history hops");
   puts("                                x >= 0, default 1.0; attach the value: -r0.5 or --with-reins=0.5");
-  puts("  -R, --with-rebal                enable rebalancing logic");
-  puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
+  puts("  -R[<x>], --with-rebal[=<x>]     rebalance when depth > x * ceil(log2(nodes+1))");
+  printf("                                x >= 0, default %.6g; higher is less sensitive; attach values: -R2.0\n",
+         (double)REBALANCE_THRESHOLD);
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
   puts("      --latency-series <ms>       print per-interval latency lines (#L); off by default");
   puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
@@ -52,8 +53,7 @@ int main(int argc, char **argv) {
         {"old-percent",     required_argument, 0, 'o'},
         {"epoch",           required_argument, 0, 'e'},
         {"with-reins",      optional_argument, 0, 'r'},
-        {"with-rebal",      no_argument,       0, 'R'},
-        {"rebalance-threshold", required_argument, 0, 1004},
+        {"with-rebal",      optional_argument, 0, 'R'},
         {"util-gate",       no_argument,       0, 1005},
         {"latency-series",  required_argument, 0, 1006},
         {"churn-mix",       required_argument, 0, 1011},
@@ -70,7 +70,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:r::Rp:M:n:q:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:r::R::p:M:n:q:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'P': cfg.page_cache_size = strtoul(optarg, NULL, 0); break;
         case 'b': cfg.bench           = parse_bench(optarg);     break;
@@ -98,8 +98,24 @@ int main(int argc, char **argv) {
           cfg.reins_multiplier = multiplier;
           break;
         }
-        case 'R': cfg.with_rebal      = 1;                       break;
-        case 1004: cfg.rebalance_threshold = strtod(optarg, NULL); break;
+        case 'R': {
+          double threshold = REBALANCE_THRESHOLD;
+
+          if (optarg != NULL) {
+            char *end;
+
+            errno = 0;
+            threshold = strtod(optarg, &end);
+            if (end == optarg || *end != '\0' || errno == ERANGE ||
+                !isfinite(threshold) || threshold < 0.0) {
+              fprintf(stderr, "-R/--with-rebal requires a finite, nonnegative threshold\n");
+              return 1;
+            }
+          }
+          cfg.with_rebal = 1;
+          cfg.rebalance_threshold = threshold;
+          break;
+        }
         case 1005: cfg.util_gate = 1; break;
         case 1009: cfg.reins_sample = strtoul(optarg, NULL, 0);
                    if (!cfg.reins_sample) cfg.reins_sample = 1;
@@ -145,7 +161,7 @@ int main(int argc, char **argv) {
         // 남은 포지셔널 세 개
     if (optind + 3 != argc) {
 	fprintf(stderr, "Expected exactly three positional arguments: disks, workers, distributors.\n"
-                        "Attach an optional -r value as -r0.5 or --with-reins=0.5.\n");
+                        "Attach optional -r/-R values, for example -r0.5 or -R2.0.\n");
 	print_help(argv[0]);
         return 1;
     }

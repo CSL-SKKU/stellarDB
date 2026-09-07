@@ -67,7 +67,7 @@ make REALKEY_FILE_PATH=/path/to/key-trace
   -e, --epoch <number>            Set epoch count
   -r[<x>], --with-reins[=<x>]     Reinsert after >= ceil(x * log2(nodes+1)) history hops (x >= 0, default 1.0)
       --reins-sample <N>          With -r: attempt a copy on one in N qualifying reads (16; 0 means 1)
-  -R, --with-rebal                Enable rebalancing logic (used in Section 4.5 experiments)
+  -R[<x>], --with-rebal[=<x>]     Rebalance when depth > x * ceil(log2(nodes+1)) (x >= 0, default 5.0)
   -n, --items <number>            Number of items in the database
   -q, --requests <number>         Number of requests
   -c, --chunk <number>            Chunk size for key shuffling (used in Section 4.5 experiments)
@@ -131,6 +131,29 @@ The former `--reins-on-read`, `--reins-depth-ratio`, and
 and deep/hot reads before sampling; `#R run reinsertion` reports copy attempts,
 published copies, and abandoned copies. Slab queue counters stay zero in this
 mode.
+
+## Rebalancing
+
+`-R` / `--with-rebal` enables routing rebalancing with a default threshold of
+`5.0`. Attach an optional threshold as `-R2.0` or `--with-rebal=2.0`.
+Background rebalancing runs when the tree has more than one node and:
+
+```text
+depth > threshold * ceil(log2(node_count + 1))
+```
+
+Higher values are less sensitive. The threshold must be finite and
+nonnegative; `0` requests rebalancing at each maintenance check for a tree
+with more than one node. The shared maintenance interval is controlled by
+`-M`. With `-R` enabled, `main` also rebalances once after loading, independently
+of the background threshold. Rebalancing preserves historical `lu_parent`
+links and moves no records.
+
+The optional value must be attached, so `-R 1 48 12` uses the default threshold
+and preserves the disk/worker/distributor arguments. Use `-R2.0 1 48 12` for
+threshold `2.0`. The last `-R` setting wins; a later bare `-R` restores the
+default. Configure the threshold through `-R`; `--rebalance-threshold` is no
+longer accepted.
 
 ## Pruning
 

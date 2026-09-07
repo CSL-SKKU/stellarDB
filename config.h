@@ -18,7 +18,7 @@ struct runtime_config {
     int                with_reins;
     double             reins_multiplier;
     int                with_rebal;
-    /* Rebalance when depth > log2(nodes) * rebalance_threshold. */
+    /* -R[<x>]: rebalance when depth > ceil(log2(nodes+1)) * x. */
     double             rebalance_threshold;
     /* --util-gate: also require the (distributor busy, I/O idle) gate. Off. */
     int                util_gate;
