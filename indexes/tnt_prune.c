@@ -50,73 +50,86 @@ static uint64_t now_us(void) {
 }
 
 /*
- * Batched page reads for the merge. One synchronous 4 KiB read per touched
+ * Pipelined page reads for the merge. One synchronous 4 KiB read per touched
  * page was the pruner's whole cost under load: each read waited its turn
- * behind the workload's queue (~1.5 ms against ~20 us on an idle device), so a
- * source with 10k live entries took 15 s. Submitting the touched pages as
- * batches of QUEUE_DEPTH concurrent reads pays that wait once per batch. The
- * pruner is a single thread, so it owns one aio context of its own.
+ * behind the workload's queue (~1.5 ms against ~20 us on an idle device).
+ * Batches of QUEUE_DEPTH paid that wait once per batch, but still once per
+ * batch: a 64 MiB node took ~265 round trips of 2-3 ms. Now up to
+ * PRUNE_READ_DEPTH reads stay in flight and every completion is refilled at
+ * once, so the read phase is bound by the thread's share of device bandwidth
+ * instead of by round trips. The pruner is a single thread, so it owns one
+ * aio context of its own.
  */
-#define PRUNE_READ_BATCH QUEUE_DEPTH
+#define PRUNE_READ_DEPTH 512
 
 static aio_context_t prune_aio;
-static struct iocb prune_iocb[PRUNE_READ_BATCH];
-static struct iocb *prune_iocbs[PRUNE_READ_BATCH];
-static struct io_event prune_events[PRUNE_READ_BATCH];
+static struct iocb prune_iocb[PRUNE_READ_DEPTH];
+static struct iocb *prune_iocbs[PRUNE_READ_DEPTH];
+static struct io_event prune_events[PRUNE_READ_DEPTH];
 
 static int prune_aio_init(void) {
   if (prune_aio != 0)
     return 0;
-  if (syscall(__NR_io_setup, PRUNE_READ_BATCH, &prune_aio) != 0)
+  if (syscall(__NR_io_setup, PRUNE_READ_DEPTH, &prune_aio) != 0)
     return -errno;
-  for (int i = 0; i < PRUNE_READ_BATCH; i++)
-    prune_iocbs[i] = &prune_iocb[i];
   return 0;
 }
 
-/* Reads pages[0..nb) of fd into buf, PAGE_SIZE each, in submission batches. */
+/* Reads pages[0..nb) of fd into buf, PAGE_SIZE each, keeping the queue full. */
 static int prune_read_pages(int fd, const size_t *pages, size_t nb, char *buf) {
   int error = prune_aio_init();
+  int free_idx[PRUNE_READ_DEPTH];
+  int nfree = PRUNE_READ_DEPTH;
+  size_t next = 0, done = 0, inflight = 0;
 
   if (error)
     return error;
-  for (size_t done = 0; done < nb;) {
-    long batch = (long)(nb - done);
-    long got = 0;
+  for (int i = 0; i < PRUNE_READ_DEPTH; i++)
+    free_idx[i] = PRUNE_READ_DEPTH - 1 - i;
+  while (done < nb) {
+    long tosend = 0;
 
-    if (batch > PRUNE_READ_BATCH)
-      batch = PRUNE_READ_BATCH;
-    for (long i = 0; i < batch; i++) {
+    while (next < nb && nfree > 0) {
+      int i = free_idx[--nfree];
       struct iocb *cb = &prune_iocb[i];
 
       memset(cb, 0, sizeof(*cb));
+      cb->aio_data = (uint64_t)i;
       cb->aio_fildes = (uint32_t)fd;
       cb->aio_lio_opcode = IOCB_CMD_PREAD;
-      cb->aio_buf = (uint64_t)(uintptr_t)(buf + (done + (size_t)i) * PAGE_SIZE);
+      cb->aio_buf = (uint64_t)(uintptr_t)(buf + next * PAGE_SIZE);
       cb->aio_nbytes = PAGE_SIZE;
-      cb->aio_offset = (int64_t)(pages[done + (size_t)i] * PAGE_SIZE);
+      cb->aio_offset = (int64_t)(pages[next] * PAGE_SIZE);
+      prune_iocbs[tosend++] = cb;
+      next++;
     }
-    for (long sent = 0; sent < batch;) {
-      long r = syscall(__NR_io_submit, prune_aio, batch - sent,
+    for (long sent = 0; sent < tosend;) {
+      long r = syscall(__NR_io_submit, prune_aio, tosend - sent,
                        prune_iocbs + sent);
 
       if (r < 0)
         return -errno;
       sent += r;
     }
-    pt.preads++;
-    while (got < batch) {
-      long r = syscall(__NR_io_getevents, prune_aio, batch - got, batch - got,
+    inflight += (size_t)tosend;
+    if (tosend)
+      pt.preads++;
+    if (inflight == 0)
+      break;
+    {
+      long r = syscall(__NR_io_getevents, prune_aio, 1, (long)inflight,
                        prune_events, NULL);
 
       if (r < 0)
         return -errno;
-      for (long i = 0; i < r; i++)
+      for (long i = 0; i < r; i++) {
         if (prune_events[i].res != (int64_t)PAGE_SIZE)
           return -EIO;
-      got += r;
+        free_idx[nfree++] = (int)prune_events[i].data;
+      }
+      inflight -= (size_t)r;
+      done += (size_t)r;
     }
-    done += (size_t)batch;
   }
   return 0;
 }

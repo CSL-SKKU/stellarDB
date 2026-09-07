@@ -664,6 +664,9 @@ static void *worker_distributor_init(void *pdata) {
   return NULL;
 }
 
+/* Worker time split between the cleaner and the ILI pruner (see the wake loop). */
+static uint64_t cleaner_ms_last_wake = 0, ili_ms_last_wake = 0, cleaner_box_ms = 0;
+
 static uint64_t now_ms(void) {
   struct timespec ts;
 
@@ -782,11 +785,21 @@ static void *worker_restructuring_init(void *pdata) {
         }
       }
       /*
-       * 2. the cleaner, with its own time-box: a single 64 MiB rebuild takes
-       * longer than the period, so the box is checked after each rebuild, not
-       * before the first -- while over target at least one rebuild runs per
-       * wake whatever the migration above cost.
+       * 2. the cleaner, with its own time-box checked after each rebuild (a
+       * single 64 MiB rebuild exceeds the period, so at least one runs per
+       * wake while over target). The box is the cleaner's share of the
+       * worker: with the ILI burst of the previous wake having taken I ms,
+       * the cleaner gets I * (1 - share) / share, and at least one period.
+       * With the immediate re-wake below this alternates cleaner / ILI in
+       * that proportion for as long as the ratio is above target.
        */
+      {
+        double share = cfg.compact_ili_share > 0 && cfg.compact_ili_share < 1
+                           ? cfg.compact_ili_share : 0.25;
+        uint64_t box = (uint64_t)((double)ili_ms_last_wake * (1.0 - share) / share);
+
+        cleaner_box_ms = box > cfg.prune_period_ms ? box : cfg.prune_period_ms;
+      }
       t_start = now_ms();
       for (;;) {
         if (!BUDGET_OK())
@@ -811,9 +824,10 @@ static void *worker_restructuring_init(void *pdata) {
         prune_stale_measure(&m);
         ratio = prune_stale_ratio(&m);
         stop = "period over";
-        if (now_ms() - t_start >= cfg.prune_period_ms)
+        if (now_ms() - t_start >= cleaner_box_ms)
           break;
       }
+      cleaner_ms_last_wake = now_ms() - t_start;
       if (cfg.compact_rate_mb && !unthrottled && allowance <= 0)
         stop = "budget spent";
       if (done) {
@@ -847,7 +861,22 @@ static void *worker_restructuring_init(void *pdata) {
       struct prune_stale m;
       size_t done = 0;
       int status = TNT_PRUNE_NOOP;
+      uint64_t t_ili = now_ms(), ili_box_ms = 0;
 
+      /*
+       * Its share of the worker while the cleaner is active: the burst may
+       * run share / (1 - share) of the cleaner's time this wake, at least one
+       * prune. With the cleaner idle (at target, or not configured) the burst
+       * is bounded only by candidates, as before.
+       */
+      if (cleaner_ms_last_wake > 0) {
+        double share = cfg.compact_ili_share > 0 && cfg.compact_ili_share < 1
+                           ? cfg.compact_ili_share : 0.25;
+
+        ili_box_ms = (uint64_t)((double)cleaner_ms_last_wake * share / (1.0 - share));
+        if (ili_box_ms < 1)
+          ili_box_ms = 1;
+      }
       prune_stale_measure(&m);
       __atomic_store_n(&rstats.prune_stale_last, (uint64_t)m.stale, __ATOMIC_RELAXED);
       __atomic_store_n(&rstats.prune_reserved_last, (uint64_t)m.reserved, __ATOMIC_RELAXED);
@@ -857,7 +886,11 @@ static void *worker_restructuring_init(void *pdata) {
           break;
         done++;
         prune_stale_measure(&m);
+        if (ili_box_ms && now_ms() - t_ili >= ili_box_ms)
+          break;
       }
+      ili_ms_last_wake = now_ms() - t_ili;
+      cleaner_ms_last_wake = 0;
       if (done) {
         RSTAT_INC(prune_bursts);
         printf("Prune trigger: %zu prunes, stale %zu/%zu (%.1f%%)\n", done,

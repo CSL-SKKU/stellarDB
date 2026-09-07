@@ -75,6 +75,9 @@ struct runtime_config {
      */
     double             compact_target;
     double             compact_hard_cap;
+    /* --compact-ili-share f: while over target the ILI pruner gets this
+     * fraction of the worker's time and the cleaner the rest (0.25). */
+    double             compact_ili_share;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;

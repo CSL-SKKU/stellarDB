@@ -40,6 +40,7 @@ static void print_help(char *n) {
   puts("      --compact-rate-mb <n>       byte budget for rebuild writes, MB/s (0 = unlimited)");
   puts("      --compact-target <0..1>     keep stale/reserved <= this: rebuild the most-stale internal node while above (0 = off)");
   puts("      --compact-hard-cap <0..1>   above this stale/reserved ratio the byte budget is ignored (0 = none)");
+  puts("      --compact-ili-share <0..1>  while over target: worker time share of the ILI pruner, cleaner gets the rest (0.25)");
   puts("  -n, --items <number>            set number of items in DB");
   puts("  -q, --requests <number>         set number of requests");
   puts("  -c, --chunk <number>            chunk size for shuffling");
@@ -80,6 +81,7 @@ int main(int argc, char **argv) {
         {"compact-rate-mb", required_argument, 0, 1015},
         {"compact-target",  required_argument, 0, 1016},
         {"compact-hard-cap", required_argument, 0, 1017},
+        {"compact-ili-share", required_argument, 0, 1018},
         {"items",           required_argument, 0, 'n'},
         {"requests",        required_argument, 0, 'q'},
         {"chunk",           required_argument, 0, 'c'},
@@ -137,6 +139,7 @@ int main(int argc, char **argv) {
         case 1015: cfg.compact_rate_mb = strtoul(optarg, NULL, 0); break;
         case 1016: cfg.compact_target  = strtod(optarg, NULL);   break;
         case 1017: cfg.compact_hard_cap = strtod(optarg, NULL);  break;
+        case 1018: cfg.compact_ili_share = strtod(optarg, NULL); break;
         case 'n': cfg.nb_items_in_db  = strtoull(optarg, NULL, 0); break;
         case 'q': cfg.nb_requests     = strtoull(optarg, NULL, 0); break;
         case 'c': cfg.chunk_for_shuffle = strtoull(optarg, NULL, 0); break;
