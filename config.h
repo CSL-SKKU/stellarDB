@@ -14,8 +14,9 @@ struct runtime_config {
     int                insert_mode;
     double             old_percent;
     unsigned long      epoch;
-    /* -r: copy deep, hot records on read using ceil(log2(nodes+1)). */
+    /* -r[<x>]: copy hot records after ceil(x * log2(nodes+1)) history hops. */
     int                with_reins;
+    double             reins_multiplier;
     int                with_rebal;
     /* Rebalance when depth > log2(nodes) * rebalance_threshold. */
     double             rebalance_threshold;

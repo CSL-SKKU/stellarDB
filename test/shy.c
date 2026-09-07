@@ -316,7 +316,7 @@ static void test_on_read_trigger(void) {
       .action = READ_NO_LOOKUP, .upward_len = 6, .page_was_hot = 1};
 
   init_default_config(&cfg);
-  check(!cfg.with_reins && cfg.reins_sample == 16,
+  check(!cfg.with_reins && cfg.reins_multiplier == 1.0 && cfg.reins_sample == 16,
         "reinsertion defaults changed");
   cfg.reins_sample = 1;
   centree_init();
@@ -359,6 +359,35 @@ static void test_on_read_trigger(void) {
   src->read_ref++;
   read_item_async_cb(&cb);
   check(rstats.reins_or_deep == 2, "node count did not raise the threshold");
+
+  const struct {
+    uint64_t nodes;
+    double multiplier;
+    int upward_len, qualifies;
+  } cases[] = {
+      {31, 0.5, 3, 0},  /* ceil(0.5 * log2(32)) = 3 hops */
+      {31, 0.5, 4, 1},
+      {31, 2.0, 10, 0}, /* ceil(2 * log2(32)) = 10 hops */
+      {31, 2.0, 11, 1},
+      {33, 1.1, 6, 0},  /* multiply before rounding: ceil(1.1 * log2(34)) = 6 */
+      {33, 1.1, 7, 1},
+      {31, 0.0, 1, 1},  /* zero bypasses distance, including a leaf hit */
+  };
+  for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    uint64_t deep_before = rstats.reins_or_deep;
+    uint64_t examined_before = rstats.reins_examined;
+
+    atomic_store(&tnt_centree()->node_count, cases[i].nodes);
+    cfg.reins_multiplier = cases[i].multiplier;
+    cb.upward_len = cases[i].upward_len;
+    src->read_ref++;
+    read_item_async_cb(&cb);
+    check(rstats.reins_or_deep == deep_before + cases[i].qualifies &&
+              rstats.reins_examined == examined_before + cases[i].qualifies,
+          "multiplier %.2f, %lu nodes, upward_len %d: wrong trigger result",
+          cases[i].multiplier, cases[i].nodes, cases[i].upward_len);
+  }
+  cfg.reins_multiplier = 1.0;
   check(rstats.reins_issued == 0 && rstats.reins_published == 0 && src->read_ref == 0,
         "an unindexed source was copied or leaked a read reference");
   subtree_free(src->subtree);
@@ -366,7 +395,7 @@ static void test_on_read_trigger(void) {
   free(src->centree_node);
   free(src);
   free(item);
-  puts("  on-read enable, page reuse and logarithmic history threshold passed");
+  puts("  on-read enable, page reuse and scaled logarithmic history threshold passed");
 }
 
 int main(void) {

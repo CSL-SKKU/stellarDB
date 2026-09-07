@@ -82,6 +82,7 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->old_percent     = OLD_PERCENT;
     cfg->epoch           = EPOCH;
     cfg->with_reins      = 0;
+    cfg->reins_multiplier = 1.0;
     cfg->with_rebal      = 0;
     cfg->rebalance_threshold = REBALANCE_THRESHOLD;
     cfg->util_gate       = 0;

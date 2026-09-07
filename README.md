@@ -65,7 +65,7 @@ make REALKEY_FILE_PATH=/path/to/key-trace
   -i, --insert-mode <ascend|descend|random>  Set insert mode (used in Section 4.5 experiments)
   -o, --old-percent <float>       Set OLD_PERCENT
   -e, --epoch <number>            Set epoch count
-  -r, --with-reins                Reinsert hot records on read after >= ceil(log2(nodes+1)) history hops
+  -r[<x>], --with-reins[=<x>]     Reinsert after >= ceil(x * log2(nodes+1)) history hops (x >= 0, default 1.0)
       --reins-sample <N>          With -r: attempt a copy on one in N qualifying reads (16; 0 means 1)
   -R, --with-rebal                Enable rebalancing logic (used in Section 4.5 experiments)
   -n, --items <number>            Number of items in the database
@@ -91,11 +91,19 @@ NUMA layout, worker mapping, queue depth, and cache size together with results.
 
 ## Reinsertion
 
-`-r` / `--with-reins` enables reinsertion at read completion. The fixed threshold
-is `ceil(log2(node_count + 1))` historical parent hops above the leaf. Internally,
-`upward_len` includes the leaf, so a read qualifies when
-`upward_len > ceil(log2(node_count + 1))`. The threshold depends on node count,
-not the current routing depth, and is not configurable.
+`-r` / `--with-reins` enables reinsertion at read completion with a default
+multiplier of `1.0`. Attach an optional multiplier as `-r0.5` or
+`--with-reins=0.5`. The threshold is
+`ceil(multiplier * log2(node_count + 1))` historical parent hops above the leaf;
+the multiplication happens before rounding. Internally, `upward_len` includes
+the leaf, so a read qualifies when `upward_len` is greater than that threshold.
+The threshold depends on node count and the multiplier, not routing depth.
+
+The multiplier must be finite and nonnegative. Smaller values consider
+shallower reads; larger values require deeper history. `-r0` bypasses only
+the distance check. The optional value must be attached: `-r 1 48 12` keeps
+the default multiplier and treats the three numbers as disks, workers, and
+distributors. `-r0.5 1 48 12` uses the multiplier `0.5` with the same topology.
 
 The source page must already be marked hot by an earlier read since the last
 bitmap reset. `--reins-sample N` passes approximately one in N qualifying reads
@@ -112,6 +120,9 @@ do not trigger reinsertion. `-R` independently enables routing rebalancing.
 ```bash
 # YCSB D with reinsertion and rebalancing, sampling one in 16 qualifying reads
 ./main -n 100000000 -q 100000000 -b ycsb_d_latest -r -R --reins-sample 16 1 48 12
+
+# Half the logarithmic distance threshold, before rounding
+./main -n 100000000 -q 100000000 -b ycsb_d_latest -r0.5 -R --reins-sample 16 1 48 12
 ```
 
 The former `--reins-on-read`, `--reins-depth-ratio`, and

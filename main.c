@@ -1,4 +1,5 @@
 #include "headers.h"
+#include <errno.h>
 #include <getopt.h>
 #include <math.h>
 
@@ -19,7 +20,8 @@ static void print_help(char *n) {
   puts("  -i, --insert-mode <ascend|descend|random>");
   puts("  -o, --old-percent <float>       set OLD_PERCENT");
   puts("  -e, --epoch <number>            set EPOCH");
-  puts("  -r, --with-reins                reinsert hot records on read after >= ceil(log2(nodes+1)) history hops");
+  puts("  -r[<x>], --with-reins[=<x>]     reinsert hot records after >= ceil(x * log2(nodes+1)) history hops");
+  puts("                                x >= 0, default 1.0; attach the value: -r0.5 or --with-reins=0.5");
   puts("  -R, --with-rebal                enable rebalancing logic");
   puts("      --rebalance-threshold <x>   rebalance when depth > ceil(log2(nodes+1)) * x (1.5; 1 = perfectly balanced)");
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
@@ -49,7 +51,7 @@ int main(int argc, char **argv) {
         {"insert-mode",     required_argument, 0, 'i'},
         {"old-percent",     required_argument, 0, 'o'},
         {"epoch",           required_argument, 0, 'e'},
-        {"with-reins",      no_argument,       0, 'r'},
+        {"with-reins",      optional_argument, 0, 'r'},
         {"with-rebal",      no_argument,       0, 'R'},
         {"rebalance-threshold", required_argument, 0, 1004},
         {"util-gate",       no_argument,       0, 1005},
@@ -68,7 +70,7 @@ int main(int argc, char **argv) {
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:rRp:M:n:q:c:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "P:b:a:k:m:i:o:e:r::Rp:M:n:q:c:h", long_opts, NULL)) != -1) {
         switch (opt) {
         case 'P': cfg.page_cache_size = strtoul(optarg, NULL, 0); break;
         case 'b': cfg.bench           = parse_bench(optarg);     break;
@@ -78,7 +80,24 @@ int main(int argc, char **argv) {
         case 'i': cfg.insert_mode     = parse_insert_mode(optarg); break;
         case 'o': cfg.old_percent     = atof(optarg);            break;
         case 'e': cfg.epoch           = strtoul(optarg, NULL, 0); break;
-        case 'r': cfg.with_reins      = 1;                       break;
+        case 'r': {
+          double multiplier = 1.0;
+
+          if (optarg != NULL) {
+            char *end;
+
+            errno = 0;
+            multiplier = strtod(optarg, &end);
+            if (end == optarg || *end != '\0' || errno == ERANGE ||
+                !isfinite(multiplier) || multiplier < 0.0) {
+              fprintf(stderr, "-r/--with-reins requires a finite, nonnegative multiplier\n");
+              return 1;
+            }
+          }
+          cfg.with_reins = 1;
+          cfg.reins_multiplier = multiplier;
+          break;
+        }
         case 'R': cfg.with_rebal      = 1;                       break;
         case 1004: cfg.rebalance_threshold = strtod(optarg, NULL); break;
         case 1005: cfg.util_gate = 1; break;
@@ -124,7 +143,9 @@ int main(int argc, char **argv) {
         }
     }
         // 남은 포지셔널 세 개
-    if (optind + 3 > argc) {
+    if (optind + 3 != argc) {
+	fprintf(stderr, "Expected exactly three positional arguments: disks, workers, distributors.\n"
+                        "Attach an optional -r value as -r0.5 or --with-reins=0.5.\n");
 	print_help(argv[0]);
         return 1;
     }
@@ -168,8 +189,9 @@ int main(int argc, char **argv) {
   printf("# \tReinsertion: %s%s\n", cfg.with_reins ? "enabled" : "disabled",
          cfg.with_reins ? " (on-read mode)" : "");
   if (cfg.with_reins)
-    printf("# \tReinsert on read: >= ceil(log2(nodes+1)) history hops, page must be "
-           "hot already, one copy attempt per %lu qualifying reads\n", cfg.reins_sample);
+    printf("# \tReinsert on read: >= ceil(%.6g * log2(nodes+1)) history hops, page must be "
+           "hot already, one copy attempt per %lu qualifying reads\n",
+           cfg.reins_multiplier, cfg.reins_sample);
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
   printf("# \tPruning: %s\n", cfg.with_prune ? "enabled" : "disabled");
   if (cfg.latency_series_ms)

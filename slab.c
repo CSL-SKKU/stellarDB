@@ -61,7 +61,7 @@ static void reins_or_free(struct slab_callback *cb, void *item) {
  * Reinsertion on read (-r). Runs on the I/O worker that owns
  * the page, at the completion of a client read, with the record bytes in the
  * cached page. The record is copied forward to the leaf when
- *   - the read walked at least ceil(log2(nodes+1)) parent hops to find it,
+ *   - the read walked at least ceil(reins_multiplier * log2(nodes+1)) hops,
  *   - the page was already hot since the last bitmap reset, and
  *   - it is still the authoritative copy and not already at the leaf.
  * The copy is the same shy, append-only move the background worker makes
@@ -80,7 +80,8 @@ void reins_on_read_consider(struct slab_callback *callback,
   if (!callback->page_was_hot)
     return;
   /* upward_len includes the leaf; the threshold counts parent hops. */
-  double ideal = ceil(log2((double)tnt_get_node_count() + 1.0));
+  double ideal = ceil(cfg.reins_multiplier *
+                      log2((double)tnt_get_node_count() + 1.0));
   if ((double)callback->upward_len <= ideal)
     return;
   if (item_is_empty(meta))
