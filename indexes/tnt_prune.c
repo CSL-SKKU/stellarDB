@@ -117,7 +117,15 @@ static int prune_read_pages(int fd, const size_t *pages, size_t nb, char *buf) {
     if (inflight == 0)
       break;
     {
-      long r = syscall(__NR_io_getevents, prune_aio, 1, (long)inflight,
+      /*
+       * Wait for a chunk of completions, not one: refilling one iocb at a
+       * time costs an io_submit per page (~20 us), which capped the reader
+       * near 200 MB/s of CPU-bound submits. A quarter of the depth per refill
+       * keeps the queue deep and the submit count low.
+       */
+      long min_nr = (long)inflight < PRUNE_READ_DEPTH / 4 ? (long)inflight
+                                                          : PRUNE_READ_DEPTH / 4;
+      long r = syscall(__NR_io_getevents, prune_aio, min_nr, (long)inflight,
                        prune_events, NULL);
 
       if (r < 0)
