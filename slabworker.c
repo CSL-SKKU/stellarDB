@@ -428,11 +428,10 @@ again:
         break;
       case READ_NO_LOOKUP: {
         // slab idx에 카운트 담아옴
-	if (cfg.reins_on_read) {
+        if (cfg.with_reins) {
           /*
-           * On-read mode: no per-read shared counter (48 workers incrementing
-           * one slab's epcnt is a contended cache line on every hot read).
-           * Only the page's hot bit, with the bitmap cleared every 10 epochs.
+           * Mark page reuse for on-read reinsertion. The bitmap is cleared
+           * every 10 observed epochs; no per-slab read counter is needed.
            */
           struct slab *s = callback->slab;
           uint64_t curr_epoch = atomic_load_explicit(&epoch, memory_order_acquire);
@@ -447,47 +446,7 @@ again:
           }
           callback->page_was_hot =
               mark_page_hot_test(s, item_page_num(s, callback->slab_idx));
-        } else if (cfg.with_reins) {
-          struct slab *s = callback->slab;
-          uint64_t curr_epoch = atomic_load_explicit(&epoch, memory_order_acquire);
-          uint64_t slab_epoch = atomic_load_explicit(&s->cur_ep, memory_order_acquire);
-          uint64_t cnt = 0;
-
-          if (slab_epoch == curr_epoch) {
-             // 같은 에포크: epcount만 증가
-             cnt = atomic_fetch_add_explicit(&s->epcnt, 1, memory_order_relaxed);
-	   } else {
-             // 에포크가 바뀌었으므로, 
-             // cur_ep를 최신으로 바꾸고 epcount→prev_epcount 교환 후 epcount=1
-             uint64_t old_count = atomic_exchange_explicit(
-               &s->epcnt, 0, memory_order_relaxed);
-             atomic_store_explicit(&s->cur_ep, curr_epoch, memory_order_release);
-             atomic_store_explicit(&s->prev_epcnt, old_count, memory_order_relaxed);
-             atomic_store_explicit(&s->epcnt, 1, memory_order_relaxed);
-             if (curr_epoch % 10 == 0) {
-	       size_t num_words = (((s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE) + 63) / 64;
-               for (size_t i = 0; i < num_words; i++)
-                 __atomic_exchange_n(&s->hot_bits[i], 0ULL, __ATOMIC_RELAXED);
-             }
-           }
-
-          mark_page_hot(s, item_page_num(s, callback->slab_idx));
-          uint64_t tree_depth = tnt_get_depth();
-
-          if (cnt == (size_t)(cfg.epoch/20)
-            &&  s->upward_maxlen >= (tree_depth/3)) {
-            int expected = 0;
-
-            /* CAS, so two I/O workers cannot both enqueue the slab. */
-            if (atomic_compare_exchange_strong_explicit(
-                    &s->queued, &expected, 1, memory_order_acq_rel,
-                    memory_order_acquire)) {
-              printf("Reinsert: %lu\n", s->seq);
-              RSTAT_INC(reins_queued);
-              bgq_enqueue(GC, s);
-            }
-          }
-	}
+        }
         read_item_async(callback);
         break;
       }

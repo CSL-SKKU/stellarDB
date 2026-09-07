@@ -83,10 +83,7 @@ struct slab {
 
   // For Reinsertion
   _Atomic int queued;
-  _Atomic int upward_maxlen;
   _Atomic size_t cur_ep;
-  _Atomic size_t epcnt;
-  _Atomic size_t prev_epcnt;
   uint64_t *hot_bits;
 
   int fd;

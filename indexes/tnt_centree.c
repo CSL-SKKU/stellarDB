@@ -259,18 +259,8 @@ void print2DUtil(centree t, node n, int space) {
   printf("\n");
   for (int i = 1; i < space; i++) printf(" ");
   if (n->value.slab->min != -1) {
-    if (cfg.with_reins) {
-      printf("%lu,%lu:%lu//%lu,%lu,%lu\n", n->value.seq, n->value.level,
-             n->value.slab->nb_items, 
-             atomic_load_explicit(&n->value.slab->cur_ep, memory_order_relaxed), 
-             atomic_load_explicit(&n->value.slab->prev_epcnt, memory_order_relaxed), 
-             atomic_load_explicit(&n->value.slab->epcnt, memory_order_relaxed)
-             );
-    } else {
-      printf("%lu,%lu:%lu\n", n->value.seq, n->value.level,
-             n->value.slab->nb_items
-             );
-    }
+    printf("%lu,%lu:%lu\n", n->value.seq, n->value.level,
+           n->value.slab->nb_items);
   }
   else
     printf("%lu,%lu:0\n", n->value.seq, n->value.level);

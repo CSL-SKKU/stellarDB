@@ -18,6 +18,8 @@ int rc_thr = 1;
 /* Recovery's per-slot indexer (slabworker.c); not in a header. */
 int add_existing_item(struct slab *s, size_t idx, void *item,
                       struct slab_callback *cb);
+/* Read completion entry point (slab.c), exercised without an I/O worker. */
+void read_item_async_cb(struct slab_callback *cb);
 
 static uint64_t failures;
 
@@ -302,6 +304,71 @@ static void test_shy_tombstone(void) {
         rec->nb_items);
 }
 
+/* Exercise the real read-completion gate without submitting disk writes.
+ * The source is deliberately unindexed, so qualifying attempts fail their
+ * authority check after updating the trigger counters. */
+static void test_on_read_trigger(void) {
+  struct slab *src = fake_slab(700);
+  unsigned char *item = fake_item(700, 1);
+  struct lru page = {.page = (char *)item};
+  struct slab_callback cb = {
+      .slab = src, .slab_idx = 0, .lru_entry = &page,
+      .action = READ_NO_LOOKUP, .upward_len = 6, .page_was_hot = 1};
+
+  init_default_config(&cfg);
+  check(!cfg.with_reins && cfg.reins_sample == 16,
+        "reinsertion defaults changed");
+  cfg.reins_sample = 1;
+  centree_init();
+  /* Control advisory metadata: ceil(log2(31+1)) = 5, regardless of depth.
+   * Routing stays empty because every attempted copy must fail authority. */
+  atomic_store(&tnt_centree()->node_count, 31);
+  atomic_store(&tnt_centree()->depth, 1000);
+  reset_restructuring_stats();
+
+  src->read_ref++;
+  read_item_async_cb(&cb);
+  check(rstats.reins_or_seen == 0, "a read triggered reinsertion without -r");
+
+  cfg.with_reins = 1;
+  cb.page_was_hot = 0;
+  src->read_ref++;
+  read_item_async_cb(&cb);
+  check(rstats.reins_or_seen == 1 && rstats.reins_or_deep == 0,
+        "a cold page qualified");
+
+  cb.page_was_hot = 1;
+  cb.upward_len = 5; /* four parent hops: just below the threshold */
+  src->read_ref++;
+  read_item_async_cb(&cb);
+  check(rstats.reins_or_deep == 0, "a short history walk qualified");
+
+  cb.upward_len = 6; /* five parent hops: exactly at the threshold */
+  src->read_ref++;
+  read_item_async_cb(&cb);
+  check(rstats.reins_or_deep == 1 && rstats.reins_examined == 1,
+        "the logarithmic boundary did not qualify on a skewed routing tree");
+
+  atomic_store(&tnt_centree()->depth, 5);
+  src->read_ref++;
+  read_item_async_cb(&cb);
+  check(rstats.reins_or_deep == 2 && rstats.reins_examined == 2,
+        "routing depth changed the trigger");
+
+  atomic_store(&tnt_centree()->node_count, 33); /* ideal depth grows to six */
+  src->read_ref++;
+  read_item_async_cb(&cb);
+  check(rstats.reins_or_deep == 2, "node count did not raise the threshold");
+  check(rstats.reins_issued == 0 && rstats.reins_published == 0 && src->read_ref == 0,
+        "an unindexed source was copied or leaked a read reference");
+  subtree_free(src->subtree);
+  pthread_rwlock_destroy(&src->tree_lock);
+  free(src->centree_node);
+  free(src);
+  free(item);
+  puts("  on-read enable, page reuse and logarithmic history threshold passed");
+}
+
 int main(void) {
   struct item_metadata normal, tomb, empty = {0}, legacy;
 
@@ -393,6 +460,7 @@ int main(void) {
   test_completions();
   test_recovery_rule();
   test_shy_tombstone();
+  test_on_read_trigger();
 
   if (failures) {
     printf("== %lu failures ==\n", failures);

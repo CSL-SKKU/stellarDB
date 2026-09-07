@@ -58,11 +58,11 @@ static void reins_or_free(struct slab_callback *cb, void *item) {
 }
 
 /*
- * Reinsertion on read (--reins-on-read k). Runs on the I/O worker that owns
+ * Reinsertion on read (-r). Runs on the I/O worker that owns
  * the page, at the completion of a client read, with the record bytes in the
  * cached page. The record is copied forward to the leaf when
- *   - the read walked at least k levels above the leaf to find it,
- *   - the page was already hot in this epoch (repeat access), and
+ *   - the read walked at least ceil(log2(nodes+1)) parent hops to find it,
+ *   - the page was already hot since the last bitmap reset, and
  *   - it is still the authoritative copy and not already at the leaf.
  * The copy is the same shy, append-only move the background worker makes
  * (add_in_tree_for_reinsertion decides at completion), but per record, with no
@@ -79,16 +79,10 @@ void reins_on_read_consider(struct slab_callback *callback,
   RSTAT_INC(reins_or_seen);
   if (!callback->page_was_hot)
     return;
-  if (cfg.reins_depth_ratio > 0) {
-    /* The depth a balanced tree of this size needs; the rebalancer's yardstick. */
-    uint64_t nodes = tnt_get_node_count();
-    double ideal = ceil(log2((double)nodes + 1.0));
-
-    if ((double)callback->upward_len <= cfg.reins_depth_ratio * ideal)
-      return;
-  } else if (callback->upward_len < cfg.reins_on_read + 1) {
+  /* upward_len includes the leaf; the threshold counts parent hops. */
+  double ideal = ceil(log2((double)tnt_get_node_count() + 1.0));
+  if ((double)callback->upward_len <= ideal)
     return;
-  }
   if (item_is_empty(meta))
     return;
   RSTAT_INC(reins_or_deep);
@@ -240,10 +234,7 @@ struct slab *create_slab_sized(struct slab_context *ctx, uint64_t level,
 
   if (cfg.with_reins) {
     atomic_init(&s->queued, 0);
-    atomic_init(&s->upward_maxlen, 0);
     atomic_init(&s->cur_ep, 1);
-    atomic_init(&s->epcnt, 0);
-    atomic_init(&s->prev_epcnt, 0);
     size_t num_words = (((s->size_on_disk + PAGE_SIZE - 1) / PAGE_SIZE) + 63) / 64;
     s->hot_bits = calloc(num_words, sizeof(uint64_t));
   }
@@ -657,7 +648,7 @@ void read_item_async_cb(struct slab_callback *callback) {
       (struct item_metadata *)&disk_page[in_page_offset];
   if (item_is_legacy(meta))
     die("Read encountered legacy item metadata\n");
-  if (cfg.reins_on_read && !load && callback->action == READ_NO_LOOKUP &&
+  if (cfg.with_reins && !load && callback->action == READ_NO_LOOKUP &&
       callback->upward_len)
     reins_on_read_consider(callback, meta);
   if (callback->cb)
@@ -805,7 +796,8 @@ void add_item_async_cb1(struct slab_callback *callback) {
     return;
   }
 
-  if (cfg.reins_on_read && callback->cb == add_in_tree_for_reinsertion) {
+  if (callback->cb == add_in_tree_for_reinsertion && callback->cb_cb == reins_or_free) {
+    /* Only read-completion copies run on an I/O worker and must not block it. */
     if (!kv_add_async_no_lookup_try(callback, callback->slab, callback->slab_idx))
       reins_defer(callback);
     return;

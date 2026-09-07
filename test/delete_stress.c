@@ -91,10 +91,7 @@ static struct test_slab make_test_slab(uint64_t seq, uint64_t key,
   atomic_init(&s->full, 0);
   atomic_init(&s->last_item, 0);
   atomic_init(&s->queued, 0);
-  atomic_init(&s->upward_maxlen, 0);
   atomic_init(&s->cur_ep, 0);
-  atomic_init(&s->epcnt, 0);
-  atomic_init(&s->prev_epcnt, 0);
   INIT_LOCK(&s->tree_lock, NULL);
 
   store.slab = s;
