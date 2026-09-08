@@ -92,7 +92,6 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->timeseries_s = 0;
     cfg->wait_for_pruning_s = 0;
     cfg->churn_upd = 50; cfg->churn_ins = 25; cfg->churn_del = 25;
-    cfg->migrate_th = 0.0;
     cfg->reins_sample    = 1;
     cfg->with_prune      = 0;
     cfg->prune_stale_ratio = 0.3;
@@ -107,7 +106,7 @@ int validate_runtime_config(const struct runtime_config *cfg) {
         sizeof(struct item_metadata) + 2 * sizeof(uint64_t);
 
     if (cfg->wait_for_pruning_s > 0 && !cfg->with_prune) {
-        fprintf(stderr, "--wait-for-pruning-s requires -p/--with-prune to set the target\n");
+        fprintf(stderr, "--wait-for-pruning-s requires -p/--with-prune\n");
         return 0;
     }
     if (cfg->kv_size < (int)min_kv_size ||

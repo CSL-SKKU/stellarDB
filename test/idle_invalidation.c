@@ -123,7 +123,7 @@ static void check_idle_handoff(void) {
   cfg.kv_size = 1024; cfg.max_file_size = 16 * PAGE_SIZE;
   cfg.with_prune = 1; cfg.prune_stale_ratio = 1.0;
   cfg.wait_for_pruning_s = 2; cfg.timeseries_s = 0;
-  cfg.with_reins = 1; cfg.with_rebal = 0; cfg.migrate_th = 0;
+  cfg.with_reins = 1; cfg.with_rebal = 0;
   centree_init();
   const uint64_t pivots[5] = {49, 50, 51, 100, 101};
   for (unsigned i = 0; i < 5; i++) {

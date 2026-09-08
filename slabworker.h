@@ -46,7 +46,9 @@ int restructuring_worker_init(void);
 /* Call after the final client completion and report_finish(). Stops reinsertion
  * production, parks maintenance, and drains outstanding copies/hints. Performs
  * one complete in-memory invalidation sweep before checking the target, then
- * drives configured maintenance without the utilization gate. The deadline
+ * drives configured maintenance without the utilization gate. With -p 0 there
+ * is no ratio target: four complete passes without a decrease end cleanup.
+ * The deadline
  * includes settling and the sweep, but never interrupts an operation in flight. */
 void slab_workers_wait_for_pruning(void);
 /* Bounded, best-effort hints; enqueue never waits for queue space or maintenance.

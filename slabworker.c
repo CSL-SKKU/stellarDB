@@ -787,32 +787,36 @@ static void *worker_restructuring_init(void *pdata) {
                 strerror(-status));
     }
 
-    /* One migration per wake can empty an internal node for ILI pruning. */
-    if (cfg.migrate_th > 0) {
-      int status = tnt_migrate_once();
-
-      if (status < 0 && status != -EAGAIN && status != -EBUSY &&
-          status != -ENOSPC && status != -ECANCELED)
-        fprintf(stderr, "Background migration failed: %s\n", strerror(-status));
-    }
-
     /*
      * The maintenance operations run on this thread, which is what keeps them
      * exclusive; the mutex is there for the callers in main.c and the tests.
      *
-     * -p: prune while the stale-slot ratio is at or above the threshold and a
+     * -p X > 0: migrate and prune only above the threshold. -p 0 performs no
+     * periodic scans or structural cleanup. Prune while above threshold and a
      * candidate exists. A dropped candidate (-EAGAIN/-EBUSY/-ENOSPC) ends the
      * burst: the scan would hand back the same triple, and the next period
      * retries.
      */
-    if (cfg.with_prune) {
+    if (cfg.with_prune && cfg.prune_stale_ratio > 0) {
       struct prune_stale m;
       size_t done = 0;
       int status = TNT_PRUNE_NOOP;
 
       prune_stale_measure(&m);
 
-      while (prune_stale_ratio(&m) >= cfg.prune_stale_ratio &&
+      /* One migration per wake can empty an internal node for ILI pruning.
+       * Remeasure afterwards: migration itself may have met the target. */
+      if (prune_stale_ratio(&m) > cfg.prune_stale_ratio &&
+          !atomic_load_explicit(&idle_maintenance_requested, memory_order_acquire)) {
+        int migration_status = tnt_migrate_once();
+        if (migration_status < 0 && migration_status != -EAGAIN &&
+            migration_status != -EBUSY && migration_status != -ENOSPC &&
+            migration_status != -ECANCELED)
+          fprintf(stderr, "Background migration failed: %s\n", strerror(-migration_status));
+        prune_stale_measure(&m);
+      }
+
+      while (cfg.with_prune && prune_stale_ratio(&m) > cfg.prune_stale_ratio &&
              !atomic_load_explicit(&idle_maintenance_requested, memory_order_acquire)) {
         status = tnt_prune_once();
         if (status != TNT_PRUNE_DONE)
@@ -831,7 +835,7 @@ static void *worker_restructuring_init(void *pdata) {
         fprintf(stderr, "Background pruning failed: %s\n", strerror(-status));
     }
     /* Writes from here to the next wake are what the next scan calls "hot". */
-    if (cfg.with_prune)
+    if (cfg.with_prune && cfg.prune_stale_ratio > 0)
       prune_mark_writes();
   }
 
@@ -926,6 +930,9 @@ void slab_workers_wait_for_pruning(void) {
                                       .last_prune_status = TNT_PRUNE_NOOP};
   struct prune_stale m;
   int burst = 0, invalidation_complete = 0;
+  const int idle_only = cfg.prune_stale_ratio == 0;
+  size_t cleanup_passes = 0, no_progress_passes = 0;
+  double pass_start_ratio = 0;
 
   fsst_worker_request_stop();
 
@@ -973,9 +980,12 @@ void slab_workers_wait_for_pruning(void) {
     result.stale_ratio = prune_stale_ratio(&m);
     uint64_t now = report_now_ns();
     result.elapsed_ns = now - began;
-    int reached = !pending && invalidation_complete && result.stale_ratio <= result.target;
-    int finished = reached || now >= deadline;
-    result.status = reached ? "target_reached" : finished ? "timeout" :
+    int reached = !idle_only && !pending && invalidation_complete &&
+                  result.stale_ratio <= result.target;
+    int stalled = idle_only && no_progress_passes >= 4;
+    int finished = reached || now >= deadline || stalled;
+    result.status = reached ? "target_reached" : now >= deadline ? "timeout" :
+                    stalled ? "no_progress" :
                     pending ? "settling" : "waiting";
     if (finished || (interval && now >= next_sample)) {
       report_idle_pruning(&result);
@@ -993,6 +1003,7 @@ void slab_workers_wait_for_pruning(void) {
 
     if (!burst) {
       next_maintenance = now + period;
+      pass_start_ratio = result.stale_ratio;
       /* Keep the configured maintenance policy, except for the utilization
        * gate: client inactivity is the reason this phase exists. */
       if (cfg.with_rebal && tnt_rebalancing_needed()) {
@@ -1000,14 +1011,18 @@ void slab_workers_wait_for_pruning(void) {
         if (status < 0)
           fprintf(stderr, "Idle rebalancing failed: %s\n", strerror(-status));
       }
-      if (cfg.migrate_th > 0 && report_now_ns() < deadline) {
+      /* Rebalancing can change the estimate too. Apply the same strict gate
+       * as the busy worker; idle-only cleanup has no ratio target. */
+      prune_stale_measure(&m);
+      if (!idle_only && prune_stale_ratio(&m) <= result.target) continue;
+      if (report_now_ns() < deadline) {
         int status = tnt_migrate_once();
         if (status < 0 && status != -EAGAIN && status != -EBUSY &&
             status != -ENOSPC && status != -ECANCELED)
           fprintf(stderr, "Idle migration failed: %s\n", strerror(-status));
       }
       prune_stale_measure(&m);
-      if (prune_stale_ratio(&m) <= result.target) continue;
+      if (!idle_only && prune_stale_ratio(&m) <= result.target) continue;
     }
     /* The deadline is a fail-safe between operations, never a cancellation
      * inside a structural change. Count unsuccessful attempts as work too. */
@@ -1021,6 +1036,16 @@ void slab_workers_wait_for_pruning(void) {
     if (burst) result.successes++;
     else {
       prune_mark_writes();
+      if (idle_only) {
+        /* A complete pass includes one migration attempt and its entire
+         * pruning burst. Successful calls alone do not imply ratio progress. */
+        prune_stale_measure(&m);
+        cleanup_passes++;
+        if (prune_stale_ratio(&m) < pass_start_ratio)
+          no_progress_passes = 0;
+        else
+          no_progress_passes++;
+      }
       if (status < 0 && status != -EAGAIN && status != -EBUSY && status != -ENOSPC)
         fprintf(stderr, "Idle pruning failed: %s; retrying next period\n", strerror(-status));
     }
@@ -1028,12 +1053,18 @@ void slab_workers_wait_for_pruning(void) {
   if (!invalidation_complete)
     printf("# Idle invalidation: status=%s\n",
            strcmp(result.status, "invalidation_failed") == 0 ? "failed" : "not_started");
+  if (idle_only)
+    printf("# Idle cleanup: passes=%zu no_progress_passes=%zu\n",
+           cleanup_passes, no_progress_passes);
+  char target[32];
+  if (idle_only) snprintf(target, sizeof(target), "none");
+  else snprintf(target, sizeof(target), "%.9f", result.target);
   printf("# Idle pruning: status=%s elapsed_s=%.9f pruning_time_s=%.9f "
          "attempts=%" PRIu64 " successes=%" PRIu64 " initial_stale_ratio=%.9f "
-         "final_stale_ratio=%.9f target=%.9f last_prune_status=%d\n",
+         "final_stale_ratio=%.9f target=%s last_prune_status=%d\n",
          result.status, result.elapsed_ns / 1e9, result.pruning_ns / 1e9,
          result.attempts, result.successes, result.initial_ratio,
-         result.stale_ratio, result.target, result.last_prune_status);
+         result.stale_ratio, target, result.last_prune_status);
   fflush(stdout);
 }
 

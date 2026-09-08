@@ -37,17 +37,12 @@ struct runtime_config {
      * key read deep N times is copied with high probability; a key read once
      * almost never is. Zero-memory stand-in for a per-record hit counter. */
     unsigned long      reins_sample;
-    /* -p <ratio>: enable repeated pruning and set prune_stale_ratio. */
+    /* -p R: jointly gate pruning/migration above R; R=0 is idle-only cleanup
+     * when wait_for_pruning_s > 0, with no stale-ratio target. */
     int                with_prune;
     double             prune_stale_ratio;
     /* -M: shared background maintenance interval, in milliseconds. */
     unsigned long      maintenance_period_ms;
-    /*
-     * --migrate-th t: move an internal node's valid entries into its history
-     * parent when valid(parent) + valid(node)
-     * <= t * slab capacity, leaving the node empty. 0 = off.
-     */
-    double             migrate_th;
     uint64_t           nb_items_in_db;
     uint64_t           nb_requests;
     uint64_t           chunk_for_shuffle;

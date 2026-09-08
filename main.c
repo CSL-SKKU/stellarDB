@@ -29,10 +29,10 @@ static void print_help(char *n) {
   puts("      --timeseries <seconds>      positive interval in seconds; omitted: whole-run aggregate");
   puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
   puts("      --reins-sample <N>          with -r: attempt a copy on one in N qualifying reads (1; 0 means 1)");
-  puts("  -p, --with-prune <0..1>         enable repeated pruning at this global stale/reserved ratio");
-  puts("      --wait-for-pruning-s <s>    after requests, wait up to s seconds for the -p target (0 = off)");
+  puts("  -p, --with-prune <0..1>         prune and migrate while stale/reserved ratio > R");
+  puts("                                R=0: idle-only cleanup (ignored without a positive wait)");
+  puts("      --wait-for-pruning-s <s>    wait up to s seconds for idle pruning (0/omitted = no wait)");
   puts("  -M, --maintenance-period-ms <ms> interval for background maintenance (500)");
-  puts("      --migrate-th <0..1>         migration: move a node into its history parent when both fit in t * capacity (0 = off)");
   puts("  -n, --items <number>            set number of items in DB");
   puts("  -q, --requests <number>         set number of requests");
   puts("  -c, --chunk <number>            chunk size for shuffling");
@@ -117,7 +117,6 @@ int main(int argc, char **argv) {
         {"with-prune",      required_argument, 0, 'p'},
         {"wait-for-pruning-s", required_argument, 0, 1018},
         {"maintenance-period-ms", required_argument, 0, 'M'},
-        {"migrate-th",      required_argument, 0, 1014},
         {"items",           required_argument, 0, 'n'},
         {"requests",        required_argument, 0, 'q'},
         {"chunk",           required_argument, 0, 'c'},
@@ -222,7 +221,6 @@ int main(int argc, char **argv) {
           break;
         }
         case 'M': cfg.maintenance_period_ms = strtoul(optarg, NULL, 0); break;
-        case 1014: cfg.migrate_th      = strtod(optarg, NULL);   break;
         case 'n': cfg.nb_items_in_db  = strtoull(optarg, NULL, 0); break;
         case 'q': cfg.nb_requests     = strtoull(optarg, NULL, 0); break;
         case 'c': cfg.chunk_for_shuffle = strtoull(optarg, NULL, 0); break;
@@ -247,6 +245,8 @@ int main(int argc, char **argv) {
 
     if (!validate_runtime_config(&cfg))
         return EXIT_FAILURE;
+    if (cfg.with_prune && cfg.prune_stale_ratio == 0 && cfg.wait_for_pruning_s == 0)
+        cfg.with_prune = 0; /* -p 0 without an idle wait has no effect. */
     if (report_init(cfg.report_out, cfg.config_report, cfg.timeseries_s) != 0)
         return EXIT_FAILURE;
     if (!prepare_directory(cfg.directory))
@@ -291,16 +291,17 @@ int main(int argc, char **argv) {
            cfg.reins_multiplier, cfg.reins_sample);
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
   printf("# \tPruning: %s\n", cfg.with_prune ? "enabled" : "disabled");
-  if (cfg.with_prune)
-    printf("# \tPruning trigger: repeat while global stale ratio >= %.2f, checked every %lu ms\n",
-           cfg.prune_stale_ratio, cfg.maintenance_period_ms);
+  if (cfg.with_prune) {
+    if (cfg.prune_stale_ratio > 0)
+      printf("# \tPruning/migration trigger: global stale ratio > %.6g, checked every %lu ms\n",
+             cfg.prune_stale_ratio, cfg.maintenance_period_ms);
+    else
+      puts("# \tPruning/migration: idle only; no ratio target; stop after 4 non-improving passes");
+    puts("# \tMigration: combined valid slots <= slab capacity (threshold always 1.0)");
+  }
   if (cfg.wait_for_pruning_s > 0)
-    printf("# \tIdle pruning: target <= %.6g, grace period %.6g s (finish in-progress maintenance)\n",
-           cfg.prune_stale_ratio, cfg.wait_for_pruning_s);
-  if (cfg.migrate_th > 0)
-    printf("# \tMigration: combined valid slots <= %.2f * slab capacity, "
-           "one attempt per maintenance wake (%lu ms)\n",
-           cfg.migrate_th, cfg.maintenance_period_ms);
+    printf("# \tIdle pruning: grace period %.6g s (finish in-progress maintenance)\n",
+           cfg.wait_for_pruning_s);
   if (cfg.with_rebal) {
     printf("# \tRebalancing threshold: depth > ceil(log2(nodes+1)) * %.2f "
            "(checked every %lu ms; utilization gate %s)\n",
@@ -354,7 +355,7 @@ int main(int argc, char **argv) {
   }
 
   /* One thread runs the maintenance operations, so they exclude each other. */
-  if (cfg.with_rebal || cfg.with_prune || cfg.migrate_th > 0) {
+  if (cfg.with_rebal || (cfg.with_prune && cfg.prune_stale_ratio > 0)) {
     int worker_status = restructuring_worker_init();
 
     if (worker_status < 0)

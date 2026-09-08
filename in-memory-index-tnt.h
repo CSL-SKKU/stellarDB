@@ -227,7 +227,7 @@ enum { TNT_MIGRATE_DONE = 0, TNT_MIGRATE_NOOP = 1 };
 int tnt_migrate_up(centree_node child);
 /*
  * Pick the migration with the greatest estimated slot reclaim whose pair
- * fits cfg.migrate_th * slab capacity. TNT_MIGRATE_NOOP if nothing qualifies.
+ * fits one full slab capacity. TNT_MIGRATE_NOOP if nothing qualifies.
  */
 int tnt_migrate_once(void);
 /* Take the write marks of all leaves: the next scan ranks by writes since now. */

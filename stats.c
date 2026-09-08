@@ -289,9 +289,11 @@ void report_idle_pruning(const struct idle_pruning_result *r) {
    * out of request averages and preserve the busy maintenance counters. */
   for (int i = 0; i < REPORT_METRICS; i++)
     if (report_enabled(i)) fputc(',', output);
-  fprintf(output, ",%.9f,%.9f,%" PRIu64 ",%" PRIu64 ",%.9f,%.9f,%.9f,%s,%d\n",
+  fprintf(output, ",%.9f,%.9f,%" PRIu64 ",%" PRIu64 ",%.9f,%.9f,",
           r->elapsed_ns / 1e9, r->pruning_ns / 1e9, r->attempts, r->successes,
-          r->initial_ratio, r->stale_ratio, r->target, r->status, r->last_prune_status);
+          r->initial_ratio, r->stale_ratio);
+  if (r->target > 0) fprintf(output, "%.9f", r->target);
+  fprintf(output, ",%s,%d\n", r->status, r->last_prune_status);
   if (fflush(output) != 0) die("Cannot write report: %s\n", strerror(errno));
 }
 

@@ -41,7 +41,7 @@ void report_finish(void);
 void report_close(void);
 struct idle_pruning_result {
   uint64_t elapsed_ns, pruning_ns, attempts, successes;
-  double initial_ratio, stale_ratio, target;
+  double initial_ratio, stale_ratio, target; /* target=0: no ratio target */
   const char *status;
   int last_prune_status;
 };

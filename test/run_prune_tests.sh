@@ -83,6 +83,10 @@ echo "== the automatic trigger (-p) =="
 # Even with eligible triples, enabled pruning must wait below the threshold.
 sandboxed ./test/test_prune_links auto-wait 2>&1 | filter | grep -E "FAIL|automatic|stale"
 report "automatic pruning waits below the stale-ratio threshold" "${PIPESTATUS[0]}"
+sandboxed ./test/test_prune_links auto-equal 2>&1 | filter | grep -E "FAIL|automatic|stale"
+report "automatic pruning and migration wait at exact threshold equality" "${PIPESTATUS[0]}"
+sandboxed ./test/test_prune_links auto-zero 2>&1 | filter | grep -E "FAIL|automatic|stale"
+report "idle-only pruning skips periodic scans, migration, and pruning" "${PIPESTATUS[0]}"
 # The timer must prune until below threshold or no candidates remain.
 # Best-effort async hints may leave fewer candidates; every read stays exact.
 sandboxed ./test/test_prune_links auto 2>&1 | filter | grep -E "FAIL|automatic|stale"

@@ -6,6 +6,7 @@ struct slab_callback;
 #ifdef STELLAR_TESTING
 struct restructuring_stats {
   uint64_t worker_wakeups, prune_calls, prune_noop;
+  uint64_t migration_calls, prune_stale_scans, prune_write_scans;
   uint64_t reins_or_seen, reins_or_deep, reins_examined, reins_issued, reins_published;
   uint64_t stale_queued, stale_processed, stale_skipped, stale_dropped;
 };

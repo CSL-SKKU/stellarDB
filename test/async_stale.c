@@ -298,7 +298,6 @@ static void test_pipeline(char *directory) {
 int main(int argc, char **argv) {
   init_default_config(&cfg);
   cfg.with_rebal = cfg.with_prune = 0;
-  cfg.migrate_th = 0;
   if (argc == 3 && !strcmp(argv[1], "pipeline")) {
     test_pipeline(argv[2]);
     return 0;

@@ -190,20 +190,28 @@ longer accepted.
 
 ## Pruning
 
-`-p RATIO` / `--with-prune RATIO` enables repeated pruning while the global
-stale/reserved slot ratio is at or above `RATIO`. The argument is required and
-must be between `0` and `1`; for example, `-p 0.3` uses a 30% threshold. The worker
-rechecks the ratio after each successful prune and stops when it falls below
-the threshold or no candidate succeeds. `-M` / `--maintenance-period-ms` sets the
+`-p RATIO` / `--with-prune RATIO` enables migration and pruning while the global
+stale/reserved slot ratio is **strictly greater than** a positive `RATIO`.
+The argument is required and must be between `0` and `1`; for example, `-p 0.3`
+uses a 30% threshold. Each wake attempts one migration, remeasures, then prunes
+repeatedly while above the threshold. The worker rechecks after each successful
+prune and stops at or below the threshold or when no candidate succeeds.
+`-M` / `--maintenance-period-ms` sets the
 periodic wake interval shared by background maintenance (default `500` ms).
+
+`-p 0` selects idle-only cleanup: no periodic stale-ratio or candidate-write
+scans, migration, or pruning during requests. It requires a positive
+`--wait-for-pruning-s` to take effect; without one, `-p 0` is ignored.
+Async invalidation hints and independently enabled rebalancing still operate.
 
 The former `-C` / `--pruning` and `--prune-stale-ratio` options have been removed;
 use `-p RATIO` instead. Setting the maintenance period alone does not enable pruning.
 
-`--migrate-th T` enables migration when an internal node's valid entries fit
-with its history parent's within `T` times the slab capacity (`0` disables it).
-The worker attempts one migration per wake before the ILI pruning burst.
-For example, `-p 0.3 --migrate-th 0.9 -M 500` enables both. Standalone slab
+Migration is automatically enabled by `-p`, under the same ratio gate. Its
+fit threshold is always `1.0`: all valid entries of the internal child and
+its history parent must fit in one slab. Partial migration is not supported.
+`--migrate-th` has been removed. For example, `-p 0.3 -M 500` enables both
+migration and pruning above 30%. Standalone slab
 compaction and all `--compact-*` options have been removed.
 
 ### Post-request idle pruning
@@ -223,10 +231,15 @@ only the current ancestor path: expected O(indexed entries) time and memory
 proportional to the largest ancestor path, plus O(nodes) traversal metadata.
 The sweep also runs when the initial stale estimate is already below the target.
 
-After the sweep, enabled rebalancing and migration continue alongside pruning;
+After the sweep, enabled rebalancing continues alongside migration and pruning;
 the utilization gate is bypassed only during idle. Maintenance starts immediately
 and unsuccessful pruning bursts retry at the configured `-M` interval. The phase
-ends when the stale ratio is **at most** the `-p` target, or when `X` expires.
+ends when the stale ratio is **at most** a positive `-p` target, or when `X` expires.
+With `-p 0`, there is no stale-ratio target. One cleanup pass attempts one
+migration, then prunes until no candidate succeeds, then remeasures. After
+**four consecutive complete passes without a ratio decrease**, cleanup ends
+with `no_progress`. Any decrease resets the counter. Passes use the same `-M`
+cadence, and the timeout still applies, including when the ratio is zero.
 `X` includes settling and invalidation and is checked between operations. A
 started sweep or maintenance operation finishes safely, so elapsed time can exceed
 `X`. If settling consumes the budget, invalidation is reported as `not_started`
@@ -239,6 +252,8 @@ Stdout always includes a final `# Idle pruning:` summary with elapsed seconds,
 pruning execution seconds, attempts/successes, initial/final stale ratios, target,
 status, and last prune return code when attempts are nonzero (`0` success,
 `1` no candidate, negative errno).
+For `-p 0`, the target is `none`, and `# Idle cleanup:` reports completed
+passes and consecutive passes without progress.
 `# Idle invalidation: status=complete newly_marked=N` records sweep completion.
 Elapsed time includes the handoff from background maintenance, pending-work
 settlement, and the sweep. Pruning execution time sums complete idle prune calls,
@@ -251,7 +266,10 @@ amplification.
 With `--report-out`, enabling the wait adds a `phase` column (`busy` or `idle`)
 and `idle_*` result columns to the CSV. Busy values are unchanged; idle-only cells
 are empty on busy rows, and busy-metric cells are empty on idle rows. Filter by
-`phase` when analyzing request performance. Without `--timeseries`, there is one
+`phase` when analyzing request performance. With `-p 0`, the
+`idle_target_stale_ratio` cell is empty and cleanup can end with
+`idle_status=no_progress`.
+Without `--timeseries`, there is one
 idle summary row. With it, idle rows contain cumulative pruning time and counts
 plus the current stale ratio at the requested interval, followed by a final row
 even on timeout. The sweep samples between bounded chunks of index entries with

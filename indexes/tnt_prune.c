@@ -345,6 +345,7 @@ bool prune_scan_for_candidate(struct prune_candidate *out) {
 }
 
 void prune_mark_writes(void) {
+  TEST_STAT_INC(prune_write_scans);
   centree tree = tnt_centree();
   centree_node *leaves;
   size_t capacity, nb = 0;
@@ -591,11 +592,12 @@ int tnt_migrate_up(centree_node child) {
 /*
  * Pick the migration with the greatest estimated reclaim:
  * reserved(child) + stale(parent). The child's valid entries must be nonzero
- * and fit with the parent's within cfg.migrate_th * slab capacity. Require
+ * and fit with the parent's within one full slab capacity. Require
  * at least one page of slot gain. The scan takes no lock; migration rechecks
  * the nodes and their capacity under the maintenance lock.
  */
 int tnt_migrate_once(void) {
+  TEST_STAT_INC(migration_calls);
   centree tree = tnt_centree();
   centree_node *nodes, best = NULL;
   size_t capacity, nb = 0, best_gain = 0, min_gain = PAGE_SIZE / cfg.kv_size;
@@ -604,10 +606,6 @@ int tnt_migrate_once(void) {
   if (tree == NULL)
     return -EINVAL;
 
-  if (cfg.migrate_th <= 0) {
-
-    return TNT_MIGRATE_NOOP;
-  }
   capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
   nodes = malloc(capacity * sizeof(*nodes));
   if (nodes == NULL)
@@ -630,7 +628,8 @@ int tnt_migrate_once(void) {
       size_t pr, pv;
 
       node_slots(p, &pr, &pv);
-      if ((double)(pv + v) <= cfg.migrate_th * (double)full_slab_items()) {
+      size_t limit = full_slab_items();
+      if (pv <= limit && v <= limit - pv) {
         size_t gain = r + (pr - pv);
 
         if (gain >= min_gain && gain > best_gain) {
@@ -707,6 +706,7 @@ static void sum_stale(centree tree, centree_node n, struct prune_stale *acc) {
 }
 
 void prune_stale_measure(struct prune_stale *out) {
+  TEST_STAT_INC(prune_stale_scans);
   centree tree = tnt_centree();
 
   memset(out, 0, sizeof(*out));

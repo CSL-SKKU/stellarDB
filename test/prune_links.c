@@ -1420,7 +1420,7 @@ static void check_concurrent_prune(void) {
     int r = getenv("PRUNE_STRESS_NOPRUNE") ? 0 : prune_one();
 
     if (cfg.with_reins) queue_for_reinsertion(&seed);
-    if (cfg.migrate_th > 0) migrate_one(&migrations);
+    if (getenv("PRUNE_STRESS_MIGRATE")) migrate_one(&migrations);
 
     if (r > 0) prunes++;
     else if (r < 0) rejects++;
@@ -1489,7 +1489,7 @@ static void check_concurrent_prune(void) {
    * phase already asserts that pruning works. What this phase asserts is
    * consistency under concurrent pruning.
    */
-  if (cfg.migrate_th > 0) {
+  if (getenv("PRUNE_STRESS_MIGRATE")) {
     printf("  %-34s %zu migrations during the stress phase\n",
            "migration", migrations);
     check(migrations > 0, "no migration ever ran");
@@ -1717,7 +1717,9 @@ static void hole_verify(void) {
  * no candidates remain. Async hints are best-effort, so this fixture no longer
  * guarantees enough marked entries to reach the threshold. Reads stay exact.
  */
-static void check_auto_trigger(int below_threshold) {
+enum auto_policy { AUTO_ABOVE, AUTO_BELOW, AUTO_ZERO, AUTO_EQUAL };
+
+static void check_auto_trigger(enum auto_policy policy) {
   struct prune_stale m;
   int waited_ms = 0;
   size_t nodes_before;
@@ -1732,19 +1734,25 @@ static void check_auto_trigger(int below_threshold) {
   snapshot_reads(nb_keys + nb_keys / 2);
   nodes_before = tnt_get_node_count();
 
-  cfg.with_prune = 1;
-  cfg.prune_stale_ratio = below_threshold ? 1.0 : 0.2;
-  cfg.maintenance_period_ms = 50;
+  /* No producers remain; finish outstanding hints so equality stays exact. */
+  for (int i = 0; i < 500 && stale_invalidation_pending(); i++) usleep(10000);
+  check(!stale_invalidation_pending(), "invalidation hints did not drain");
   prune_stale_measure(&m);
-  if (below_threshold) {
+  cfg.with_prune = 1;
+  cfg.prune_stale_ratio = policy == AUTO_BELOW ? 1.0 : policy == AUTO_ZERO ? 0.0 :
+                          policy == AUTO_EQUAL ? prune_stale_ratio(&m) : 0.2;
+  cfg.maintenance_period_ms = 50;
+  if (policy == AUTO_BELOW) {
     check(prune_stale_ratio(&m) < cfg.prune_stale_ratio,
           "the fixture has no valid slots for the below-threshold check");
     check(prune_count_candidates() > 0, "the fixture has no prune candidates");
-  } else {
-    check(prune_stale_ratio(&m) >= cfg.prune_stale_ratio,
+  } else if (policy == AUTO_ABOVE) {
+    check(prune_stale_ratio(&m) > cfg.prune_stale_ratio,
           "the load left only %.1f%% stale, below the %.0f%% threshold",
           100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
   }
+  check(prune_stale_ratio(&m) > 0 && prune_count_candidates() > 0,
+        "policy fixture needs stale slots and eligible triples");
   printf("  %-34s %zu/%zu stale (%.1f%%), threshold %.0f%%\n",
          "before the automatic trigger", m.stale, m.reserved,
          100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
@@ -1752,27 +1760,36 @@ static void check_auto_trigger(int below_threshold) {
   uint64_t calls_before = __atomic_load_n(&rstats.prune_calls, __ATOMIC_RELAXED);
   uint64_t noops_before = __atomic_load_n(&rstats.prune_noop, __ATOMIC_RELAXED);
   uint64_t wakeups_before = __atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED);
+  uint64_t migrations_before = __atomic_load_n(&rstats.migration_calls, __ATOMIC_RELAXED);
+  uint64_t stale_scans_before = __atomic_load_n(&rstats.prune_stale_scans, __ATOMIC_RELAXED);
+  uint64_t write_scans_before = __atomic_load_n(&rstats.prune_write_scans, __ATOMIC_RELAXED);
   check(restructuring_worker_init() == 0, "restructuring worker did not start");
-  if (below_threshold) {
+  if (policy != AUTO_ABOVE) {
     /* Separate from the burst test: idle wakes reset candidate write marks. */
     for (int i = 0; i < 500 &&
          __atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED) < wakeups_before + 2; i++)
       usleep(10000);
     check(__atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED) >= wakeups_before + 2,
-          "the worker did not wake for the below-threshold check");
+          "the worker did not wake for the pruning policy check");
     cfg.with_prune = 0;
     tnt_maintenance_lock();
     tnt_maintenance_unlock();
     check(__atomic_load_n(&rstats.prune_calls, __ATOMIC_RELAXED) == calls_before &&
+          __atomic_load_n(&rstats.migration_calls, __ATOMIC_RELAXED) == migrations_before &&
           tnt_get_node_count() == nodes_before,
-          "-p attempted pruning below the global stale-ratio threshold");
-    verify_reads("reads below the pruning threshold");
-    printf("  automatic pruning below threshold: no prune attempts\n");
+          "-p attempted pruning or migration with a closed ratio gate");
+    if (policy == AUTO_ZERO)
+      check(__atomic_load_n(&rstats.prune_stale_scans, __ATOMIC_RELAXED) == stale_scans_before &&
+            __atomic_load_n(&rstats.prune_write_scans, __ATOMIC_RELAXED) == write_scans_before,
+            "-p 0 performed periodic stale or candidate-write scans");
+    verify_reads("reads with pruning gate closed");
+    printf("  automatic pruning policy %d: no migration/prune attempts%s\n", policy,
+           policy == AUTO_ZERO ? " or periodic scans" : "");
     return;
   }
   while (waited_ms < 30000) {
     prune_stale_measure(&m);
-    if (prune_stale_ratio(&m) < cfg.prune_stale_ratio) break;
+    if (prune_stale_ratio(&m) <= cfg.prune_stale_ratio) break;
     if (!stale_invalidation_pending() &&
         __atomic_load_n(&rstats.prune_noop, __ATOMIC_RELAXED) > noops_before &&
         prune_count_candidates() == 0) break;
@@ -1786,11 +1803,13 @@ static void check_auto_trigger(int below_threshold) {
   prune_stale_measure(&m);
 
   size_t candidates_left = prune_count_candidates();
-  check(prune_stale_ratio(&m) < cfg.prune_stale_ratio || candidates_left == 0,
+  check(prune_stale_ratio(&m) <= cfg.prune_stale_ratio || candidates_left == 0,
         "after %d ms the stale ratio is still %.1f%% with candidates left", waited_ms,
         100.0 * prune_stale_ratio(&m));
   check(tnt_get_node_count() < nodes_before,
         "the worker pruned nothing (%lu nodes before and after)", nodes_before);
+  check(__atomic_load_n(&rstats.migration_calls, __ATOMIC_RELAXED) > migrations_before,
+        "-p did not automatically attempt migration above threshold");
   check(centree_validate_locked(tnt_centree()),
         "the routing tree does not validate after automatic pruning");
   validate("after automatic pruning");
@@ -1817,9 +1836,12 @@ int main(int argc, char **argv) {
   int crash_prune = argc > 1 && !strncmp(argv[1], "crash-prune", 11);
   int auto_mode = argc > 1 && !strcmp(argv[1], "auto");
   int auto_wait_mode = argc > 1 && !strcmp(argv[1], "auto-wait");
+  int auto_zero_mode = argc > 1 && !strcmp(argv[1], "auto-zero");
+  int auto_equal_mode = argc > 1 && !strcmp(argv[1], "auto-equal");
   int mode_arg = verify_only || verify_crash || verify_consistent ||
                  crash_split || crash_prune || hole_punch_mode ||
-                 hole_verify_mode || auto_mode || auto_wait_mode;
+                 hole_verify_mode || auto_mode || auto_wait_mode ||
+                 auto_zero_mode || auto_equal_mode;
 
   if (argc > 1 && !mode_arg) nb_keys = strtoull(argv[1], NULL, 0);
   if (argc > 2) nb_keys = strtoull(argv[2], NULL, 0);
@@ -1830,7 +1852,6 @@ int main(int argc, char **argv) {
   cfg.page_cache_size = PAGE_SIZE * 8192; /* 32 MB */
   /* PRUNE_REINS=1 runs the background reinsertion worker alongside. */
   cfg.with_reins = getenv("PRUNE_REINS") ? 1 : 0;
-  cfg.migrate_th = getenv("PRUNE_STRESS_MIGRATE") ? 0.9 : 0.0;
   cfg.with_rebal = 0;
   cfg.nb_items_in_db = nb_keys;
   if (getenv("PRUNE_IDLE_INVALIDATE"))
@@ -1862,8 +1883,9 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (auto_mode || auto_wait_mode) {
-    check_auto_trigger(auto_wait_mode);
+  if (auto_mode || auto_wait_mode || auto_zero_mode || auto_equal_mode) {
+    check_auto_trigger(auto_wait_mode ? AUTO_BELOW : auto_zero_mode ? AUTO_ZERO :
+                       auto_equal_mode ? AUTO_EQUAL : AUTO_ABOVE);
     if (failures) {
       printf("== %lu failures ==\n", failures);
       return 1;

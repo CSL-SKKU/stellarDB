@@ -2,6 +2,7 @@
 """Correctness checks for the official CLI's post-request pruning phase."""
 import csv
 import math
+import re
 import subprocess
 import tempfile
 from pathlib import Path
@@ -72,22 +73,28 @@ def main():
             assert not db.exists()
         db, result = run(base, "missing-target", ["--wait-for-pruning-s", "1"], success=False)
         assert "requires -p/--with-prune" in result.stderr and not db.exists()
+        db, result = run(base, "removed-migration-option", ["--migrate-th", "1"], success=False)
+        assert "unrecognized option" in result.stderr and not db.exists()
 
         # Omitted and explicitly disabled options preserve the existing schema.
         schemas = []
-        for name, options in (("off", []), ("zero", ["--wait-for-pruning-s", "0"])):
+        for name, options in (("off", []), ("zero", ["--wait-for-pruning-s", "0"]),
+                              ("p0-off", ["-p", "0"]),
+                              ("p0-zero", ["-p", "0", "--wait-for-pruning-s", "0"])):
             path = base / (name + ".csv")
             _, result = run(base, name, [*options, "--report-out", path])
             data = read(path)
             assert len(data) == 1 and abs(completed(data) - 17) < 0.001
             assert "# Idle pruning:" not in result.stdout
             assert "phase" not in data[0]
+            assert int(data[0]["pruning_successes"]) == 0
+            assert int(data[0]["migration_successes"]) == 0
             schemas.append(set(data[0]))
-        assert schemas[0] == schemas[1]
+        assert all(schema == schemas[0] for schema in schemas)
 
-        # Equality is success even for a zero target; no gratuitous prune/wait.
+        # Below a positive target: sweep, then stop without structural work.
         path = base / "clean.csv"
-        _, result = run(base, "clean", ["-p", "0", "--wait-for-pruning-s", "2",
+        _, result = run(base, "clean", ["-p", "1", "--wait-for-pruning-s", "2",
                                        "--report-out", path])
         _, idle = phases(path, 17)
         assert len(idle) == 1
@@ -97,6 +104,20 @@ def main():
         assert float(idle[0]["idle_elapsed_s"]) < 2
         assert "# Idle invalidation: status=complete" in result.stdout
 
+        # Zero is a policy, not a target: even a clean tree completes four
+        # no-progress passes, paced by -M, after the full invalidation sweep.
+        path = base / "clean-idle-only.csv"
+        _, result = run(base, "clean-idle-only", ["-p", "0", "--wait-for-pruning-s", "2",
+                                                 "--report-out", path])
+        _, idle = phases(path, 17)
+        assert len(idle) == 1 and idle[-1]["idle_status"] == "no_progress"
+        assert int(idle[-1]["idle_pruning_attempts"]) == 4
+        assert idle[-1]["idle_target_stale_ratio"] == ""
+        assert float(idle[-1]["idle_stale_ratio"]) == 0
+        assert 0.06 <= float(idle[-1]["idle_elapsed_s"]) < 2
+        assert "# Idle cleanup: passes=4 no_progress_passes=4" in result.stdout
+        assert "target=none" in result.stdout
+
         # With no pending hints or copies, the first sweep callback is due
         # immediately, even when the entire sweep fits in one sample interval.
         path = base / "clean-timeseries.csv"
@@ -104,7 +125,9 @@ def main():
                                        "--timeseries", "0.001", "--report-out", path])
         _, idle = phases(path, 17)
         assert any(row["idle_status"] == "invalidating" for row in idle)
-        assert idle[-1]["idle_status"] == "target_reached"
+        assert idle[-1]["idle_status"] == "no_progress"
+        assert all(row["idle_target_stale_ratio"] == "" for row in idle)
+        assert int(idle[-1]["idle_pruning_attempts"]) == 4
 
         # Expiring before the sweep cannot report success merely because the
         # old estimate was already below target.
@@ -118,7 +141,7 @@ def main():
         # Three nodes cannot form an ILI triple. Stale data persists, but the
         # fail-safe exits normally and emits the final (partial interval) row.
         path = base / "unreachable.csv"
-        db, result = run(base, "unreachable", ["-p", "0", "--wait-for-pruning-s", "0.23",
+        db, result = run(base, "unreachable", ["-p", "0.001", "--wait-for-pruning-s", "0.23",
                                                "--report-out", path, "--timeseries", "0.05"],
                          items=64, requests=17, writes=True)
         busy, idle = phases(path, 17)
@@ -132,6 +155,18 @@ def main():
         assert int(final["idle_last_prune_status"]) == 1
         assert all(int(row["pruning_successes"]) == 0 for row in busy)
         assert "status=timeout" in result.stdout
+
+        # With -p 0, the same nonzero stale ratio stops after four complete
+        # no-progress passes rather than waiting for an unreachable target.
+        path = base / "stalled.csv"
+        _, result = run(base, "stalled", ["-p", "0", "--wait-for-pruning-s", "2",
+                                          "--report-out", path], items=64, db=db)
+        _, idle = phases(path, 17)
+        assert idle[-1]["idle_status"] == "no_progress"
+        assert int(idle[-1]["idle_pruning_attempts"]) == 4
+        assert float(idle[-1]["idle_stale_ratio"]) > 0
+        assert idle[-1]["idle_target_stale_ratio"] == ""
+        assert "# Idle cleanup: passes=4 no_progress_passes=4" in result.stdout
 
         # Idle results remain available with a selective config and with CSV off.
         config = base / "selected.config"
@@ -175,8 +210,30 @@ def main():
         assert abs(completed(data) - 1024) < 0.001
         assert int(data[-1]["entries_live_normal"]) == 1024
         assert int(data[-1]["entries_live_tombstones"]) == 0
+
+        # Idle-only cleanup does real migration/pruning, then exhausts four
+        # consecutive non-improving passes. A productive pass is not a retry.
+        path = base / "idle-reclaim.csv"
+        db, result = run(base, "idle-reclaim", ["-p", "0", "--wait-for-pruning-s", "5",
+                                               "--report-out", path, "--timeseries", "0.001"],
+                         items=1024, requests=4096, writes=True)
+        busy, idle = phases(path, 4096)
+        final = idle[-1]
+        assert final["idle_status"] == "no_progress", result.stdout
+        assert int(final["idle_pruning_successes"]) > 0
+        assert all(row["idle_target_stale_ratio"] == "" for row in idle)
+        assert all(int(row["pruning_successes"]) == int(row["migration_successes"]) == 0
+                   for row in busy)
+        assert float(final["idle_stale_ratio"]) < max(float(row["idle_stale_ratio"]) for row in idle)
+        match = re.search(r"# Idle cleanup: passes=(\d+) no_progress_passes=(\d+)", result.stdout)
+        assert match and int(match[1]) > 4 and int(match[2]) == 4
+        path = base / "idle-recovered.csv"
+        run(base, "idle-recovered", ["--report-out", path], items=1024, requests=1024, db=db)
+        data = read(path)
+        assert int(data[-1]["entries_live_normal"]) == 1024
+        assert int(data[-1]["entries_live_tombstones"]) == 0
     print("PASS idle pruning: validation, disabled schema, busy accounting, equality, timeout, "
-          "timeseries, selective/off reports, gate bypass, reclaim, recovery")
+          "timeseries, selective/off reports, gate bypass, reclaim, four-pass stop, recovery")
 
 
 if __name__ == "__main__":
