@@ -92,7 +92,7 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->timeseries_s = 0;
     cfg->churn_upd = 50; cfg->churn_ins = 25; cfg->churn_del = 25;
     cfg->migrate_th = 0.0;
-    cfg->reins_sample    = 16;
+    cfg->reins_sample    = 1;
     cfg->with_prune      = 0;
     cfg->prune_stale_ratio = 0.3;
     cfg->maintenance_period_ms = 500;

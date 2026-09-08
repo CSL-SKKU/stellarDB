@@ -28,7 +28,7 @@ static void print_help(char *n) {
   puts("      --config-report <file.config> metric switches, key=true/false; default all enabled");
   puts("      --timeseries <seconds>      positive interval in seconds; omitted: whole-run aggregate");
   puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
-  puts("      --reins-sample <N>          with -r: attempt a copy on one in N qualifying reads (16; 0 means 1)");
+  puts("      --reins-sample <N>          with -r: attempt a copy on one in N qualifying reads (1; 0 means 1)");
   puts("  -p, --with-prune <0..1>         enable repeated pruning at this global stale/reserved ratio");
   puts("  -M, --maintenance-period-ms <ms> interval for background maintenance (500)");
   puts("      --migrate-th <0..1>         migration: move a node into its history parent when both fit in t * capacity (0 = off)");

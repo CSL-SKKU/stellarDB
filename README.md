@@ -73,7 +73,7 @@ make REALKEY_FILE_PATH=/path/to/key-trace
   -o, --old-percent <float>       Set OLD_PERCENT
   -e, --epoch <number>            Set epoch count
   -r[<x>], --with-reins[=<x>]     Reinsert after >= ceil(x * log2(nodes+1)) history hops (x >= 0, default 1.0)
-      --reins-sample <N>          With -r: attempt a copy on one in N qualifying reads (16; 0 means 1)
+      --reins-sample <N>          With -r: attempt a copy on one in N qualifying reads (1; 0 means 1)
   -R[<x>], --with-rebal[=<x>]     Rebalance when depth > x * ceil(log2(nodes+1)) (x >= 0, default 5.0)
   -n, --items <number>            Number of items in the database
   -q, --requests <number>         Number of requests
@@ -114,7 +114,7 @@ distributors. `-r0.5 1 48 12` uses the multiplier `0.5` with the same topology.
 
 The source page must already be marked hot by an earlier read since the last
 bitmap reset. `--reins-sample N` passes approximately one in N qualifying reads
-(default 16; 1 attempts every qualifying read; 0 is treated as 1). Sampling alone
+(default 1; 1 attempts every qualifying read; 0 is treated as 1). Sampling alone
 does not enable reinsertion. The bitmap tracks pages, not repeated reads of a
 particular key, and is cleared using distributor-loop epochs rather than seconds.
 

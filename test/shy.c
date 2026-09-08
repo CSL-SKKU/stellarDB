@@ -316,9 +316,8 @@ static void test_on_read_trigger(void) {
       .action = READ_NO_LOOKUP, .upward_len = 6, .page_was_hot = 1};
 
   init_default_config(&cfg);
-  check(!cfg.with_reins && cfg.reins_multiplier == 1.0 && cfg.reins_sample == 16,
+  check(!cfg.with_reins && cfg.reins_multiplier == 1.0 && cfg.reins_sample == 1,
         "reinsertion defaults changed");
-  cfg.reins_sample = 1;
   centree_init();
   /* Control advisory metadata: ceil(log2(31+1)) = 5, regardless of depth.
    * Routing stays empty because every attempted copy must fail authority. */
