@@ -181,6 +181,12 @@ struct prune_stale {
 };
 void prune_stale_measure(struct prune_stale *out);
 double prune_stale_ratio(const struct prune_stale *m);
+/* Final-idle operation only: clients have completed, reinsertion producers
+ * have stopped, and outstanding requests/hints have drained. Acquires the
+ * maintenance lock and rechecks references before borrowing index pointers.
+ * progress() may report but must not mutate or acquire maintenance_lock. */
+int tnt_invalidate_idle(void (*progress)(void *), void *context,
+                        uint64_t *invalidated);
 
 /*
  * The replacement node N under construction. Nothing points at it until the

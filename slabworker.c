@@ -879,10 +879,10 @@ static int idle_refs_pending(centree tree, centree_node n) {
 
 static int idle_work_pending(void) {
   centree tree = tnt_centree();
-  int pending = 0;
+  int pending = !fsst_worker_stopped();
   if (tree) {
     centree_read_in(tree);
-    pending = idle_refs_pending(tree, centree_read_root(tree));
+    pending |= idle_refs_pending(tree, centree_read_root(tree));
     centree_read_out(tree);
   }
   pthread_mutex_lock(&restructuring_lock);
@@ -897,6 +897,25 @@ static void idle_sleep_until(uint64_t at) {
   while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &when, NULL) == EINTR) {}
 }
 
+struct idle_invalidation_report {
+  uint64_t began, interval;
+  uint64_t *next_sample;
+  struct idle_pruning_result *result;
+};
+
+static void idle_invalidation_progress(void *context) {
+  struct idle_invalidation_report *report = context;
+  uint64_t now = report_now_ns();
+  if (now < *report->next_sample) return;
+  struct prune_stale m;
+  prune_stale_measure(&m);
+  report->result->elapsed_ns = now - report->began;
+  report->result->stale_ratio = prune_stale_ratio(&m);
+  report->result->status = "invalidating";
+  report_idle_pruning(report->result);
+  *report->next_sample = now + report->interval;
+}
+
 void slab_workers_wait_for_pruning(void) {
   uint64_t began = report_now_ns();
   uint64_t deadline = began + (uint64_t)(cfg.wait_for_pruning_s * 1e9);
@@ -906,7 +925,9 @@ void slab_workers_wait_for_pruning(void) {
   struct idle_pruning_result result = {.target = cfg.prune_stale_ratio,
                                       .last_prune_status = TNT_PRUNE_NOOP};
   struct prune_stale m;
-  int burst = 0;
+  int burst = 0, invalidation_complete = 0;
+
+  fsst_worker_request_stop();
 
   /* The sampler has joined and busy metrics are final. Transfer maintenance
    * only between complete operations, including invalidation batches. Leave
@@ -928,11 +949,31 @@ void slab_workers_wait_for_pruning(void) {
     while (report_now_ns() < deadline && stale_invalidation_drain() &&
            (!interval || report_now_ns() < next_sample)) {}
     int pending = idle_work_pending();
+    if (!pending && !invalidation_complete && report_now_ns() < deadline) {
+      struct idle_invalidation_report report = {began, interval, &next_sample, &result};
+      uint64_t marked = 0;
+      /* No clients or reinsertion producers remain. Unlike the bounded hint
+       * queue, this pass repairs every missed ancestor mark. As with a prune,
+       * the deadline is checked between operations; a started sweep completes. */
+      int status = tnt_invalidate_idle(interval ? idle_invalidation_progress : NULL,
+                                       &report, &marked);
+      if (status) {
+        fprintf(stderr, "Idle invalidation failed: %s\n", strerror(-status));
+        prune_stale_measure(&m);
+        result.elapsed_ns = report_now_ns() - began;
+        result.stale_ratio = prune_stale_ratio(&m);
+        result.status = "invalidation_failed";
+        report_idle_pruning(&result);
+        break;
+      }
+      invalidation_complete = 1;
+      printf("# Idle invalidation: status=complete newly_marked=%" PRIu64 "\n", marked);
+    }
     prune_stale_measure(&m);
     result.stale_ratio = prune_stale_ratio(&m);
     uint64_t now = report_now_ns();
     result.elapsed_ns = now - began;
-    int reached = !pending && result.stale_ratio <= result.target;
+    int reached = !pending && invalidation_complete && result.stale_ratio <= result.target;
     int finished = reached || now >= deadline;
     result.status = reached ? "target_reached" : finished ? "timeout" :
                     pending ? "settling" : "waiting";
@@ -984,6 +1025,9 @@ void slab_workers_wait_for_pruning(void) {
         fprintf(stderr, "Idle pruning failed: %s; retrying next period\n", strerror(-status));
     }
   }
+  if (!invalidation_complete)
+    printf("# Idle invalidation: status=%s\n",
+           strcmp(result.status, "invalidation_failed") == 0 ? "failed" : "not_started");
   printf("# Idle pruning: status=%s elapsed_s=%.9f pruning_time_s=%.9f "
          "attempts=%" PRIu64 " successes=%" PRIu64 " initial_stale_ratio=%.9f "
          "final_stale_ratio=%.9f target=%.9f last_prune_status=%d\n",

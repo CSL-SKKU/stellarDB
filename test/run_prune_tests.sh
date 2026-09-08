@@ -8,7 +8,7 @@ set -u
 cd "$(dirname "$0")/.."
 
 make -j"$(nproc)" test/test_prune_freeze test/test_prune_links test/test_split_skip \
-  test/test_rebalance test/test_rebalance_api >/dev/null || exit 1
+  test/test_rebalance test/test_rebalance_api test/test_idle_invalidation >/dev/null || exit 1
 
 # Runs a binary with a throwaway /scratch0/kvell. $DBDIR is reused when set,
 # which is how the recovery case re-opens the database it just wrote.
@@ -31,6 +31,8 @@ filter() { grep -v "SLAB WORKER\|^CORE:\|Reserving memory\|page_cache_init\|BREA
 echo "== in-process unit tests (no slab files) =="
 ./test/test_prune_freeze >/dev/null 2>&1
 report "slab_freeze (reject paths, drain, freeze vs. split race)" $?
+./test/test_idle_invalidation
+report "idle invalidation (all missed hints, counts, branch isolation, quiescence)" $?
 
 echo
 echo "== the final-slot writer must split (Known bugs 23) =="
@@ -64,6 +66,16 @@ sandboxed env PRUNE_STRESS_MIGRATE=1 ./test/test_prune_links 2>&1 | filter | gre
 report "migration with ILI pruning under load" "${PIPESTATUS[0]}"
 sandboxed ./test/test_prune_links verify 2>&1 | filter | tail -2
 report "read back after migration and pruning recovery" "${PIPESTATUS[0]}"
+unset DBDIR
+
+echo
+echo "== full idle invalidation after migration and reinsertion =="
+DBDIR=$(mktemp -d /tmp/stellar-prune-XXXXXX)
+export DBDIR
+sandboxed env PRUNE_REINS=1 PRUNE_STRESS_MIGRATE=1 PRUNE_IDLE_INVALIDATE=1 ./test/test_prune_links 2>&1 | filter | grep -E "FAIL|idle invalidation|Idle invalidation|state after recovery"
+report "complete idle sweep after concurrent migration/pruning/reinsertion" "${PIPESTATUS[0]}"
+sandboxed ./test/test_prune_links verify 2>&1 | filter | tail -2
+report "recovery after complete idle invalidation" "${PIPESTATUS[0]}"
 unset DBDIR
 
 echo

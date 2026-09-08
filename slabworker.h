@@ -43,9 +43,11 @@ int get_nb_distributors(void);
 unsigned int get_distributor_utilization(void);
 unsigned int get_io_worker_utilization(void);
 int restructuring_worker_init(void);
-/* Call after the final client completion and report_finish(). Parks the
- * background maintenance worker through process exit, drives configured
- * maintenance without the utilization gate, and reports the idle phase. */
+/* Call after the final client completion and report_finish(). Stops reinsertion
+ * production, parks maintenance, and drains outstanding copies/hints. Performs
+ * one complete in-memory invalidation sweep before checking the target, then
+ * drives configured maintenance without the utilization gate. The deadline
+ * includes settling and the sweep, but never interrupts an operation in flight. */
 void slab_workers_wait_for_pruning(void);
 /* Bounded, best-effort hints; enqueue never waits for queue space or maintenance.
  * Descriptors are retained for the process lifetime. No reference is pinned. */

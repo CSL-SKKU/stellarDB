@@ -43,6 +43,21 @@ int subtree_forall_keys(subtree_t *t, void (*cb)(uint64_t h, int n, void *data),
 int subtree_forall_entries(subtree_t *t,
                            void (*cb)(uint64_t key, uint32_t slot, void *data),
                            void *data);
+/* Historical preorder; root has parent SIZE_MAX, every other parent precedes
+ * its children. The caller owns all indexes exclusively for the entire sweep.
+ * No insert/erase/free or topology change may run, including in progress(). */
+struct subtree_idle_node {
+  subtree_t *index;
+  size_t *valid;
+  size_t parent;
+};
+/* Mark all descendant-shadowed entries, including those behind tombstones.
+ * Uses only the active ancestor path; no disk I/O or per-key B-tree lookup.
+ * A started sweep runs to completion. Returns 0 or a negative errno; partial
+ * marking on error is safe and idempotent. progress() may report, not mutate. */
+int subtree_invalidate_idle(struct subtree_idle_node *nodes, size_t count,
+                            void (*progress)(void *), void *context,
+                            uint64_t *invalidated);
 int subtree_forall_invalid(subtree_t *t, void *data, void (*cb)(void *slab, uint64_t slab_idx));
 void subtree_free(subtree_t *t);
 

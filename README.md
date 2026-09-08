@@ -213,24 +213,38 @@ requests complete. It requires `-p RATIO`, accepts fractional seconds, and is
 disabled by default or with `X = 0`. Busy throughput, latency, traversal, and
 maintenance measurements finish at their existing completion boundary.
 
-During idle, pending asynchronous copies and stale hints settle before the
-target is tested. Enabled rebalancing and migration continue alongside pruning;
+At idle entry, the optional background reinsertion producer stops, maintenance
+parks, and outstanding copies and stale hints drain. Before testing the target,
+one complete in-memory sweep marks every ancestor entry shadowed by a descendant,
+including copies behind tombstones and copies whose invalidation hints were lost.
+It follows the historical tree and updates invalid bits and live-entry counts
+directly, with no slab reads or writes. A reusable hash table and undo stack keep
+only the current ancestor path: expected O(indexed entries) time and memory
+proportional to the largest ancestor path, plus O(nodes) traversal metadata.
+The sweep also runs when the initial stale estimate is already below the target.
+
+After the sweep, enabled rebalancing and migration continue alongside pruning;
 the utilization gate is bypassed only during idle. Maintenance starts immediately
 and unsuccessful pruning bursts retry at the configured `-M` interval. The phase
 ends when the stale ratio is **at most** the `-p` target, or when `X` expires.
-`X` is a fail-safe checked between operations: an in-progress maintenance operation
-finishes safely, so elapsed time can exceed `X`. An unreachable target is a normal
-`timeout` result and does not make the benchmark fail.
+`X` includes settling and invalidation and is checked between operations. A
+started sweep or maintenance operation finishes safely, so elapsed time can exceed
+`X`. If settling consumes the budget, invalidation is reported as `not_started`
+and the phase times out without claiming the target was reached. A sweep error
+ends the phase with `invalidation_failed`, without starting structural maintenance.
+An unreachable target is a normal `timeout` result and does not make the
+benchmark fail.
 
 Stdout always includes a final `# Idle pruning:` summary with elapsed seconds,
 pruning execution seconds, attempts/successes, initial/final stale ratios, target,
 status, and last prune return code when attempts are nonzero (`0` success,
 `1` no candidate, negative errno).
-Elapsed time includes the handoff from background maintenance and pending-work
-settlement. Pruning execution time sums complete idle prune calls, including
-unsuccessful attempts, and excludes sleeps, hint processing, rebalancing, migration,
-and an operation already running at handoff. The initial ratio is measured at
-handoff; pending hints can make it rise before pruning reduces it. Both ratios use
+`# Idle invalidation: status=complete newly_marked=N` records sweep completion.
+Elapsed time includes the handoff from background maintenance, pending-work
+settlement, and the sweep. Pruning execution time sums complete idle prune calls,
+including unsuccessful attempts, and excludes sleeps, invalidation, rebalancing,
+migration, and an operation already running at handoff. The initial ratio is measured at
+handoff; repairing missed hints can make it rise before pruning reduces it. Both ratios use
 the same stale/reserved **estimate** as the pruning trigger, not physical space
 amplification.
 
@@ -240,7 +254,10 @@ are empty on busy rows, and busy-metric cells are empty on idle rows. Filter by
 `phase` when analyzing request performance. Without `--timeseries`, there is one
 idle summary row. With it, idle rows contain cumulative pruning time and counts
 plus the current stale ratio at the requested interval, followed by a final row
-even on timeout. Samples wait for operation boundaries and skip missed intervals.
+even on timeout. The sweep samples between bounded chunks of index entries with
+`idle_status=invalidating`; other maintenance operations sample at operation
+boundaries and skip missed intervals. Invalidation time is excluded from busy
+request throughput/latency and from idle pruning execution time.
 Without this option, the existing CSV schema is unchanged.
 
 ```bash

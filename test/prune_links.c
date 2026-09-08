@@ -1833,6 +1833,9 @@ int main(int argc, char **argv) {
   cfg.migrate_th = getenv("PRUNE_STRESS_MIGRATE") ? 0.9 : 0.0;
   cfg.with_rebal = 0;
   cfg.nb_items_in_db = nb_keys;
+  if (getenv("PRUNE_IDLE_INVALIDATE"))
+    report_mask = (UINT64_C(1) << REPORT_ENTRIES_STALE) |
+                  (UINT64_C(1) << REPORT_ENTRIES_TOMBSTONES);
 
   printf("== history links (%lu keys, reins=%d) ==\n", nb_keys,
          cfg.with_reins);
@@ -1940,6 +1943,24 @@ int main(int argc, char **argv) {
         tnt_get_node_count());
   check_writes_after_prune();
   check_concurrent_prune();
+  if (getenv("PRUNE_IDLE_INVALIDATE")) {
+    cfg.with_prune = 1;
+    cfg.prune_stale_ratio = 1.0;
+    cfg.wait_for_pruning_s = 5;
+    slab_workers_wait_for_pruning();
+    check(fsst_worker_stopped(), "idle left the reinsertion producer running");
+    uint64_t total = 0, stale = 0, tombstones = 0, marked;
+    tnt_report_entries(&total, &stale, &tombstones);
+    check(total - stale - tombstones == nb_keys + nb_keys / 2 - (nb_keys + 9) / 10,
+          "idle left stale-but-unmarked normal entries (%lu normal)", total - stale - tombstones);
+    check(tnt_invalidate_idle(NULL, NULL, &marked) == 0 && marked == 0,
+          "a second idle sweep found missed invalidations");
+    // Verification reads must not start new copy-forwards after final idle.
+    cfg.with_reins = 0;
+    verify_model();
+    validate("after idle invalidation");
+    puts("  idle invalidation: exact live population, idempotence and model readback checked");
+  }
   check(count_slab_files() == tnt_get_node_count(),
         "%zu slab files for %lu nodes after the stress run", count_slab_files(),
         tnt_get_node_count());
@@ -1955,7 +1976,7 @@ int main(int argc, char **argv) {
    * (or split its leaf) for a whole run, so the plain run is the one that has
    * to prove the history-root case. The reinsertion run only reports it.
    */
-  if (!cfg.with_reins)
+  if (!getenv("PRUNE_REINS"))
     check(cov_history_root > 0, "the D == NULL case was never seen");
   else if (cov_history_root == 0)
     printf("    NOTE the D == NULL case did not come up in this run\n");

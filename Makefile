@@ -35,7 +35,7 @@ all: makefile.dep main
 
 test: test/test_main test/test_reins test/test_rebalance test/test_rebalance_api \
 	test/test_prune_links test/test_prune_freeze test/test_shy test/test_split_skip \
-	test/test_async_stale test/test_report
+	test/test_async_stale test/test_report test/test_idle_invalidation
 
 # Test observations and fault injection never enter normal benchmark objects.
 TEST_OTHERS_OBJ=$(addprefix .build/test/,${OTHERS_OBJ})
@@ -49,6 +49,9 @@ TEST_CFLAGS=${CFLAGS} -DSTELLAR_TESTING=1
 -include $(wildcard .build/test/*.d .build/test/indexes/*.d .build/test/test/*.d)
 
 test/test_report: .build/test/test/report.o ${TEST_OTHERS_OBJ}
+	${CC} $^ ${CFLAGS} ${LDLIBS} -o $@
+
+test/test_idle_invalidation: .build/test/test/idle_invalidation.o ${TEST_OTHERS_OBJ}
 	${CC} $^ ${CFLAGS} ${LDLIBS} -o $@
 
 test/test_async_stale: .build/test/test/async_stale.o ${TEST_OTHERS_OBJ}
@@ -95,4 +98,4 @@ clean:
 	rm -rf .build/test
 	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins \
 		test/test_rebalance test/test_rebalance_api test/test_prune_links \
-		test/test_prune_freeze test/test_shy test/test_split_skip test/test_async_stale test/test_report makefile.dep
+		test/test_prune_freeze test/test_shy test/test_split_skip test/test_async_stale test/test_report test/test_idle_invalidation makefile.dep

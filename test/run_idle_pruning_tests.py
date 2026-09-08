@@ -56,6 +56,8 @@ def phases(path, requests):
         attempts = int(row["idle_pruning_attempts"])
         successes = int(row["idle_pruning_successes"])
         assert 0 <= pruning <= elapsed and 0 <= successes <= attempts
+        if row["idle_status"] == "invalidating":
+            assert attempts == successes == 0 and pruning == 0
         ratio = float(row["idle_stale_ratio"])
         assert math.isfinite(ratio) and 0 <= ratio <= 1
     return busy, idle
@@ -93,6 +95,25 @@ def main():
         assert int(idle[0]["idle_pruning_attempts"]) == 0
         assert float(idle[0]["idle_stale_ratio"]) == 0
         assert float(idle[0]["idle_elapsed_s"]) < 2
+        assert "# Idle invalidation: status=complete" in result.stdout
+
+        # With no pending hints or copies, the first sweep callback is due
+        # immediately, even when the entire sweep fits in one sample interval.
+        path = base / "clean-timeseries.csv"
+        run(base, "clean-timeseries", ["-p", "0", "--wait-for-pruning-s", "2",
+                                       "--timeseries", "0.001", "--report-out", path])
+        _, idle = phases(path, 17)
+        assert any(row["idle_status"] == "invalidating" for row in idle)
+        assert idle[-1]["idle_status"] == "target_reached"
+
+        # Expiring before the sweep cannot report success merely because the
+        # old estimate was already below target.
+        path = base / "no-sweep-time.csv"
+        _, result = run(base, "no-sweep-time", ["-p", "0", "--wait-for-pruning-s", "0.000000001",
+                                               "--report-out", path])
+        _, idle = phases(path, 17)
+        assert idle[-1]["idle_status"] == "timeout"
+        assert "# Idle invalidation: status=not_started" in result.stdout
 
         # Three nodes cannot form an ILI triple. Stale data persists, but the
         # fail-safe exits normally and emits the final (partial interval) row.
@@ -137,12 +158,15 @@ def main():
         final = idle[-1]
         assert final["idle_status"] == "target_reached", result.stdout
         assert float(final["idle_stale_ratio"]) <= 0.6
-        assert float(final["idle_initial_stale_ratio"]) > 0.6
+        # The handoff estimate can still be below target: pending hints and
+        # the complete sweep raise it before the first idle target check.
+        assert 0 <= float(final["idle_initial_stale_ratio"]) <= 1
         assert int(final["idle_pruning_successes"]) > 0
         assert float(final["idle_pruning_time_s"]) > 0
         assert float(final["idle_elapsed_s"]) < 5
         assert all(int(row["pruning_successes"]) == 0 for row in busy)
         assert int(final["idle_last_prune_status"]) == 0
+        assert "# Idle invalidation: status=complete" in result.stdout
 
         # Reopen the pruned database: all authoritative keys remain indexed.
         path = base / "recovered.csv"

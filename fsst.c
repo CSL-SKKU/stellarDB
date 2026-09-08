@@ -2,6 +2,16 @@
 #include <errno.h>
 
 static char *gc_buf;
+static _Atomic int fsst_started, fsst_stop_requested, fsst_stopped;
+
+void fsst_worker_request_stop(void) {
+  atomic_store_explicit(&fsst_stop_requested, 1, memory_order_release);
+}
+
+int fsst_worker_stopped(void) {
+  return !atomic_load_explicit(&fsst_started, memory_order_acquire) ||
+         atomic_load_explicit(&fsst_stopped, memory_order_acquire);
+}
 int cur = 0;
 
 void cb_gc(struct slab_callback *cb, void *item){
@@ -17,12 +27,14 @@ static void *fsst_worker(void *pdata) {
   //tnt_rebalancing();
 
   while (1) {
+    if (atomic_load_explicit(&fsst_stop_requested, memory_order_acquire)) break;
     if (bgq_is_empty(GC)) {
       goto fsst_sleep;
     }
 
   if (!bgq_is_empty(GC)) {
     for (int j = 0; j < HOT_BATCH; j++) {
+      if (atomic_load_explicit(&fsst_stop_requested, memory_order_acquire)) goto stopped;
       struct slab *s = (struct slab*)bgq_dequeue(GC);
 
       if (!s) goto fsst_sleep;
@@ -220,10 +232,17 @@ slab_done:
 fsst_sleep:
     sleep(1);
   }
+stopped:
+  free(gc_buf);
+  atomic_store_explicit(&fsst_stopped, 1, memory_order_release);
+  return NULL;
 }
 
 void fsst_worker_init(void) {
   pthread_t t;
   gc_buf = aligned_alloc(PAGE_SIZE, cfg.max_file_size);
-  pthread_create(&t, NULL, fsst_worker, NULL);
+  atomic_store_explicit(&fsst_started, 1, memory_order_release);
+  int error = pthread_create(&t, NULL, fsst_worker, NULL);
+  if (error) die("Cannot start reinsertion worker: %s\n", strerror(error));
+  pthread_detach(t);
 }

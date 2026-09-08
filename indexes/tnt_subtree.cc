@@ -1,5 +1,8 @@
 #include "cpp-btree/btree_map.h"
 #include <vector>
+#include <cerrno>
+#include <new>
+#include <stdexcept>
 #include "tnt_subtree.h"
 #include "../report.h"
 
@@ -203,6 +206,127 @@ int subtree_forall_entries(subtree_t *t,
     i++;
   }
   return n;
+}
+
+int subtree_invalidate_idle(struct subtree_idle_node *nodes, size_t count,
+                            void (*progress)(void *), void *context,
+                            uint64_t *invalidated) {
+  using tree_type = btree_map<uint64_t, uint32_t>;
+  struct entry {
+    uint64_t key;
+    uint32_t *word;             // stable: the indexes cannot change structure
+    subtree_idle_node *owner;
+    size_t previous;            // former ancestor, encoded as index + 1
+  };
+  struct frame { size_t node, begin; };
+  *invalidated = 0;
+  try {
+    // Allocate everything before marking. Unlike a node-based hash map, the
+    // table/path storage is reused without allocating for every indexed key.
+    vector<size_t> lengths(count);
+    size_t peak = 0;
+    for (size_t i = 0; i < count; i++) {
+      auto &n = nodes[i];
+      if (!n.index || !n.valid || (i == 0 ? n.parent != SIZE_MAX : n.parent >= i))
+        return -EINVAL;
+      size_t length = i ? lengths[n.parent] : 0;
+      bool internal = i + 1 < count && nodes[i + 1].parent == i;
+      if (internal) {
+        size_t items = static_cast<tree_type *>(n.index->tree)->size();
+        if (items > SIZE_MAX - length) return -EOVERFLOW;
+        length += items;
+      }
+      lengths[i] = length;
+      if (length > peak) peak = length;
+    }
+    size_t capacity = 8;
+    if (peak > SIZE_MAX / 2) return -EOVERFLOW;
+    while (capacity / 2 < peak) {
+      if (capacity > SIZE_MAX / 2) return -EOVERFLOW;
+      capacity *= 2;
+    }
+    vector<size_t> table(capacity, 0);
+    vector<entry> path;
+    vector<frame> frames;
+    path.reserve(peak);
+    frames.reserve(count);
+    const size_t mask = capacity - 1;
+    auto home = [mask](uint64_t key) {
+      key ^= key >> 30; key *= UINT64_C(0xbf58476d1ce4e5b9);
+      key ^= key >> 27; key *= UINT64_C(0x94d049bb133111eb);
+      return (size_t)(key ^ (key >> 31)) & mask;
+    };
+    auto find = [&](uint64_t key) {
+      size_t at = home(key);
+      while (table[at] && path[table[at] - 1].key != key) at = (at + 1) & mask;
+      return at;
+    };
+    size_t visited = 0;
+    auto pop = [&]() {
+      size_t begin = frames.back().begin;
+      while (path.size() > begin) {
+        auto &e = path.back();
+        size_t at = find(e.key);
+        table[at] = e.previous;
+        if (!e.previous) {
+          // Backshift deletion avoids accumulating tombstones over a long
+          // traversal. Ancestor stack indices remain valid when cells move.
+          size_t hole = at, next = (at + 1) & mask;
+          while (table[next]) {
+            size_t start = home(path[table[next] - 1].key);
+            if (((hole - start) & mask) < ((next - start) & mask)) {
+              table[hole] = table[next]; hole = next;
+            }
+            next = (next + 1) & mask;
+          }
+          table[hole] = 0;
+        }
+        path.pop_back();
+        if (++visited % 16384 == 0 && progress) progress(context);
+      }
+      frames.pop_back();
+      if (progress) progress(context);
+    };
+    for (size_t i = 0; i < count; i++) {
+      while (!frames.empty() && frames.back().node != nodes[i].parent) pop();
+      if (nodes[i].parent != SIZE_MAX && frames.empty()) return -EINVAL;
+      bool internal = i + 1 < count && nodes[i + 1].parent == i;
+      size_t begin = path.size();
+      auto tree = static_cast<tree_type *>(nodes[i].index->tree);
+      for (auto it = tree->begin(); it != tree->end(); ++it) {
+        size_t at = find(it->first), previous = table[at];
+        if (previous) {
+          auto &older = path[previous - 1];
+          uint32_t word = *older.word;
+          if (!sidx_is_invalid(word)) {
+            // Exclusive idle ownership permits updating the actual value word
+            // without a second lookup or a per-entry lock/atomic bit operation.
+            *older.word = word | SIDX_INVALID_BIT;
+            --*older.owner->valid;
+            marked_add(older.owner->index);
+            if (report_entry_classes() && tombstone_at(older.owner->index, word))
+              --older.owner->index->live_tombstones;
+            ++*invalidated;
+          }
+        }
+        // Marked entries and tombstones still shadow older copies. A leaf
+        // only probes: it has no descendants that need a path-table entry.
+        if (internal) {
+          path.push_back({it->first, &it->second, &nodes[i], previous});
+          table[at] = path.size();
+        }
+        if (++visited % 16384 == 0 && progress) progress(context);
+      }
+      if (internal) frames.push_back({i, begin});
+      if (progress) progress(context);
+    }
+    while (!frames.empty()) pop();
+  } catch (const bad_alloc &) {
+    return -ENOMEM;
+  } catch (const length_error &) {
+    return -EOVERFLOW;
+  }
+  return 0;
 }
 
 int subtree_forall_invalid(subtree_t *t, void *data, void (*cb)(void *slab, uint64_t slab_idx)) {

@@ -426,6 +426,60 @@ static void rebuild_swap(centree_node n, struct slab *old, struct slab *fresh) {
 
 static size_t slab_valid(struct slab *s) { return s->nb_items; }
 
+int tnt_invalidate_idle(void (*progress)(void *), void *context,
+                        uint64_t *invalidated) {
+  centree tree = tnt_centree();
+  struct pending { centree_node node; size_t parent; };
+  struct pending *stack = NULL;
+  struct subtree_idle_node *nodes = NULL;
+  size_t used = 0, pending = 0, capacity;
+  int status = 0;
+  *invalidated = 0;
+  if (!tree) return 0;
+  tnt_maintenance_lock();
+  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire);
+  if (!capacity) goto out;
+  if (capacity > SIZE_MAX / sizeof(*stack) || capacity > SIZE_MAX / sizeof(*nodes)) {
+    status = -EOVERFLOW; goto out;
+  }
+  stack = malloc(capacity * sizeof(*stack));
+  nodes = malloc(capacity * sizeof(*nodes));
+  if (!stack || !nodes) { status = -ENOMEM; goto out; }
+  centree_read_in(tree);
+  centree_node root = centree_read_root(tree);
+  centree_read_out(tree);
+  if (!root) { status = -EINVAL; goto out; }
+  while (centree_lu_parent(root)) root = centree_lu_parent(root);
+  stack[pending++] = (struct pending){root, SIZE_MAX};
+  while (pending) {
+    struct pending item = stack[--pending];
+    centree_node n = item.node;
+    struct slab *s = n->value.slab;
+    if (used == capacity || retired(n) || !s->subtree ||
+        atomic_load_explicit(&s->superseded, memory_order_acquire) ||
+        __atomic_load_n(&s->update_ref, __ATOMIC_ACQUIRE) ||
+        __atomic_load_n(&s->read_ref, __ATOMIC_ACQUIRE)) {
+      status = -EBUSY; goto out;
+    }
+    size_t index = used++;
+    nodes[index] = (struct subtree_idle_node){s->subtree, &s->nb_items, item.parent};
+    for (int side = 1; side >= 0; side--) {
+      centree_node child = n->lu_child[side];
+      if (child) {
+        if (pending == capacity || centree_lu_parent(child) != n) {
+          status = -EINVAL; goto out;
+        }
+        stack[pending++] = (struct pending){child, index};
+      }
+    }
+  }
+  status = subtree_invalidate_idle(nodes, used, progress, context, invalidated);
+out:
+  free(nodes); free(stack);
+  tnt_maintenance_unlock();
+  return status;
+}
+
 static int node_is_internal(centree_node n) {
   return n != NULL && child_flag(n) == 1 && !retired(n);
 }
