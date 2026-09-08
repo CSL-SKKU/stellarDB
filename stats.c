@@ -158,8 +158,13 @@ invalid:
   pthread_cond_init(&timer_cond, &attr);
   pthread_condattr_destroy(&attr);
   fputs("time_s", output);
+  if (cfg.wait_for_pruning_s > 0) fputs(",phase", output);
   for (int i = 0; i < REPORT_METRICS; i++)
     if (report_enabled(i)) fprintf(output, ",%s", names[i]);
+  if (cfg.wait_for_pruning_s > 0)
+    fputs(",idle_elapsed_s,idle_pruning_time_s,idle_pruning_attempts,idle_pruning_successes"
+          ",idle_initial_stale_ratio,idle_stale_ratio,idle_target_stale_ratio"
+          ",idle_status,idle_last_prune_status", output);
   fputc('\n', output);
   return 0;
 }
@@ -201,6 +206,7 @@ static void write_row(uint64_t now) {
       if (accumulated >= rank) { p99 = bucket_upper(b) / 1e6; break; }
     }
   fprintf(output, "%.9f", (now - began_ns) / 1e9);
+  if (cfg.wait_for_pruning_s > 0) fputs(",busy", output);
   for (int i = 0; i < REPORT_METRICS; i++) {
     if (!report_enabled(i)) continue;
     fputc(',', output);
@@ -215,6 +221,7 @@ static void write_row(uint64_t now) {
       if (sum.reads) fprintf(output, "%.9f", (double)hops / sum.reads);
     } else fprintf(output, "%" PRIu64, counts[i]);
   }
+  if (cfg.wait_for_pruning_s > 0) fputs(",,,,,,,,,", output);
   fputc('\n', output);
   if (fflush(output) != 0) die("Cannot write report: %s\n", strerror(errno));
   previous_ns = now;
@@ -273,6 +280,19 @@ void report_finish(void) {
 void report_close(void) {
   if (output && fclose(output) != 0) die("Cannot close report: %s\n", strerror(errno));
   output = NULL;
+}
+
+void report_idle_pruning(const struct idle_pruning_result *r) {
+  if (!output) return;
+  fprintf(output, "%.9f,idle", (report_now_ns() - began_ns) / 1e9);
+  /* Busy metrics have already been finalized. Empty cells keep idle time
+   * out of request averages and preserve the busy maintenance counters. */
+  for (int i = 0; i < REPORT_METRICS; i++)
+    if (report_enabled(i)) fputc(',', output);
+  fprintf(output, ",%.9f,%.9f,%" PRIu64 ",%" PRIu64 ",%.9f,%.9f,%.9f,%s,%d\n",
+          r->elapsed_ns / 1e9, r->pruning_ns / 1e9, r->attempts, r->successes,
+          r->initial_ratio, r->stale_ratio, r->target, r->status, r->last_prune_status);
+  if (fflush(output) != 0) die("Cannot write report: %s\n", strerror(errno));
 }
 
 #ifdef STELLAR_TESTING

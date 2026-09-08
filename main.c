@@ -30,6 +30,7 @@ static void print_help(char *n) {
   puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
   puts("      --reins-sample <N>          with -r: attempt a copy on one in N qualifying reads (1; 0 means 1)");
   puts("  -p, --with-prune <0..1>         enable repeated pruning at this global stale/reserved ratio");
+  puts("      --wait-for-pruning-s <s>    after requests, wait up to s seconds for the -p target (0 = off)");
   puts("  -M, --maintenance-period-ms <ms> interval for background maintenance (500)");
   puts("      --migrate-th <0..1>         migration: move a node into its history parent when both fit in t * capacity (0 = off)");
   puts("  -n, --items <number>            set number of items in DB");
@@ -114,6 +115,7 @@ int main(int argc, char **argv) {
         {"churn-mix",       required_argument, 0, 1011},
         {"reins-sample",    required_argument, 0, 1009},
         {"with-prune",      required_argument, 0, 'p'},
+        {"wait-for-pruning-s", required_argument, 0, 1018},
         {"maintenance-period-ms", required_argument, 0, 'M'},
         {"migrate-th",      required_argument, 0, 1014},
         {"items",           required_argument, 0, 'n'},
@@ -191,6 +193,17 @@ int main(int argc, char **argv) {
           if (errno || end == optarg || *end || !isfinite(cfg.timeseries_s) ||
               cfg.timeseries_s < 1e-9 || cfg.timeseries_s > 31536000) {
             fprintf(stderr, "--timeseries requires seconds in [0.000000001, 31536000]\n");
+            return 1;
+          }
+          break;
+        }
+        case 1018: {
+          char *end;
+          errno = 0;
+          cfg.wait_for_pruning_s = strtod(optarg, &end);
+          if (errno || end == optarg || *end || !isfinite(cfg.wait_for_pruning_s) ||
+              cfg.wait_for_pruning_s < 0 || cfg.wait_for_pruning_s > 31536000) {
+            fprintf(stderr, "--wait-for-pruning-s requires seconds in [0, 31536000]\n");
             return 1;
           }
           break;
@@ -281,6 +294,9 @@ int main(int argc, char **argv) {
   if (cfg.with_prune)
     printf("# \tPruning trigger: repeat while global stale ratio >= %.2f, checked every %lu ms\n",
            cfg.prune_stale_ratio, cfg.maintenance_period_ms);
+  if (cfg.wait_for_pruning_s > 0)
+    printf("# \tIdle pruning: target <= %.6g, grace period %.6g s (finish in-progress maintenance)\n",
+           cfg.prune_stale_ratio, cfg.wait_for_pruning_s);
   if (cfg.migrate_th > 0)
     printf("# \tMigration: combined valid slots <= %.2f * slab capacity, "
            "one attempt per maintenance wake (%lu ms)\n",
@@ -364,5 +380,7 @@ int main(int argc, char **argv) {
 
   }
 
+  if (cfg.wait_for_pruning_s > 0)
+    slab_workers_wait_for_pruning();
   report_close();
 }

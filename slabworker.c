@@ -1,6 +1,7 @@
 #include "headers.h"
 
 #include <errno.h>
+#include <inttypes.h>
 #include <time.h>
 
 /*
@@ -43,6 +44,9 @@ static pthread_cond_t restructuring_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic int restructuring_started = 0;
 static _Atomic int restructuring_enabled = 0;
 static int restructuring_requested = 0;
+/* Post-run ownership transfer, never requested while clients are measured. */
+static _Atomic int idle_maintenance_requested;
+static int idle_maintenance_parked; /* protected by restructuring_lock */
 
 #define STALE_QUEUE_CAPACITY 65536
 #define STALE_BATCH_SIZE 128
@@ -735,6 +739,11 @@ static void *worker_restructuring_init(void *pdata) {
   while (1) {
     int maintenance_due;
     pthread_mutex_lock(&restructuring_lock);
+    while (atomic_load_explicit(&idle_maintenance_requested, memory_order_acquire)) {
+      idle_maintenance_parked = 1;
+      pthread_cond_broadcast(&restructuring_cond);
+      pthread_cond_wait(&restructuring_cond, &restructuring_lock);
+    }
     while (stale_count == 0 && !restructuring_requested) {
       struct timespec deadline;
       uint64_t now = monotonic_ms();
@@ -749,6 +758,10 @@ static void *worker_restructuring_init(void *pdata) {
         deadline.tv_nsec -= 1000000000L;
       }
       pthread_cond_timedwait(&restructuring_cond, &restructuring_lock, &deadline);
+    }
+    if (atomic_load_explicit(&idle_maintenance_requested, memory_order_acquire)) {
+      pthread_mutex_unlock(&restructuring_lock);
+      continue;
     }
     maintenance_due = restructuring_requested || monotonic_ms() >= next_maintenance;
     restructuring_requested = 0;
@@ -799,7 +812,8 @@ static void *worker_restructuring_init(void *pdata) {
 
       prune_stale_measure(&m);
 
-      while (prune_stale_ratio(&m) >= cfg.prune_stale_ratio) {
+      while (prune_stale_ratio(&m) >= cfg.prune_stale_ratio &&
+             !atomic_load_explicit(&idle_maintenance_requested, memory_order_acquire)) {
         status = tnt_prune_once();
         if (status != TNT_PRUNE_DONE)
           break;
@@ -849,6 +863,134 @@ int restructuring_worker_init(void) {
   atomic_store_explicit(&restructuring_enabled, 1, memory_order_release);
   maybe_wake_restructuring_worker();
   return 0;
+}
+
+/* All clients have completed. A read may still have an asynchronous copy
+ * outstanding; do not mistake its not-yet-published stale hints for a clean
+ * database, or start a prune that would wait indefinitely for that copy. */
+static int idle_refs_pending(centree tree, centree_node n) {
+  if (!n) return 0;
+  struct slab *s = n->value.slab;
+  if (__atomic_load_n(&s->update_ref, __ATOMIC_ACQUIRE) ||
+      __atomic_load_n(&s->read_ref, __ATOMIC_ACQUIRE)) return 1;
+  return idle_refs_pending(tree, centree_read_left(tree, n)) ||
+         idle_refs_pending(tree, centree_read_right(tree, n));
+}
+
+static int idle_work_pending(void) {
+  centree tree = tnt_centree();
+  int pending = 0;
+  if (tree) {
+    centree_read_in(tree);
+    pending = idle_refs_pending(tree, centree_read_root(tree));
+    centree_read_out(tree);
+  }
+  pthread_mutex_lock(&restructuring_lock);
+  pending |= stale_count != 0;
+  pthread_mutex_unlock(&restructuring_lock);
+  return pending;
+}
+
+static void idle_sleep_until(uint64_t at) {
+  struct timespec when = {.tv_sec = at / UINT64_C(1000000000),
+                         .tv_nsec = at % UINT64_C(1000000000)};
+  while (clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &when, NULL) == EINTR) {}
+}
+
+void slab_workers_wait_for_pruning(void) {
+  uint64_t began = report_now_ns();
+  uint64_t deadline = began + (uint64_t)(cfg.wait_for_pruning_s * 1e9);
+  uint64_t interval = (uint64_t)(cfg.timeseries_s * 1e9);
+  uint64_t next_sample = began, next_maintenance = began;
+  uint64_t period = cfg.maintenance_period_ms * UINT64_C(1000000);
+  struct idle_pruning_result result = {.target = cfg.prune_stale_ratio,
+                                      .last_prune_status = TNT_PRUNE_NOOP};
+  struct prune_stale m;
+  int burst = 0;
+
+  /* The sampler has joined and busy metrics are final. Transfer maintenance
+   * only between complete operations, including invalidation batches. Leave
+   * the worker parked so it cannot change the final result before exit. */
+  pthread_mutex_lock(&restructuring_lock);
+  atomic_store_explicit(&idle_maintenance_requested, 1, memory_order_release);
+  restructuring_requested = 1;
+  pthread_cond_broadcast(&restructuring_cond);
+  while (atomic_load_explicit(&restructuring_started, memory_order_acquire) &&
+         !idle_maintenance_parked)
+    pthread_cond_wait(&restructuring_cond, &restructuring_lock);
+  pthread_mutex_unlock(&restructuring_lock);
+
+  prune_stale_measure(&m);
+  result.initial_ratio = prune_stale_ratio(&m);
+  for (;;) {
+    /* Drain hints within the grace period. Only this thread consumes them;
+     * residual I/O completions can still enqueue or release references. */
+    while (report_now_ns() < deadline && stale_invalidation_drain() &&
+           (!interval || report_now_ns() < next_sample)) {}
+    int pending = idle_work_pending();
+    prune_stale_measure(&m);
+    result.stale_ratio = prune_stale_ratio(&m);
+    uint64_t now = report_now_ns();
+    result.elapsed_ns = now - began;
+    int reached = !pending && result.stale_ratio <= result.target;
+    int finished = reached || now >= deadline;
+    result.status = reached ? "target_reached" : finished ? "timeout" :
+                    pending ? "settling" : "waiting";
+    if (finished || (interval && now >= next_sample)) {
+      report_idle_pruning(&result);
+      if (interval) next_sample = now + interval;
+    }
+    if (finished) break;
+
+    if (pending || (!burst && now < next_maintenance)) {
+      uint64_t wake = pending ? now + UINT64_C(1000000) : next_maintenance;
+      if (interval && next_sample < wake) wake = next_sample;
+      if (deadline < wake) wake = deadline;
+      idle_sleep_until(wake);
+      continue;
+    }
+
+    if (!burst) {
+      next_maintenance = now + period;
+      /* Keep the configured maintenance policy, except for the utilization
+       * gate: client inactivity is the reason this phase exists. */
+      if (cfg.with_rebal && tnt_rebalancing_needed()) {
+        int status = tnt_rebalancing();
+        if (status < 0)
+          fprintf(stderr, "Idle rebalancing failed: %s\n", strerror(-status));
+      }
+      if (cfg.migrate_th > 0 && report_now_ns() < deadline) {
+        int status = tnt_migrate_once();
+        if (status < 0 && status != -EAGAIN && status != -EBUSY &&
+            status != -ENOSPC && status != -ECANCELED)
+          fprintf(stderr, "Idle migration failed: %s\n", strerror(-status));
+      }
+      prune_stale_measure(&m);
+      if (prune_stale_ratio(&m) <= result.target) continue;
+    }
+    /* The deadline is a fail-safe between operations, never a cancellation
+     * inside a structural change. Count unsuccessful attempts as work too. */
+    uint64_t start = report_now_ns();
+    if (start >= deadline) continue;
+    int status = tnt_prune_once();
+    result.pruning_ns += report_now_ns() - start;
+    result.attempts++;
+    result.last_prune_status = status;
+    burst = status == TNT_PRUNE_DONE;
+    if (burst) result.successes++;
+    else {
+      prune_mark_writes();
+      if (status < 0 && status != -EAGAIN && status != -EBUSY && status != -ENOSPC)
+        fprintf(stderr, "Idle pruning failed: %s; retrying next period\n", strerror(-status));
+    }
+  }
+  printf("# Idle pruning: status=%s elapsed_s=%.9f pruning_time_s=%.9f "
+         "attempts=%" PRIu64 " successes=%" PRIu64 " initial_stale_ratio=%.9f "
+         "final_stale_ratio=%.9f target=%.9f last_prune_status=%d\n",
+         result.status, result.elapsed_ns / 1e9, result.pruning_ns / 1e9,
+         result.attempts, result.successes, result.initial_ratio,
+         result.stale_ratio, result.target, result.last_prune_status);
+  fflush(stdout);
 }
 
 /*

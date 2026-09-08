@@ -43,6 +43,10 @@ int get_nb_distributors(void);
 unsigned int get_distributor_utilization(void);
 unsigned int get_io_worker_utilization(void);
 int restructuring_worker_init(void);
+/* Call after the final client completion and report_finish(). Parks the
+ * background maintenance worker through process exit, drives configured
+ * maintenance without the utilization gate, and reports the idle phase. */
+void slab_workers_wait_for_pruning(void);
 /* Bounded, best-effort hints; enqueue never waits for queue space or maintenance.
  * Descriptors are retained for the process lifetime. No reference is pinned. */
 void stale_invalidation_enqueue(struct slab *destination, uint64_t key);

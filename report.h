@@ -39,6 +39,14 @@ int report_init(const char *output, const char *config, double interval_s);
 void report_begin(void);
 void report_finish(void);
 void report_close(void);
+struct idle_pruning_result {
+  uint64_t elapsed_ns, pruning_ns, attempts, successes;
+  double initial_ratio, stale_ratio, target;
+  const char *status;
+  int last_prune_status;
+};
+/* Separate post-request rows; never touches the busy collectors or clock. */
+void report_idle_pruning(const struct idle_pruning_result *result);
 /* O(nodes), no disk I/O or entry scans. Locally consistent slab snapshots. */
 void tnt_report_entries(uint64_t *total, uint64_t *stale, uint64_t *tombstones);
 

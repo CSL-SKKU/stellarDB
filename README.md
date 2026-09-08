@@ -81,6 +81,7 @@ make REALKEY_FILE_PATH=/path/to/key-trace
       --report-out <file.csv>     Enable reporting (omitted or none: off)
       --config-report <file>      Select metrics; all are enabled by default
       --timeseries <seconds>      Report interval averages; omitted: whole-run aggregate
+      --wait-for-pruning-s <s>     Post-request pruning grace period; requires -p (0 = off)
   -h, --help                      Show help message
 ```
 
@@ -204,6 +205,48 @@ with its history parent's within `T` times the slab capacity (`0` disables it).
 The worker attempts one migration per wake before the ILI pruning burst.
 For example, `-p 0.3 --migrate-th 0.9 -M 500` enables both. Standalone slab
 compaction and all `--compact-*` options have been removed.
+
+### Post-request idle pruning
+
+`--wait-for-pruning-s X` gives pruning a grace period after all benchmark client
+requests complete. It requires `-p RATIO`, accepts fractional seconds, and is
+disabled by default or with `X = 0`. Busy throughput, latency, traversal, and
+maintenance measurements finish at their existing completion boundary.
+
+During idle, pending asynchronous copies and stale hints settle before the
+target is tested. Enabled rebalancing and migration continue alongside pruning;
+the utilization gate is bypassed only during idle. Maintenance starts immediately
+and unsuccessful pruning bursts retry at the configured `-M` interval. The phase
+ends when the stale ratio is **at most** the `-p` target, or when `X` expires.
+`X` is a fail-safe checked between operations: an in-progress maintenance operation
+finishes safely, so elapsed time can exceed `X`. An unreachable target is a normal
+`timeout` result and does not make the benchmark fail.
+
+Stdout always includes a final `# Idle pruning:` summary with elapsed seconds,
+pruning execution seconds, attempts/successes, initial/final stale ratios, target,
+status, and last prune return code when attempts are nonzero (`0` success,
+`1` no candidate, negative errno).
+Elapsed time includes the handoff from background maintenance and pending-work
+settlement. Pruning execution time sums complete idle prune calls, including
+unsuccessful attempts, and excludes sleeps, hint processing, rebalancing, migration,
+and an operation already running at handoff. The initial ratio is measured at
+handoff; pending hints can make it rise before pruning reduces it. Both ratios use
+the same stale/reserved **estimate** as the pruning trigger, not physical space
+amplification.
+
+With `--report-out`, enabling the wait adds a `phase` column (`busy` or `idle`)
+and `idle_*` result columns to the CSV. Busy values are unchanged; idle-only cells
+are empty on busy rows, and busy-metric cells are empty on idle rows. Filter by
+`phase` when analyzing request performance. Without `--timeseries`, there is one
+idle summary row. With it, idle rows contain cumulative pruning time and counts
+plus the current stale ratio at the requested interval, followed by a final row
+even on timeout. Samples wait for operation boundaries and skip missed intervals.
+Without this option, the existing CSV schema is unchanged.
+
+```bash
+./main -D ./db -a ycsb -b ycsb_a_uniform -n 100000 -q 1000000 \
+  -p 0.3 --wait-for-pruning-s 60 --report-out run.csv --timeseries 1 1 4 2
+```
 
 ## Index-Only Testing
 

@@ -26,6 +26,8 @@ struct runtime_config {
     const char        *report_out;
     const char        *config_report;
     double             timeseries_s;
+    /* Post-request pruning grace period; zero disables it. Requires -p. */
+    double             wait_for_pruning_s;
     /* --churn-mix U/I/D: percentages of updates, inserts of new keys (top of
      * the key space) and deletes of the oldest live key; the rest are reads.
      * Inserts and deletes balance, so the live key count stays constant while
