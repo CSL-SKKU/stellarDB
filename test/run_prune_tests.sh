@@ -71,10 +71,10 @@ echo "== the automatic trigger (-p) =="
 # Even with eligible triples, enabled pruning must wait below the threshold.
 sandboxed ./test/test_prune_links auto-wait 2>&1 | filter | grep -E "FAIL|automatic|stale"
 report "automatic pruning waits below the stale-ratio threshold" "${PIPESTATUS[0]}"
-# The restructuring worker, woken on a timer, must bring the stale-slot ratio
-# under the threshold on its own, and every key must still read correctly.
+# The timer must prune until below threshold or no candidates remain.
+# Best-effort async hints may leave fewer candidates; every read stays exact.
 sandboxed ./test/test_prune_links auto 2>&1 | filter | grep -E "FAIL|automatic|stale"
-report "automatic pruning brings the stale ratio under the threshold" "${PIPESTATUS[0]}"
+report "automatic pruning reaches threshold or exhausts candidates" "${PIPESTATUS[0]}"
 
 echo
 echo "== recovery of a pruned database =="

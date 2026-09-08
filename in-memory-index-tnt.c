@@ -988,34 +988,10 @@ restart:
   }
   R_UNLOCK(&centree_root_lock);
 
-  // 6) upward lookup: 리프 노드 n에서부터 위로 올라가며 이전 entry 찾기
-  /*
-   * Retired slabs are skipped rather than restarted on: this walk only looks
-   * for the older copy to invalidate, and the copy it would have found was
-   * already carried into the replacement node. Its subtree is freed under the
-   * write lock, so it must not be consulted once removed is set.
-   */
+  /* Appends do no history lookup. Completion publishes the destination before
+   * queueing an invalidation hint for maintenance. Only in-place writes return
+   * an entry through out_e. */
   *out_e = NULL;
-  for (centree_node cur = n; cur; cur = centree_lu_parent(cur)) {
-    struct slab *s2 = cur->value.slab;
-    index_entry_t *e2 = NULL;
-    R_LOCK(&s2->tree_lock);
-    if (atomic_load_explicit(&s2->superseded, memory_order_acquire)) {
-      R_UNLOCK(&s2->tree_lock);
-      s2 = cur->value.slab; /* rebuilt meanwhile: use the current slab */
-      R_LOCK(&s2->tree_lock);
-    }
-    if (!atomic_load_explicit(&cur->removed, memory_order_acquire) &&
-        key <= s2->max && key >= s2->min)
-    	e2 = subtree_worker_lookup_utree(s2->subtree, item);
-    R_UNLOCK(&s2->tree_lock);
-    if (e2) {
-      *out_e = e2;
-      break;
-    }
-  }
-
-  // 7) 최종 대상 tree_entry 리턴
   return &n->value;
 }
 

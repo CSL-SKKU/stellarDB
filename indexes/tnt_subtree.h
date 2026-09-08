@@ -9,12 +9,14 @@ extern "C" {
 typedef struct subtree {
   void *slab;
   void *tree;
+  uint64_t marked_count; /* invalid-bit population; atomic updates under caller locks */
 } subtree_t;
 
 subtree_t *subtree_create();
 int subtree_find(subtree_t *t, unsigned char *k, size_t len,
                  struct index_entry *e);
 int subtree_set_invalid(subtree_t *t, unsigned char *k, size_t len);
+uint64_t subtree_marked_total(void); /* marked entries in allocated local indexes */
 void subtree_set_slab(subtree_t *t, void *slab);
 int subtree_delete(subtree_t *t, unsigned char *k, size_t len);
 void subtree_insert(subtree_t *t, unsigned char *k, size_t len,

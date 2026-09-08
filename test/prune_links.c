@@ -1712,10 +1712,10 @@ static void hole_verify(void) {
 
 /*
  * The same load and overwrite passes as the main run, then the restructuring
- * worker is started as -p would start it, with a short period and a threshold
- * the sweep is known to reach. Nobody calls tnt_prune_once() here: the worker
- * has to notice the stale ratio on its own timer and bring it under the
- * threshold, and every key must still read as before.
+ * worker's structural work is enabled as -p would enable it. Nobody calls
+ * tnt_prune_once() here: the timer must drive pruning until below threshold or
+ * no candidates remain. Async hints are best-effort, so this fixture no longer
+ * guarantees enough marked entries to reach the threshold. Reads stay exact.
  */
 static void check_auto_trigger(int below_threshold) {
   struct prune_stale m;
@@ -1750,6 +1750,7 @@ static void check_auto_trigger(int below_threshold) {
          100.0 * prune_stale_ratio(&m), 100.0 * cfg.prune_stale_ratio);
 
   uint64_t calls_before = __atomic_load_n(&rstats.prune_calls, __ATOMIC_RELAXED);
+  uint64_t noops_before = __atomic_load_n(&rstats.prune_noop, __ATOMIC_RELAXED);
   uint64_t wakeups_before = __atomic_load_n(&rstats.worker_wakeups, __ATOMIC_RELAXED);
   check(restructuring_worker_init() == 0, "restructuring worker did not start");
   if (below_threshold) {
@@ -1772,6 +1773,9 @@ static void check_auto_trigger(int below_threshold) {
   while (waited_ms < 30000) {
     prune_stale_measure(&m);
     if (prune_stale_ratio(&m) < cfg.prune_stale_ratio) break;
+    if (!stale_invalidation_pending() &&
+        __atomic_load_n(&rstats.prune_noop, __ATOMIC_RELAXED) > noops_before &&
+        prune_count_candidates() == 0) break;
     usleep(100000);
     waited_ms += 100;
   }
@@ -1781,8 +1785,9 @@ static void check_auto_trigger(int below_threshold) {
   tnt_maintenance_unlock();
   prune_stale_measure(&m);
 
-  check(prune_stale_ratio(&m) < cfg.prune_stale_ratio,
-        "after %d ms the stale ratio is still %.1f%%", waited_ms,
+  size_t candidates_left = prune_count_candidates();
+  check(prune_stale_ratio(&m) < cfg.prune_stale_ratio || candidates_left == 0,
+        "after %d ms the stale ratio is still %.1f%% with candidates left", waited_ms,
         100.0 * prune_stale_ratio(&m));
   check(tnt_get_node_count() < nodes_before,
         "the worker pruned nothing (%lu nodes before and after)", nodes_before);
@@ -1797,6 +1802,9 @@ static void check_auto_trigger(int below_threshold) {
          "automatic pruning", m.stale, m.reserved,
          100.0 * prune_stale_ratio(&m), waited_ms, nodes_before,
          tnt_get_node_count());
+  printf("  automatic pruning stopped: candidates=%zu, async hints dropped=%lu skipped=%lu\n",
+         candidates_left, __atomic_load_n(&rstats.stale_dropped, __ATOMIC_RELAXED),
+         __atomic_load_n(&rstats.stale_skipped, __ATOMIC_RELAXED));
 }
 
 int main(int argc, char **argv) {

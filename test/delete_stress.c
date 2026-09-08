@@ -326,7 +326,10 @@ static uint64_t audit_final_state(void) {
     }
     bool created =
         atomic_load_explicit(&key_created[key], memory_order_acquire);
-    if (valid_count != (created ? 1u : 0u)) anomalies++;
+    /* Async hints may lag or be dropped. An extra unmarked historical copy
+     * is conservative; the authoritative entry below must still be valid and
+     * point to the correct record. Never accept a missing authoritative key. */
+    if (created ? valid_count == 0 : valid_count != 0) anomalies++;
 
     struct slab_callback cb = {.item = query};
     index_entry_t *entry = tnt_index_lookup(&cb, query);
@@ -401,6 +404,8 @@ int main(int argc, char **argv) {
   for (int i = 0; i < nb_threads; i++)
     CHECK(pthread_join(threads[i], NULL) == 0);
 
+  /* This fixture calls completions directly and has no maintenance thread. */
+  while (stale_invalidation_drain()) ;
   uint64_t final_anomalies = audit_final_state();
   uint64_t index_misses = atomic_load_explicit(&read_index_misses,
                                                 memory_order_relaxed);

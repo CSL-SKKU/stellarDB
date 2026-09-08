@@ -34,7 +34,11 @@ MAIN_OBJ=main.o ${OTHERS_OBJ}
 all: makefile.dep main 
 
 test: test/test_main test/test_reins test/test_rebalance test/test_rebalance_api \
-	test/test_prune_links test/test_prune_freeze test/test_shy test/test_split_skip
+	test/test_prune_links test/test_prune_freeze test/test_shy test/test_split_skip \
+	test/test_async_stale
+
+test/test_async_stale: test/async_stale.o ${OTHERS_OBJ}
+	${CC} test/async_stale.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_async_stale
 
 test/test_split_skip: test/split_skip.o ${OTHERS_OBJ}
 	${CC} test/split_skip.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_split_skip
@@ -76,4 +80,4 @@ main: $(MAIN_OBJ)
 clean:
 	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins \
 		test/test_rebalance test/test_rebalance_api test/test_prune_links \
-		test/test_prune_freeze test/test_shy test/test_split_skip makefile.dep
+		test/test_prune_freeze test/test_shy test/test_split_skip test/test_async_stale makefile.dep

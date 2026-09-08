@@ -197,9 +197,8 @@ static void test_routing_publication_and_invalidation(void) {
   CHECK(tree != NULL);
   CHECK(tree->slab == left);
   CHECK(idx == 0);
-  CHECK(old_entry != NULL);
-  CHECK(old_entry->slab == root);
-  CHECK(GET_SIDX(old_entry->slab_idx) == 0);
+  CHECK(old_entry == NULL); /* append reservation no longer searches history */
+  CHECK(stale_invalidation_pending() == 0);
 
   struct slab_callback move_cb = {
     .item = moving_tombstone,
@@ -219,6 +218,10 @@ static void test_routing_publication_and_invalidation(void) {
 
   entry = tnt_index_lookup_utree(root->subtree, moving_tombstone);
   CHECK(entry != NULL);
+  CHECK(!index_entry_is_invalid(entry)); /* publication only queued a hint */
+  CHECK(left->update_ref == 0);
+  CHECK(stale_invalidation_drain() == 1);
+  entry = tnt_index_lookup_utree(root->subtree, moving_tombstone);
   CHECK(index_entry_is_invalid(entry));
 
   struct slab_callback lookup_cb = {.item = moving_tombstone};

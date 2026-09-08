@@ -7,6 +7,17 @@ using namespace std;
 using namespace btree;
 
 extern "C" {
+static uint64_t marked_total;
+
+uint64_t subtree_marked_total(void) {
+  return __atomic_load_n(&marked_total, __ATOMIC_RELAXED);
+}
+
+static void marked_add(subtree_t *t) {
+  __atomic_fetch_add(&t->marked_count, 1, __ATOMIC_RELAXED);
+  __atomic_fetch_add(&marked_total, 1, __ATOMIC_RELAXED);
+}
+
 static inline void set_inval(uint32_t *addr) {
   asm("btsl %1, %0" : "+m"(*addr) : "Ir"(31));
 }
@@ -28,6 +39,7 @@ subtree_t *subtree_create() {
   btree_map<uint64_t, uint32_t> *b =
       new btree_map<uint64_t, uint32_t>();
   t->tree = b;
+  t->marked_count = 0;
   return t;
 }
 
@@ -61,6 +73,7 @@ int subtree_set_invalid(subtree_t *t, unsigned char *k, size_t len) {
     if (!tas_inval(&i->second)) {
       // printf("SET INVAL %lu (s, %lu)\n", hash, i->second.slab_idx);
       set_inval(&i->second);
+      marked_add(t);
       return 1;
     }
     // printf("Already INVAL %lu(s, %lu)\n", hash, i->second.slab_idx);
@@ -74,7 +87,14 @@ int subtree_delete(subtree_t *t, unsigned char *k, size_t len) {
   uint64_t hash = *(uint64_t *)k;
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
-  return b->erase(hash);
+  auto i = b->find(hash);
+  if (i == b->end()) return 0;
+  if (sidx_is_invalid(i->second)) {
+    __atomic_fetch_sub(&t->marked_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_sub(&marked_total, 1, __ATOMIC_RELAXED);
+  }
+  b->erase(i);
+  return 1;
 }
 
 void subtree_insert(subtree_t *t, unsigned char *k, size_t len,
@@ -82,7 +102,8 @@ void subtree_insert(subtree_t *t, unsigned char *k, size_t len,
   uint64_t hash = *(uint64_t *)k;
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
-  b->insert(make_pair(hash, (uint32_t)e->slab_idx));
+  auto inserted = b->insert(make_pair(hash, (uint32_t)e->slab_idx));
+  if (inserted.second && sidx_is_invalid(e->slab_idx)) marked_add(t);
 }
 
 void subtree_insert_shy(subtree_t *t, unsigned char *k, size_t len,
@@ -90,7 +111,8 @@ void subtree_insert_shy(subtree_t *t, unsigned char *k, size_t len,
   uint64_t hash = *(uint64_t *)k;
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
-  b->insert(make_pair(hash, (uint32_t)e->slab_idx | SIDX_SHY_BIT));
+  auto inserted = b->insert(make_pair(hash, (uint32_t)e->slab_idx | SIDX_SHY_BIT));
+  if (inserted.second && sidx_is_invalid(e->slab_idx)) marked_add(t);
 }
 
 int subtree_clear_shy(subtree_t *t, unsigned char *k, size_t len) {
@@ -194,12 +216,14 @@ int subtree_forall_invalid(subtree_t *t, void *data, void (*cb)(void *slab, uint
 
 
 void subtree_free(subtree_t *t) {
+  __atomic_fetch_sub(&marked_total, t->marked_count, __ATOMIC_RELAXED);
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
   delete b;
   free(t);
 }
 void subtree_all_free(subtree_t *t) {
+  __atomic_fetch_sub(&marked_total, t->marked_count, __ATOMIC_RELAXED);
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
   b->erase(b->begin(), b->end());

@@ -940,12 +940,10 @@ void slab_release_if_idle(struct slab *s) {
 
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   struct slab *s = cb->slab;
-  struct slab *old_s = cb->fsst_slab;
-  //uint64_t old_idx = cb->fsst_idx;
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
   uint64_t key = *(uint64_t *)item_key;
-  int removed = 0, alrdy = 0;
+  int alrdy = 0, was_invalid = 0;
   index_entry_t *e = NULL;
 
   add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
@@ -956,6 +954,7 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
     // 그 다음 쓰레드는 스킵해야함.
   e = tnt_index_lookup_utree(s->subtree, item);
   if (e) {
+    was_invalid = sidx_is_invalid(e->slab_idx);
     /*
      * Two client writes of one key in one slab: the higher slot wins (there is
      * no request ordering, so either is acceptable). A shy entry -- put there
@@ -980,17 +979,16 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
     __sync_fetch_and_add(&nb_totals, 1);
 #if WITH_FILTER
     if (filter_add((filter_t *)s->filter, (unsigned char *)&key) == 0) {
-      printf("Fail adding to filter %p %lu seq/idx %lu/%lu fsst %lu/%lu\n",
-             s->filter, key, cb->slab->seq, cb->slab_idx, cb->fsst_slab->seq,
-             cb->fsst_idx);
+      printf("Fail adding to filter %p %lu seq/idx %lu/%lu\n",
+             s->filter, key, cb->slab->seq, cb->slab_idx);
     } else if (!filter_contain(s->filter, (unsigned char *)&key)) {
       printf("FIFIFIFIF UPUP\n");
     }
 #endif
-  } else {
+  } else if (!was_invalid) {
+    /* An invalidated entry is no longer in nb_items. A late publication that
+     * replaces it with an unmarked entry keeps its reservation's count. */
     __sync_fetch_and_sub(&s->nb_items, 1);
-    W_UNLOCK(&s->tree_lock);
-    goto skip;
   }
 
   slab_widen_range(s, key);
@@ -999,30 +997,10 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
 
   add_time_in_payload(cb, TIMING_STAGE_NEW_INDEX_PUBLISHED);
 
-  /*
-   * The older copy may have been rebuilt into a fresh slab meanwhile
-   * (migration): invalidate it where it lives now, so the stale
-   * hint is not lost. A retired node (min == -1, not superseded) is gone.
-   */
-  if (atomic_load_explicit(&old_s->superseded, memory_order_acquire) &&
-      old_s->centree_node != NULL)
-    old_s = ((centree_node)old_s->centree_node)->value.slab;
-  R_LOCK(&old_s->tree_lock);
-  if (old_s->min == -1)
-    removed = 1;
-  else {
-    removed = tnt_index_invalid_utree(old_s->subtree, cb->item);
-    if (removed)
-      __sync_fetch_and_sub(&old_s->nb_items, 1);
-  }
-  R_UNLOCK(&old_s->tree_lock);
-
-  add_time_in_payload(cb, TIMING_STAGE_OLD_INDEX_INVALIDATED);
-
-
-  if (!removed) {
-      printf("UPCASE: Edge\n");
-  }
+  /* The job owns just a stable slab descriptor and a copied key. It does not
+   * retain the callback, item buffer, or the write's update reference. */
+  stale_invalidation_enqueue(s, key);
+  add_time_in_payload(cb, TIMING_STAGE_INVALIDATION_QUEUED);
 
 skip:
   __sync_fetch_and_sub(&s->update_ref, 1);

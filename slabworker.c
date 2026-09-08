@@ -42,7 +42,20 @@ static int nb_workers_ready = 0;
 static pthread_mutex_t restructuring_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t restructuring_cond = PTHREAD_COND_INITIALIZER;
 static _Atomic int restructuring_started = 0;
+static _Atomic int restructuring_enabled = 0;
 static int restructuring_requested = 0;
+
+#define STALE_QUEUE_CAPACITY 65536
+#define STALE_BATCH_SIZE 128
+struct stale_job {
+  struct slab *destination;
+  uint64_t key, queued_ms;
+};
+/* All I/O workers produce; maintenance consumes. The mutex is held only while
+ * copying jobs, never across index access. Producers drop on contention/full. */
+static struct stale_job stale_queue[STALE_QUEUE_CAPACITY];
+static size_t stale_head, stale_count;
+static _Atomic uint64_t stale_outstanding;
 
 uint64_t nb_totals;
 int try_fsst = 0;
@@ -97,6 +110,100 @@ static uint64_t monotonic_ms(void) {
   return (uint64_t)now.tv_sec * 1000LU + (uint64_t)now.tv_nsec / 1000000LU;
 }
 
+void stale_invalidation_enqueue(struct slab *destination, uint64_t key) {
+  centree_node n = destination->centree_node;
+  if (n == NULL || centree_lu_parent(n) == NULL)
+    return;
+  if (pthread_mutex_trylock(&restructuring_lock) != 0) {
+    RSTAT_INC(stale_dropped);
+    return;
+  }
+  if (stale_count == STALE_QUEUE_CAPACITY) {
+    RSTAT_INC(stale_dropped);
+  } else {
+    size_t tail = (stale_head + stale_count) % STALE_QUEUE_CAPACITY;
+    stale_queue[tail] = (struct stale_job){destination, key, monotonic_ms()};
+    stale_count++;
+    atomic_fetch_add_explicit(&stale_outstanding, 1, memory_order_relaxed);
+    RSTAT_INC(stale_queued);
+    rstat_max(&rstats.stale_queue_max, stale_count);
+    if (stale_count == 1)
+      pthread_cond_signal(&restructuring_cond);
+  }
+  pthread_mutex_unlock(&restructuring_lock);
+}
+
+uint64_t stale_invalidation_pending(void) {
+  return atomic_load_explicit(&stale_outstanding, memory_order_acquire);
+}
+
+/* maintenance_lock is held, excluding retirement, migration and history
+ * rewiring. Splits can still run; they preserve the existing history chain. */
+static void stale_invalidate(const struct stale_job *job) {
+  struct slab *s = job->destination;
+  centree_node n = s->centree_node;
+  index_entry_t e;
+  unsigned char *key = (unsigned char *)&job->key;
+  int valid;
+
+  rstat_max(&rstats.stale_lag_max_ms, monotonic_ms() - job->queued_ms);
+  R_LOCK(&s->tree_lock);
+  valid = !atomic_load_explicit(&n->removed, memory_order_acquire) &&
+          !atomic_load_explicit(&s->superseded, memory_order_acquire) &&
+          s->subtree != NULL &&
+          subtree_find(s->subtree, key, sizeof(job->key), &e) &&
+          !sidx_is_invalid(e.slab_idx);
+  R_UNLOCK(&s->tree_lock);
+  /* In particular, do not follow an anchor whose records migrated upward:
+   * its parent now contains the authoritative copy, not a stale source. */
+  if (!valid) {
+    RSTAT_INC(stale_skipped);
+    return;
+  }
+
+  for (n = centree_lu_parent(n); n; n = centree_lu_parent(n)) {
+    int found = 0;
+    s = n->value.slab;
+    R_LOCK(&s->tree_lock);
+    if (!atomic_load_explicit(&n->removed, memory_order_acquire) &&
+        s->subtree != NULL && job->key >= s->min && job->key <= s->max) {
+      found = subtree_set_invalid(s->subtree, key, sizeof(job->key));
+      if (found) {
+        __sync_fetch_and_sub(&s->nb_items, 1);
+        RSTAT_INC(stale_invalidated);
+      }
+    }
+    R_UNLOCK(&s->tree_lock);
+    /* Already-invalid copies do not consume the job; look for a live hint. */
+    if (found)
+      break;
+  }
+}
+
+size_t stale_invalidation_drain(void) {
+  struct stale_job batch[STALE_BATCH_SIZE];
+  size_t count;
+
+  pthread_mutex_lock(&restructuring_lock);
+  count = stale_count < STALE_BATCH_SIZE ? stale_count : STALE_BATCH_SIZE;
+  for (size_t i = 0; i < count; i++) {
+    batch[i] = stale_queue[stale_head];
+    stale_head = (stale_head + 1) % STALE_QUEUE_CAPACITY;
+  }
+  stale_count -= count;
+  pthread_mutex_unlock(&restructuring_lock);
+  if (count == 0)
+    return 0;
+
+  tnt_maintenance_lock();
+  for (size_t i = 0; i < count; i++)
+    stale_invalidate(&batch[i]);
+  tnt_maintenance_unlock();
+  RSTAT_ADD(stale_processed, count);
+  atomic_fetch_sub_explicit(&stale_outstanding, count, memory_order_release);
+  return count;
+}
+
 static unsigned int get_pool_utilization(size_t first, size_t count) {
   uint64_t total = 0;
   uint64_t now = monotonic_ms();
@@ -129,7 +236,7 @@ static int restructuring_utilization_thresholds_met(void) {
 }
 
 static void maybe_wake_restructuring_worker(void) {
-  if (!atomic_load_explicit(&restructuring_started, memory_order_acquire) ||
+  if (!atomic_load_explicit(&restructuring_enabled, memory_order_acquire) ||
       !restructuring_utilization_thresholds_met())
     return;
 
@@ -627,36 +734,38 @@ static void *worker_distributor_init(void *pdata) {
 
 static void *worker_restructuring_init(void *pdata) {
   (void)pdata;
+  uint64_t next_maintenance = monotonic_ms() + cfg.maintenance_period_ms;
 
   while (1) {
+    int maintenance_due;
     pthread_mutex_lock(&restructuring_lock);
-    {
-      /*
-       * Periodic: wake once per period and check the structural conditions
-       * (depth for rebalancing, stale ratio for -p pruning). The utilization
-       * gate used to stand in front of both; it measured queue-empty time,
-       * which a closed-loop benchmark keeps near zero for every pool, and
-       * booked time blocked in io_getevents as busy, so it never opened on a
-       * disk-bound run. --util-gate puts it back in front; by default it is
-       * only sampled for the statistics.
-       */
+    while (stale_count == 0 && !restructuring_requested) {
       struct timespec deadline;
-
+      uint64_t now = monotonic_ms();
+      if (now >= next_maintenance)
+        break;
+      uint64_t delay = next_maintenance - now;
       clock_gettime(CLOCK_REALTIME, &deadline);
-      deadline.tv_sec += cfg.maintenance_period_ms / 1000;
-      deadline.tv_nsec += (cfg.maintenance_period_ms % 1000) * 1000000L;
+      deadline.tv_sec += delay / 1000;
+      deadline.tv_nsec += (delay % 1000) * 1000000L;
       if (deadline.tv_nsec >= 1000000000L) {
         deadline.tv_sec++;
         deadline.tv_nsec -= 1000000000L;
       }
-      while (!restructuring_requested &&
-             pthread_cond_timedwait(&restructuring_cond, &restructuring_lock,
-                                    &deadline) == 0)
-        ;
+      pthread_cond_timedwait(&restructuring_cond, &restructuring_lock, &deadline);
     }
+    maintenance_due = restructuring_requested || monotonic_ms() >= next_maintenance;
     restructuring_requested = 0;
     pthread_mutex_unlock(&restructuring_lock);
 
+    /* Queue wakeups do not reset the periodic deadline or trigger a prune.
+     * Invalidation is always enabled and never subject to --util-gate. */
+    stale_invalidation_drain();
+    if (!maintenance_due)
+      continue;
+    next_maintenance = monotonic_ms() + cfg.maintenance_period_ms;
+    if (!atomic_load_explicit(&restructuring_enabled, memory_order_acquire))
+      continue;
     RSTAT_INC(worker_wakeups);
     int gate_ok = restructuring_utilization_thresholds_met();
     if (gate_ok)
@@ -666,14 +775,11 @@ static void *worker_restructuring_init(void *pdata) {
     if (cfg.with_rebal && tnt_rebalancing_needed())
       RSTAT_INC(rebalance_needed);
 
-    while (cfg.with_rebal && tnt_rebalancing_needed()) {
+    if (cfg.with_rebal && tnt_rebalancing_needed()) {
       int status = tnt_rebalancing();
-
-      if (status >= 0)
-        break;
-      fprintf(stderr, "Background rebalancing failed: %s; retrying\n",
-              strerror(-status));
-      sleep(1);
+      if (status < 0)
+        fprintf(stderr, "Background rebalancing failed: %s; retrying next period\n",
+                strerror(-status));
     }
 
     /* One migration per wake can empty an internal node for ILI pruning. */
@@ -707,6 +813,7 @@ static void *worker_restructuring_init(void *pdata) {
         if (status != TNT_PRUNE_DONE)
           break;
         done++;
+        stale_invalidation_drain();
         prune_stale_measure(&m);
       }
       if (done) {
@@ -742,10 +849,12 @@ static void *utilization_sampler(void *pdata) {
     printf("#L t_s count avg_us p50_us p99_us p999_us max_us "
            "rd_count rd_avg_us rd_p99_us wr_count wr_avg_us wr_p99_us "
            "q_avg_us q_p99_us dist_avg_us dist_p99_us io_avg_us io_p99_us "
-           "desc_avg_us desc_p99_us walk_avg_us walk_p99_us\n");
+           "desc_avg_us desc_p99_us walk_avg_us walk_p99_us "
+           "client_q_avg_us client_service_avg_us\n");
   printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
          "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb "
-         "reserved_slots valid_slots migrations rebuild_mb_written\n");
+         "reserved_slots valid_slots migrations rebuild_mb_written "
+         "marked_entries stale_queued stale_processed stale_dropped stale_pending\n");
   while (1) {
     struct prune_stale m;
 
@@ -779,7 +888,7 @@ static void *utilization_sampler(void *pdata) {
     uint64_t rss_kb, vsz_kb, hwm_kb;
 
     process_memory_kb(&rss_kb, &vsz_kb, &hwm_kb);
-    printf("#U %.1f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu %lu %.1f\n",
+    printf("#U %.3f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu %lu %.1f %lu %lu %lu %lu %lu\n",
            (now.tv_sec - t0.tv_sec) + (now.tv_usec - t0.tv_usec) / 1e6, dist,
            io, gate, tnt_rebalancing_needed() ? 1 : 0, tnt_get_node_count(),
            tnt_get_depth(), prune_stale_ratio(&m),
@@ -789,7 +898,12 @@ static void *utilization_sampler(void *pdata) {
            __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED),
            rss_kb / 1024, vsz_kb / 1024, m.reserved, m.valid,
            __atomic_load_n(&rstats.migrations, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED) / 1e6);
+           __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED) / 1e6,
+           subtree_marked_total(),
+           __atomic_load_n(&rstats.stale_queued, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.stale_processed, __ATOMIC_RELAXED),
+           __atomic_load_n(&rstats.stale_dropped, __ATOMIC_RELAXED),
+           stale_invalidation_pending());
     fflush(stdout);
     usleep(100000);
     tick_ms += 100;
@@ -804,7 +918,7 @@ void utilization_sampler_init(void) {
     pthread_detach(thread);
 }
 
-int restructuring_worker_init(void) {
+static int maintenance_worker_start(void) {
   int expected = 0;
   pthread_t thread;
 
@@ -819,6 +933,14 @@ int restructuring_worker_init(void) {
     return -error;
   }
   pthread_detach(thread);
+  return 0;
+}
+
+int restructuring_worker_init(void) {
+  int error = maintenance_worker_start();
+  if (error != 0)
+    return error;
+  atomic_store_explicit(&restructuring_enabled, 1, memory_order_release);
   maybe_wake_restructuring_worker();
   return 0;
 }
@@ -1256,6 +1378,11 @@ void slab_workers_init(int _nb_disks, int nb_workers_per_disk,
   while (*(volatile int *)&nb_workers_ready != nb_workers + nb_distributors) {
     NOP10();
   }
+  /* Start invalidation before accepting client traffic, including load.
+   * Structural maintenance is enabled separately after load by main/tests. */
+  int error = maintenance_worker_start();
+  if (error != 0)
+    die("Cannot start maintenance worker: %s\n", strerror(-error));
 }
 
 size_t get_database_size(void) {

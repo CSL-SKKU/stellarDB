@@ -13,7 +13,7 @@ enum timing_stage {
   TIMING_STAGE_IO_SUBMIT,
   TIMING_STAGE_IO_COMPLETE,
   TIMING_STAGE_NEW_INDEX_PUBLISHED,
-  TIMING_STAGE_OLD_INDEX_INVALIDATED,
+  TIMING_STAGE_INVALIDATION_QUEUED,
   TIMING_STAGE_REQUEST_COMPLETE,
 };
 
@@ -37,6 +37,8 @@ struct restructuring_stats {
   uint64_t migrate_calls, migrate_noop, migrate_failed;
   uint64_t prune_cold_picks, prune_hot_picks; /* ILI candidate had 0 / >0 recent writes */
   uint64_t reins_or_seen, reins_or_deep, reins_or_deferred, reins_or_dropped; /* on-read */
+  uint64_t stale_queued, stale_processed, stale_invalidated, stale_skipped;
+  uint64_t stale_dropped, stale_queue_max, stale_lag_max_ms;
 };
 extern struct restructuring_stats rstats;
 #define RSTAT_ADD(field, n) __atomic_fetch_add(&rstats.field, (uint64_t)(n), __ATOMIC_RELAXED)

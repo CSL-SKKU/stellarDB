@@ -19,6 +19,7 @@ struct lat_set {
   uint64_t hist[LAT_BUCKETS];
 };
 struct lat_tl {
+  uint64_t client_count, client_queue_cycles, client_service_cycles;
   struct lat_set op[2]; /* [0] reads, [1] writes */
   struct lat_set stage[5]; /* [0] queue wait, [1] distributor service, [2] I/O service, [3] routing descent, [4] history walk */
 };
@@ -84,8 +85,11 @@ void lat_series_record_stages(struct slab_callback *c, uint64_t end) {
            t3 = c->t_stage[2], tl = c->t_stage[3];
   uint64_t q = 0, d = 0, io = 0, desc = 0, walk = 0, d_end;
 
-  if (t == NULL || !t0 || !t1 || t1 < t0)
+  if (t == NULL || !t0 || !t1 || t1 < t0 || end < t1)
     return;
+  t->client_count++;
+  t->client_queue_cycles += t1 - t0;
+  t->client_service_cycles += end - t1;
   q = t1 - t0;
   if (t2 && t3 && t2 >= t1 && t3 >= t2 && end >= t3) {
     d = t2 - t1;
@@ -136,6 +140,8 @@ static void lat_set_stats(const struct lat_set *cur, const struct lat_set *prev,
 }
 
 void lat_series_report(double t_s) {
+  static uint64_t prev_client_count, prev_client_queue, prev_client_service;
+  uint64_t client_count = 0, client_queue = 0, client_service = 0;
   static struct lat_set prev_all, prev_rd, prev_wr, prev_st[5];
   struct lat_set all = {0}, rd = {0}, wr = {0}, st[5] = {{0}};
   uint64_t sc[5], savg[5], sp50[5], sp99[5], sp999[5], smx[5];
@@ -150,6 +156,9 @@ void lat_series_report(double t_s) {
 
     if (t == NULL)
       continue;
+    client_count += t->client_count;
+    client_queue += t->client_queue_cycles;
+    client_service += t->client_service_cycles;
     for (int k = 0; k < 2; k++) {
       struct lat_set *dst = k ? &wr : &rd;
 
@@ -176,10 +185,16 @@ void lat_series_report(double t_s) {
   for (int k = 0; k < 5; k++)
     lat_set_stats(&st[k], &prev_st[k], &sc[k], &savg[k], &sp50[k], &sp99[k], &sp999[k], &smx[k]);
   /* ... q_avg q_p99 dist_avg dist_p99 io_avg io_p99 desc_avg desc_p99 walk_avg walk_p99 */
-  printf("#L %.1f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu\n",
+  uint64_t client_n = client_count - prev_client_count;
+  double client_q_us = client_n ? cycles_to_us(client_queue - prev_client_queue) / (double)client_n : 0;
+  double client_s_us = client_n ? cycles_to_us(client_service - prev_client_service) / (double)client_n : 0;
+  printf("#L %.3f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %.3f %.3f\n",
          t_s, c, avg, p50, p99, p999, mx, rc, ravg, rp99, wc, wavg, wp99,
          savg[0], sp99[0], savg[1], sp99[1], savg[2], sp99[2],
-         savg[3], sp99[3], savg[4], sp99[4]);
+         savg[3], sp99[3], savg[4], sp99[4], client_q_us, client_s_us);
+  prev_client_count = client_count;
+  prev_client_queue = client_queue;
+  prev_client_service = client_service;
   fflush(stdout);
   prev_all = all;
   prev_rd = rd;
@@ -254,6 +269,11 @@ void print_restructuring_stats(const char *phase) {
          tnt_get_node_count(), tnt_get_depth(), r.splits);
   printf("#R %s worker: wakeups=%lu gate_open=%lu rebalance_needed=%lu\n",
          phase, r.worker_wakeups, r.worker_gate_open, r.rebalance_needed);
+  printf("#R %s async-stale: queued=%lu processed=%lu invalidated=%lu "
+         "skipped=%lu dropped=%lu pending=%lu queue_max=%lu lag_max_ms=%lu\n",
+         phase, r.stale_queued, r.stale_processed, r.stale_invalidated,
+         r.stale_skipped, r.stale_dropped, stale_invalidation_pending(),
+         r.stale_queue_max, r.stale_lag_max_ms);
   printf("#R %s rebalance: calls=%lu success=%lu noop=%lu failed=%lu "
          "total_ms=%.1f max_ms=%.1f\n", phase, r.rebalance_calls,
          r.rebalance_success, r.rebalance_noop, r.rebalance_failed,

@@ -81,6 +81,8 @@ tree_entry_t *tnt_subtree_get(void *key, uint64_t *idx, index_entry_t *old_e);
  * slab_freeze() through last_item.
  */
 size_t reserve_slot(struct slab *s);
+/* out_e is set only for an in-place leaf update (out_idx == UINT64_MAX).
+ * An append reserves a slot and returns out_e == NULL without walking history. */
 struct tree_entry* centree_lookup_and_reserve(
   void *item,
   uint64_t *out_idx,

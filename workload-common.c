@@ -40,33 +40,11 @@ char *create_workload_item(struct workload *w) {
  * Fill the DB with missing items
  */
 void add_in_tree(struct slab_callback *cb, void *item) {
-  struct slab *s = cb->slab;
-  struct item_metadata *meta = (struct item_metadata *)item;
-  char *item_key = &item[sizeof(*meta)];
-  uint64_t key = *(uint64_t *)item_key;
-
-  W_LOCK(&s->tree_lock);
-  tnt_index_add(cb, item);
-  // s->nb_items++;
-#if WITH_FILTER
-  if (filter_add((filter_t *)s->filter, (unsigned char *)&key) == 0) {
-    printf("Fail adding to filter %p %lu %lu\n", s->filter, key, s->nb_items);
-  } else if (!filter_contain(s->filter, (unsigned char *)&key)) {
-    printf("FIFIFIFIF\n");
-  }
-#endif
-
-  slab_widen_range(s, key);
-
-  __sync_fetch_and_sub(&s->update_ref, 1);
-
-  W_UNLOCK(&s->tree_lock);
-
-  slab_release_if_idle(s);
-
-  __sync_fetch_and_add(&nb_totals, 1);
-
-  if (!cb->cb_cb) {
+  int release = cb->cb_cb == NULL;
+  /* New keys and moving updates are indistinguishable without a history
+   * search. Both need the same destination publication and conflict rules. */
+  add_in_tree_for_upsert(cb, item);
+  if (release) {
     free(cb->item);
     free(cb);
   }
