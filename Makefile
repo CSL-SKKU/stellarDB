@@ -35,34 +35,48 @@ all: makefile.dep main
 
 test: test/test_main test/test_reins test/test_rebalance test/test_rebalance_api \
 	test/test_prune_links test/test_prune_freeze test/test_shy test/test_split_skip \
-	test/test_async_stale
+	test/test_async_stale test/test_report
 
-test/test_async_stale: test/async_stale.o ${OTHERS_OBJ}
-	${CC} test/async_stale.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_async_stale
+# Test observations and fault injection never enter normal benchmark objects.
+TEST_OTHERS_OBJ=$(addprefix .build/test/,${OTHERS_OBJ})
+TEST_CFLAGS=${CFLAGS} -DSTELLAR_TESTING=1
+.build/test/%.o: %.c
+	@mkdir -p $(dir $@)
+	${CC} ${TEST_CFLAGS} -MMD -MP -c $< -o $@
+.build/test/%.o: %.cc
+	@mkdir -p $(dir $@)
+	${CXX} ${TEST_CFLAGS} -MMD -MP -c $< -o $@
+-include $(wildcard .build/test/*.d .build/test/indexes/*.d .build/test/test/*.d)
 
-test/test_split_skip: test/split_skip.o ${OTHERS_OBJ}
-	${CC} test/split_skip.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_split_skip
+test/test_report: .build/test/test/report.o ${TEST_OTHERS_OBJ}
+	${CC} $^ ${CFLAGS} ${LDLIBS} -o $@
 
-test/test_shy: test/shy.o ${OTHERS_OBJ}
-	${CC} test/shy.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_shy
+test/test_async_stale: .build/test/test/async_stale.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/async_stale.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_async_stale
 
-test/test_prune_links: test/prune_links.o ${OTHERS_OBJ}
-	${CC} test/prune_links.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_prune_links
+test/test_split_skip: .build/test/test/split_skip.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/split_skip.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_split_skip
 
-test/test_prune_freeze: test/prune_freeze.o ${OTHERS_OBJ}
-	${CC} test/prune_freeze.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_prune_freeze
+test/test_shy: .build/test/test/shy.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/shy.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_shy
 
-test/test_rebalance: test/rebalance.o indexes/tnt_balance.o rcu.o
-	${CC} test/rebalance.o indexes/tnt_balance.o rcu.o ${CFLAGS} ${LDLIBS} -o test/test_rebalance
+test/test_prune_links: .build/test/test/prune_links.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/prune_links.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_prune_links
 
-test/test_rebalance_api: test/rebalance_api.o ${OTHERS_OBJ}
-	${CC} test/rebalance_api.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_rebalance_api
+test/test_prune_freeze: .build/test/test/prune_freeze.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/prune_freeze.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_prune_freeze
 
-test/test_main: test/main.o ${OTHERS_OBJ}
-	${CC} test/main.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_main
+test/test_rebalance: .build/test/test/rebalance.o .build/test/indexes/tnt_balance.o .build/test/rcu.o
+	${CC} .build/test/test/rebalance.o .build/test/indexes/tnt_balance.o .build/test/rcu.o ${CFLAGS} ${LDLIBS} -o test/test_rebalance
 
-test/test_reins: test/reinsert.o ${OTHERS_OBJ}
-	${CC} test/reinsert.o ${OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_reins
+test/test_rebalance_api: .build/test/test/rebalance_api.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/rebalance_api.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_rebalance_api
+
+test/test_main: .build/test/test/main.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/main.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_main
+
+test/test_reins: .build/test/test/reinsert.o ${TEST_OTHERS_OBJ}
+	${CC} .build/test/test/reinsert.o ${TEST_OTHERS_OBJ} ${CFLAGS} ${LDLIBS} -o test/test_reins
 
 makefile.dep: *.[Cch] indexes/*.[ch] indexes/*.cc test/*.c
 	for i in *.[Cc]; do ${CC} -MM "$${i}" ${CFLAGS}; done > $@
@@ -78,6 +92,7 @@ endif
 main: $(MAIN_OBJ)
 
 clean:
+	rm -rf .build/test
 	rm -f *.o indexes/*.o test/*.o main test/test_main test/test_reins \
 		test/test_rebalance test/test_rebalance_api test/test_prune_links \
-		test/test_prune_freeze test/test_shy test/test_split_skip test/test_async_stale makefile.dep
+		test/test_prune_freeze test/test_shy test/test_split_skip test/test_async_stale test/test_report makefile.dep

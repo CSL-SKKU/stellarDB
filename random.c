@@ -102,21 +102,6 @@ void cp_old_keys(size_t *prev, uint64_t nb_items_in_db) {
   printf("old cpy: %lu\n", oldkey_size);
 }
 
-void init_old_keys(uint64_t nb_items_in_db) {
-  oldkey_size = nb_items_in_db;
-  printf("old: %lu\n", oldkey_size);
-  old_keys = malloc(oldkey_size * sizeof(uint64_t));
-
-  if (!old_keys) {
-    perror("Failed to allocate memory for old keys");
-    exit(1);
-  }
-
-  for (size_t i = 0; i < oldkey_size; i++) old_keys[i] = i;
-
-  swizzle_by_slab(old_keys, nb_items_in_db, cfg.old_percent);
-}
-
 uint64_t get_old_key(size_t position) {
   if (oldkey_size == 0)
     return position;

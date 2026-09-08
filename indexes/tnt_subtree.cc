@@ -1,21 +1,60 @@
 #include "cpp-btree/btree_map.h"
 #include <vector>
-#include <random>
 #include "tnt_subtree.h"
+#include "../report.h"
 
 using namespace std;
 using namespace btree;
 
 extern "C" {
+#ifdef STELLAR_TESTING
 static uint64_t marked_total;
 
 uint64_t subtree_marked_total(void) {
   return __atomic_load_n(&marked_total, __ATOMIC_RELAXED);
 }
+#endif
 
+static int track_marked(void) {
+#ifdef STELLAR_TESTING
+  return 1;
+#else
+  return report_marked_entries();
+#endif
+}
 static void marked_add(subtree_t *t) {
-  __atomic_fetch_add(&t->marked_count, 1, __ATOMIC_RELAXED);
+  if (track_marked()) __atomic_fetch_add(&t->marked_count, 1, __ATOMIC_RELAXED);
+#ifdef STELLAR_TESTING
   __atomic_fetch_add(&marked_total, 1, __ATOMIC_RELAXED);
+#endif
+}
+static bool tombstone_at(subtree_t *t, uint32_t slot) {
+  auto bits = static_cast<vector<uint64_t> *>(t->report_tombstones);
+  size_t word = GET_SIDX(slot) / 64;
+  return bits && word < bits->size() && ((*bits)[word] & (UINT64_C(1) << (GET_SIDX(slot) % 64)));
+}
+void subtree_report_record(subtree_t *t, uint64_t key, uint64_t slot, int tombstone) {
+  if (!report_entry_classes() || (!tombstone && !t->report_tombstones)) return;
+  auto b = static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
+  auto i = b->find(key);
+  if (i == b->end() || GET_SIDX(i->second) != slot) return;
+  bool old = tombstone_at(t, i->second);
+  if (old == (bool)tombstone) return;
+  auto bits = static_cast<vector<uint64_t> *>(t->report_tombstones);
+  if (!bits) t->report_tombstones = bits = new vector<uint64_t>();
+  size_t word = slot / 64;
+  if (word >= bits->size()) bits->resize(word + 1, 0);
+  (*bits)[word] ^= UINT64_C(1) << (slot % 64);
+  if (!sidx_is_invalid(i->second)) {
+    if (tombstone) __atomic_fetch_add(&t->live_tombstones, 1, __ATOMIC_RELAXED);
+    else __atomic_fetch_sub(&t->live_tombstones, 1, __ATOMIC_RELAXED);
+  }
+}
+void subtree_report_counts(subtree_t *t, uint64_t *total, uint64_t *stale, uint64_t *tombstones) {
+  auto b = static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
+  *total += b->size();
+  *stale += t->marked_count;
+  *tombstones += t->live_tombstones;
 }
 
 static inline void set_inval(uint32_t *addr) {
@@ -38,7 +77,10 @@ subtree_t *subtree_create() {
   subtree_t *t = (subtree_t*) malloc(sizeof(subtree_t));
   btree_map<uint64_t, uint32_t> *b =
       new btree_map<uint64_t, uint32_t>();
+  t->slab = NULL;
   t->tree = b;
+  t->report_tombstones = NULL;
+  t->live_tombstones = 0;
   t->marked_count = 0;
   return t;
 }
@@ -74,6 +116,8 @@ int subtree_set_invalid(subtree_t *t, unsigned char *k, size_t len) {
       // printf("SET INVAL %lu (s, %lu)\n", hash, i->second.slab_idx);
       set_inval(&i->second);
       marked_add(t);
+      if (report_entry_classes() && tombstone_at(t, i->second))
+        __atomic_fetch_sub(&t->live_tombstones, 1, __ATOMIC_RELAXED);
       return 1;
     }
     // printf("Already INVAL %lu(s, %lu)\n", hash, i->second.slab_idx);
@@ -90,8 +134,16 @@ int subtree_delete(subtree_t *t, unsigned char *k, size_t len) {
   auto i = b->find(hash);
   if (i == b->end()) return 0;
   if (sidx_is_invalid(i->second)) {
-    __atomic_fetch_sub(&t->marked_count, 1, __ATOMIC_RELAXED);
+    if (track_marked()) __atomic_fetch_sub(&t->marked_count, 1, __ATOMIC_RELAXED);
+#ifdef STELLAR_TESTING
     __atomic_fetch_sub(&marked_total, 1, __ATOMIC_RELAXED);
+#endif
+  }
+  if (report_entry_classes() && tombstone_at(t, i->second)) {
+    if (!sidx_is_invalid(i->second))
+      __atomic_fetch_sub(&t->live_tombstones, 1, __ATOMIC_RELAXED);
+    auto bits = static_cast<vector<uint64_t> *>(t->report_tombstones);
+    (*bits)[GET_SIDX(i->second) / 64] &= ~(UINT64_C(1) << (GET_SIDX(i->second) % 64));
   }
   b->erase(i);
   return 1;
@@ -124,45 +176,6 @@ int subtree_clear_shy(subtree_t *t, unsigned char *k, size_t len) {
     return 0;
   __atomic_and_fetch(&i->second, ~SIDX_SHY_BIT, __ATOMIC_RELAXED);
   return 1;
-}
-
-int subtree_sample_percent(subtree_t *t,
-                           uint64_t *out_keys,
-                           size_t sample_cnt) {
-  auto b = static_cast<btree_map<uint64_t,uint32_t>*>(t->tree);
-  size_t N = b->size();
-  if (N == 0 || sample_cnt == 0) return 0;
-
-  // 리저버 샘플링 준비
-  std::vector<uint64_t> reservoir;
-  reservoir.reserve(sample_cnt);
-
-  std::mt19937_64 rng{std::random_device{}()};
-  size_t idx = 0;
-
-  for (auto it = b->begin(); it != b->end(); ++it, ++idx) {
-    uint64_t key = it->first;
-
-    if (idx < sample_cnt) {
-      // 초기 sample_cnt개는 곧바로 reservoir에 담고
-      reservoir.push_back(key);
-    } else {
-      // 이후엔 [0..idx] 사이에서 랜덤 인덱스 j를 뽑아
-      // j < sample_cnt 이면 reservoir[j]를 대체
-      std::uniform_int_distribution<size_t> dist(0, idx);
-      size_t j = dist(rng);
-      if (j < sample_cnt) {
-        reservoir[j] = key;
-      }
-    }
-    if (idx + 1 >= N) break;
-  }
-
-  // 결과를 out_keys에 복사
-  for (size_t i = 0; i < sample_cnt; i++) {
-    out_keys[i] = reservoir[i];
-  }
-  return (int)sample_cnt;
 }
 
 int subtree_forall_keys(subtree_t *t, void (*cb)(uint64_t h, int n, void *data),
@@ -214,16 +227,21 @@ int subtree_forall_invalid(subtree_t *t, void *data, void (*cb)(void *slab, uint
   return count;
 }
 
-
 void subtree_free(subtree_t *t) {
+#ifdef STELLAR_TESTING
   __atomic_fetch_sub(&marked_total, t->marked_count, __ATOMIC_RELAXED);
+#endif
+  delete static_cast<vector<uint64_t> *>(t->report_tombstones);
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
   delete b;
   free(t);
 }
 void subtree_all_free(subtree_t *t) {
+#ifdef STELLAR_TESTING
   __atomic_fetch_sub(&marked_total, t->marked_count, __ATOMIC_RELAXED);
+#endif
+  delete static_cast<vector<uint64_t> *>(t->report_tombstones);
   btree_map<uint64_t, uint32_t> *b =
       static_cast<btree_map<uint64_t, uint32_t> *>(t->tree);
   b->erase(b->begin(), b->end());

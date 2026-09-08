@@ -22,7 +22,6 @@ static void *fsst_worker(void *pdata) {
     }
 
   if (!bgq_is_empty(GC)) {
-    int updated = 0;
     for (int j = 0; j < HOT_BATCH; j++) {
       struct slab *s = (struct slab*)bgq_dequeue(GC);
 
@@ -51,8 +50,6 @@ static void *fsst_worker(void *pdata) {
       __sync_fetch_and_add(&s->read_ref, 1);
       R_UNLOCK(&s->tree_lock);
 
-      printf("GC: %lu\n", s->seq);
-      RSTAT_INC(reins_slabs);
       size_t nread = pread(s->fd, gc_buf, slab_data_size(s), 0);
       if (nread < 0) perror("pread GC");
 
@@ -97,11 +94,6 @@ static void *fsst_worker(void *pdata) {
             cb->payload  = NULL;
             cb->slab     = s;
             cb->slab_idx = slot_idx;
-            /*
-             * The source is recorded only after the authority walk below:
-             * tnt_index_lookup() feeds the callback to the latency helpers,
-             * which read fsst_slab as their context pointer when it is set.
-             */
             cb->fsst_slab = NULL;
             cb->fsst_idx = -1;
 
@@ -120,7 +112,8 @@ static void *fsst_worker(void *pdata) {
             
             /* empty slot; no need for reinsertion */
             if (item_is_empty(meta)) goto skip;
-            RSTAT_INC(reins_examined);
+            TEST_STAT_INC(reins_examined);
+            report_event(REPORT_REINSERTION);
 
             /*
              * The source slab's subtree is freed under its write lock when it
@@ -206,8 +199,7 @@ static void *fsst_worker(void *pdata) {
             cb->io_cb = add_item_async_cb1;
             cb->lru_entry = NULL;
             cb->io_cb(cb);
-            updated++;
-            RSTAT_INC(reins_issued);
+            TEST_STAT_INC(reins_issued);
             continue;
           skip:
             free(cb->item);
@@ -235,91 +227,3 @@ void fsst_worker_init(void) {
   gc_buf = aligned_alloc(PAGE_SIZE, cfg.max_file_size);
   pthread_create(&t, NULL, fsst_worker, NULL);
 }
-
-
-#if 0
-void check_and_remove_tree(struct slab_callback *cb, void *item) {
-  struct slab *s = cb->fsst_slab;
-  free(cb->item);
-  free(cb);
-
-  W_LOCK(&s->tree_lock);
-  if (s->nb_items || (s->max == 0 && s->min == -1)) {
-    W_UNLOCK(&s->tree_lock);
-    return;
-  }
-
-  printf("free %lu %lu %lu %lu\n", s->min, s->max, s->seq, s->nb_items);
-  s->min = -1;
-  s->max = 0;
-  subtree_free(s->subtree);
-  if (cfg.with_reins)
-    free(s->hot_bits);
-
-#if WITH_FILTER
-  filter_delete(s->filter);
-#endif
-  s->subtree = NULL;
-  /*s->centree_node = NULL;*/
-
-  printf("RM %lu\n", s->seq);
-
-  if (__sync_fetch_and_or(&s->update_ref, 0) == 0 && s->read_ref == 0) {
-    char path[128], spath[128];
-    int len;
-    sprintf(path, "/proc/self/fd/%d", s->fd);
-    if ((len = readlink(path, spath, 512)) < 0) die("READLINK\n");
-    spath[len] = 0;
-    close(s->fd);
-    truncate(spath, 0);
-    printf("REMOVED FILE\n");
-  }
-
-  W_UNLOCK(&s->tree_lock);
-}
-
-void skip_or_invalidate_index_fsst(void *slab, uint64_t slab_idx) {
-  struct slab_callback *cb;
-  struct slab *s = (struct slab *)slab;
-  size_t page_num;
-  size_t page_idx;
-  char *src;
-
-  cb = malloc(sizeof(*cb));
-  cb->payload = NULL;  /* read by add_time_in_payload()'s write-once test */
-  cb->cb = NULL;
-  cb->cb_cb = check_and_remove_tree;
-  cb->slab = s;
-  cb->slab_idx = GET_SIDX(slab_idx);
-  cb->fsst_slab = s;
-  cb->fsst_idx = GET_SIDX(slab_idx);
-  R_UNLOCK(&s->tree_lock);
-  cb->item = malloc(cb->slab->item_size);
-
-  page_num = item_page_num(cb->slab, cb->slab_idx);
-  page_idx =
-      (cb->slab_idx % (PAGE_SIZE / cb->slab->item_size)) * cb->slab->item_size;
-  src = &vict_file_fsst[(page_num * PAGE_SIZE) + page_idx];
-  memcpy(cb->item, src, cb->slab->item_size);
-  kv_upsert_async(cb);
-  R_LOCK(&s->tree_lock);
-  return;
-}
-
-
-static char *vict_file_fsst = NULL;
-vict_file_fsst = aligned_alloc(PAGE_SIZE, cfg.max_file_size);
-if (!vict_file_fsst) die("FSST Static Buf Error\n");
-if (!bgq_is_empty(FSST)) {
-    doing = 1;
-    for (size_t i = 0; i < NODE_BATCH; i++) {
-      tree_entry_t *victim = (tree_entry_t *)bgq_dequeue(FSST);
-      if (!victim) goto fsst_sleep;
-      pread(victim->slab->fd, vict_file_fsst, victim->slab->size_on_disk, 0);
-
-      R_LOCK(&victim->slab->tree_lock);
-      subtree_forall_invalid(victim->slab->subtree, victim->slab, skip_or_invalidate_index_fsst);
-      R_UNLOCK(&victim->slab->tree_lock);
-    }
-  }
-#endif

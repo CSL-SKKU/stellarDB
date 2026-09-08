@@ -1,412 +1,258 @@
 #include "headers.h"
-#include "utils.h"
-#include "slab.h"
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <time.h>
 
-#define MAX_STATS 10000000LU
-
-struct stats {
-  uint64_t *timing_time;
-  uint64_t *timing_value;
-  size_t timing_idx;
-  size_t max_timing_idx;
-} stats;
-
-/* ---- latency series ---- */
-#define LAT_BUCKETS 128
-#define LAT_MAX_THREADS 512
-struct lat_set {
-  uint64_t count, sum_cycles;
-  uint64_t hist[LAT_BUCKETS];
+uint64_t report_mask;
+static FILE *output;
+static uint64_t interval_ns, began_ns, previous_ns;
+static _Atomic int active;
+static _Atomic uint64_t events[REPORT_METRICS - REPORT_REBALANCE];
+static const char *names[REPORT_METRICS] = {
+  "throughput_rps", "latency_avg_ms", "latency_p99_ms", "entries_total",
+  "entries_stale", "entries_live_tombstones", "entries_live_normal", "nodes",
+  "max_depth", "rebalance_attempts", "reinsertion_attempts",
+  "pruning_successes", "migration_successes"
 };
-struct lat_tl {
-  uint64_t client_count, client_queue_cycles, client_service_cycles;
-  struct lat_set op[2]; /* [0] reads, [1] writes */
-  struct lat_set stage[5]; /* [0] queue wait, [1] distributor service, [2] I/O service, [3] routing descent, [4] history walk */
+
+/* Sixteen buckets per power of two; upper bounds overestimate by <= 6.25%.
+ * Each completion thread owns a bounded histogram. Its lock also makes an
+ * interval snapshot consistent with its count and sum. No raw samples. */
+#define HIST_BUCKETS 1024
+struct measurements {
+  uint64_t count, sum_ns, hist[HIST_BUCKETS];
 };
-static struct lat_tl *lat_threads[LAT_MAX_THREADS];
-static _Atomic int lat_nb_threads;
-static __thread struct lat_tl *my_lat;
-static struct lat_tl *lat_mine(void);
+struct reporter {
+  pthread_mutex_t lock;
+  uint64_t count, sum_ns;
+  uint64_t *hist;
+  struct reporter *next;
+};
+static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct reporter *reporters;
+static __thread struct reporter *mine;
+static pthread_t sampler;
+static pthread_mutex_t timer_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t timer_cond;
+static int stopping, sampler_started;
 
-static inline unsigned lat_bucket(uint64_t us) {
-  if (us < 4)
-    return (unsigned)us;                         /* 0..3 exact */
-  unsigned exp = 63 - __builtin_clzll(us);       /* >= 2 */
-  unsigned sub = (unsigned)((us >> (exp - 2)) & 3);
-  unsigned idx = exp * 4 + sub;
-  return idx < LAT_BUCKETS ? idx : LAT_BUCKETS - 1;
+uint64_t report_now_ns(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
 }
 
-static inline uint64_t lat_bucket_low_us(unsigned idx) {
-  if (idx < 4)
-    return idx;
-  unsigned exp = idx / 4, sub = idx % 4;
-  return (uint64_t)(4 + sub) << (exp - 2);
+static unsigned bucket(uint64_t ns) {
+  if (ns < 16) return ns;
+  unsigned exponent = 63 - __builtin_clzll(ns);
+  return exponent * 16 + ((ns >> (exponent - 4)) & 15);
 }
-
-void lat_series_record(uint64_t cycles, int is_write) {
-  struct lat_tl *t = lat_mine();
-
-  if (t == NULL)
+static uint64_t bucket_upper(unsigned b) {
+  if (b < 16) return b;
+  unsigned exponent = b / 16;
+  if (exponent == 63 && b % 16 == 15) return UINT64_MAX;
+  return ((uint64_t)(17 + b % 16) << (exponent - 4)) - 1;
+}
+uint64_t report_request_start(void) {
+  return (report_enabled(REPORT_LATENCY_AVG) ||
+          report_enabled(REPORT_LATENCY_P99)) ? report_now_ns() : 0;
+}
+void report_request_complete(uint64_t start_ns) {
+  if (!(report_mask & 7) || !atomic_load_explicit(&active, memory_order_relaxed))
     return;
-  struct lat_set *s = &t->op[is_write ? 1 : 0];
-
-  s->count++;
-  s->sum_cycles += cycles;
-  s->hist[lat_bucket(cycles_to_us(cycles))]++;
+  uint64_t elapsed = start_ns ? report_now_ns() - start_ns : 0;
+  if (!mine) {
+    mine = calloc(1, sizeof(*mine));
+    if (!mine) die("Cannot allocate report histogram\n");
+    if (report_enabled(REPORT_LATENCY_P99)) {
+      mine->hist = calloc(HIST_BUCKETS, sizeof(*mine->hist));
+      if (!mine->hist) die("Cannot allocate report histogram\n");
+    }
+    pthread_mutex_init(&mine->lock, NULL);
+    pthread_mutex_lock(&registry_lock);
+    mine->next = reporters;
+    reporters = mine;
+    pthread_mutex_unlock(&registry_lock);
+  }
+  pthread_mutex_lock(&mine->lock);
+  mine->count++;
+  if (report_enabled(REPORT_LATENCY_AVG)) mine->sum_ns += elapsed;
+  if (report_enabled(REPORT_LATENCY_P99)) mine->hist[bucket(elapsed)]++;
+  pthread_mutex_unlock(&mine->lock);
+}
+void report_event(enum report_metric metric) {
+  if (report_enabled(metric) && atomic_load_explicit(&active, memory_order_relaxed))
+    atomic_fetch_add_explicit(&events[metric - REPORT_REBALANCE], 1, memory_order_relaxed);
 }
 
-static struct lat_tl *lat_mine(void) {
-  struct lat_tl *t = my_lat;
-
-  if (t == NULL) {
-    int slot = atomic_fetch_add_explicit(&lat_nb_threads, 1, memory_order_relaxed);
-
-    if (slot >= LAT_MAX_THREADS)
-      return NULL;
-    t = calloc(1, sizeof(*t));
-    if (t == NULL)
-      return NULL;
-    my_lat = t;
-    __atomic_store_n(&lat_threads[slot], t, __ATOMIC_RELEASE);
-  }
-  return t;
+static char *trim(char *s) {
+  while (isspace((unsigned char)*s)) s++;
+  char *end = s + strlen(s);
+  while (end > s && isspace((unsigned char)end[-1])) *--end = 0;
+  return s;
 }
-
-/*
- * Per-stage service times of one completed request, from the stamps the
- * enqueue/dequeue sites left on the callback (see add_time_in_payload()).
- * A request that never reached an I/O worker (a read miss answered by the
- * distributor) has no second queue and no I/O stage.
- */
-void lat_series_record_stages(struct slab_callback *c, uint64_t end) {
-  struct lat_tl *t = lat_mine();
-  uint64_t t0 = (uint64_t)c->payload, t1 = c->t_stage[0], t2 = c->t_stage[1],
-           t3 = c->t_stage[2], tl = c->t_stage[3];
-  uint64_t q = 0, d = 0, io = 0, desc = 0, walk = 0, d_end;
-
-  if (t == NULL || !t0 || !t1 || t1 < t0 || end < t1)
-    return;
-  t->client_count++;
-  t->client_queue_cycles += t1 - t0;
-  t->client_service_cycles += end - t1;
-  q = t1 - t0;
-  if (t2 && t3 && t2 >= t1 && t3 >= t2 && end >= t3) {
-    d = t2 - t1;
-    q += t3 - t2;
-    io = end - t3;
-    d_end = t2;
-  } else if (end >= t1) {
-    d = end - t1;
-    d_end = end;
-  } else {
-    d_end = t1;
-  }
-  /* The distributor stage split at LEAF_FOUND: routing descent, then the history walk. */
-  if (tl && tl >= t1 && tl <= d_end) {
-    desc = tl - t1;
-    walk = d_end - tl;
-  }
-  uint64_t v[5] = {q, d, io, desc, walk};
-  for (int k = 0; k < 5; k++) {
-    struct lat_set *s = &t->stage[k];
-
-    s->count++;
-    s->sum_cycles += v[k];
-    s->hist[lat_bucket(cycles_to_us(v[k]))]++;
-  }
-}
-
-/* Percentiles of the interval (cur - prev) for one counter set. */
-static void lat_set_stats(const struct lat_set *cur, const struct lat_set *prev,
-                          uint64_t *count, uint64_t *avg, uint64_t *p50,
-                          uint64_t *p99, uint64_t *p999, uint64_t *max_us) {
-  uint64_t acc = 0, sum = cur->sum_cycles - prev->sum_cycles;
-
-  *count = cur->count - prev->count;
-  *avg = *count ? cycles_to_us(sum / *count) : 0;
-  *p50 = *p99 = *p999 = *max_us = 0;
-  for (unsigned b = 0; b < LAT_BUCKETS && *count; b++) {
-    uint64_t in_bucket = cur->hist[b] - prev->hist[b];
-
-    if (!in_bucket)
+int report_init(const char *path, const char *config, double seconds) {
+  report_mask = path && strcmp(path, "none") ? (UINT64_C(1) << REPORT_METRICS) - 1 : 0;
+  if (!report_mask) return 0;
+  if (config) {
+    FILE *f = fopen(config, "r");
+    if (!f) { perror(config); return -1; }
+    char *line = NULL;
+    size_t capacity = 0, number = 0;
+    while (getline(&line, &capacity, f) >= 0) {
+      number++;
+      char *comment = strchr(line, '#');
+      if (comment) *comment = 0;
+      char *key = trim(line);
+      if (!*key) continue;
+      char *value = strchr(key, '=');
+      if (!value) goto invalid;
+      *value++ = 0;
+      key = trim(key); value = trim(value);
+      int enabled;
+      if (!strcmp(value, "1") || !strcmp(value, "true")) enabled = 1;
+      else if (!strcmp(value, "0") || !strcmp(value, "false")) enabled = 0;
+      else goto invalid;
+      if (!strcmp(key, "all")) {
+        report_mask = enabled ? (UINT64_C(1) << REPORT_METRICS) - 1 : 0;
+        continue;
+      }
+      unsigned metric;
+      for (metric = 0; metric < REPORT_METRICS; metric++)
+        if (!strcmp(key, names[metric])) break;
+      if (metric == REPORT_METRICS) goto invalid;
+      if (enabled) report_mask |= UINT64_C(1) << metric;
+      else report_mask &= ~(UINT64_C(1) << metric);
       continue;
-    *max_us = lat_bucket_low_us(b);
-    acc += in_bucket;
-    if (!*p50 && acc * 2 >= *count) *p50 = lat_bucket_low_us(b);
-    if (!*p99 && acc * 100 >= *count * 99) *p99 = lat_bucket_low_us(b);
-    if (!*p999 && acc * 1000 >= *count * 999) *p999 = lat_bucket_low_us(b);
-  }
-}
-
-void lat_series_report(double t_s) {
-  static uint64_t prev_client_count, prev_client_queue, prev_client_service;
-  uint64_t client_count = 0, client_queue = 0, client_service = 0;
-  static struct lat_set prev_all, prev_rd, prev_wr, prev_st[5];
-  struct lat_set all = {0}, rd = {0}, wr = {0}, st[5] = {{0}};
-  uint64_t sc[5], savg[5], sp50[5], sp99[5], sp999[5], smx[5];
-  int n = atomic_load_explicit(&lat_nb_threads, memory_order_relaxed);
-  uint64_t c, avg, p50, p99, p999, mx, rc, ravg, rp50, rp99, rp999, rmx, wc,
-      wavg, wp50, wp99, wp999, wmx;
-
-  if (n > LAT_MAX_THREADS)
-    n = LAT_MAX_THREADS;
-  for (int i = 0; i < n; i++) {
-    struct lat_tl *t = __atomic_load_n(&lat_threads[i], __ATOMIC_ACQUIRE);
-
-    if (t == NULL)
-      continue;
-    client_count += t->client_count;
-    client_queue += t->client_queue_cycles;
-    client_service += t->client_service_cycles;
-    for (int k = 0; k < 2; k++) {
-      struct lat_set *dst = k ? &wr : &rd;
-
-      dst->count += t->op[k].count;
-      dst->sum_cycles += t->op[k].sum_cycles;
-      for (unsigned b = 0; b < LAT_BUCKETS; b++)
-        dst->hist[b] += t->op[k].hist[b];
+invalid:
+      fprintf(stderr, "%s:%zu: expected a report metric = true/false (or 1/0)\n", config, number);
+      free(line); fclose(f); return -1;
     }
-    for (int k = 0; k < 5; k++) {
-      st[k].count += t->stage[k].count;
-      st[k].sum_cycles += t->stage[k].sum_cycles;
-      for (unsigned b = 0; b < LAT_BUCKETS; b++)
-        st[k].hist[b] += t->stage[k].hist[b];
-    }
+    int error = ferror(f);
+    free(line); fclose(f);
+    if (error) { perror(config); return -1; }
   }
-  all.count = rd.count + wr.count;
-  all.sum_cycles = rd.sum_cycles + wr.sum_cycles;
-  for (unsigned b = 0; b < LAT_BUCKETS; b++)
-    all.hist[b] = rd.hist[b] + wr.hist[b];
-
-  lat_set_stats(&all, &prev_all, &c, &avg, &p50, &p99, &p999, &mx);
-  lat_set_stats(&rd, &prev_rd, &rc, &ravg, &rp50, &rp99, &rp999, &rmx);
-  lat_set_stats(&wr, &prev_wr, &wc, &wavg, &wp50, &wp99, &wp999, &wmx);
-  for (int k = 0; k < 5; k++)
-    lat_set_stats(&st[k], &prev_st[k], &sc[k], &savg[k], &sp50[k], &sp99[k], &sp999[k], &smx[k]);
-  /* ... q_avg q_p99 dist_avg dist_p99 io_avg io_p99 desc_avg desc_p99 walk_avg walk_p99 */
-  uint64_t client_n = client_count - prev_client_count;
-  double client_q_us = client_n ? cycles_to_us(client_queue - prev_client_queue) / (double)client_n : 0;
-  double client_s_us = client_n ? cycles_to_us(client_service - prev_client_service) / (double)client_n : 0;
-  printf("#L %.3f %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %.3f %.3f\n",
-         t_s, c, avg, p50, p99, p999, mx, rc, ravg, rp99, wc, wavg, wp99,
-         savg[0], sp99[0], savg[1], sp99[1], savg[2], sp99[2],
-         savg[3], sp99[3], savg[4], sp99[4], client_q_us, client_s_us);
-  prev_client_count = client_count;
-  prev_client_queue = client_queue;
-  prev_client_service = client_service;
-  fflush(stdout);
-  prev_all = all;
-  prev_rd = rd;
-  prev_wr = wr;
-  for (int k = 0; k < 5; k++)
-    prev_st[k] = st[k];
-}
-
-void add_timing_stat(uint64_t elapsed) {
-  if (!stats.timing_value) {
-    stats.timing_time = malloc(MAX_STATS * sizeof(*stats.timing_time));
-    stats.timing_value = malloc(MAX_STATS * sizeof(*stats.timing_value));
-    stats.timing_idx = 0;
-    stats.max_timing_idx = MAX_STATS;
-  }
-  if (stats.timing_idx >= stats.max_timing_idx) return;
-  // die("Cannot collect all stats, buffer is full!\n");
-  rdtscll(stats.timing_time[stats.timing_idx]);
-  stats.timing_value[stats.timing_idx] = elapsed;
-  stats.timing_idx++;
-}
-
-int cmp_uint(const void *_a, const void *_b) {
-  uint64_t a = *(uint64_t *)_a;
-  uint64_t b = *(uint64_t *)_b;
-  if (a > b)
-    return 1;
-  else if (a < b)
-    return -1;
-  else
-    return 0;
-}
-
-struct restructuring_stats rstats;
-
-void rstat_max(uint64_t *slot, uint64_t v) {
-  uint64_t cur = __atomic_load_n(slot, __ATOMIC_RELAXED);
-  while (v > cur &&
-         !__atomic_compare_exchange_n(slot, &cur, v, 1, __ATOMIC_RELAXED,
-                                      __ATOMIC_RELAXED))
-    ;
-}
-
-void reset_restructuring_stats(void) {
-  memset(&rstats, 0, sizeof(rstats));
-}
-
-/* VmRSS / VmSize / VmHWM of this process in KiB, from /proc/self/status. */
-void process_memory_kb(uint64_t *rss, uint64_t *vsz, uint64_t *hwm) {
-  char line[256];
-  FILE *f = fopen("/proc/self/status", "r");
-
-  *rss = *vsz = *hwm = 0;
-  if (f == NULL)
-    return;
-  while (fgets(line, sizeof(line), f) != NULL) {
-    if (strncmp(line, "VmRSS:", 6) == 0)
-      *rss = strtoull(line + 6, NULL, 10);
-    else if (strncmp(line, "VmSize:", 7) == 0)
-      *vsz = strtoull(line + 7, NULL, 10);
-    else if (strncmp(line, "VmHWM:", 6) == 0)
-      *hwm = strtoull(line + 6, NULL, 10);
-  }
-  fclose(f);
-}
-
-/* One block per phase; every line is "#R <phase> key=value ..." for grep. */
-void print_restructuring_stats(const char *phase) {
-  struct restructuring_stats r;
-  memcpy(&r, &rstats, sizeof(r));
-  printf("#R %s tree: nodes=%lu depth=%lu splits=%lu\n", phase,
-         tnt_get_node_count(), tnt_get_depth(), r.splits);
-  printf("#R %s worker: wakeups=%lu gate_open=%lu rebalance_needed=%lu\n",
-         phase, r.worker_wakeups, r.worker_gate_open, r.rebalance_needed);
-  printf("#R %s async-stale: queued=%lu processed=%lu invalidated=%lu "
-         "skipped=%lu dropped=%lu pending=%lu queue_max=%lu lag_max_ms=%lu\n",
-         phase, r.stale_queued, r.stale_processed, r.stale_invalidated,
-         r.stale_skipped, r.stale_dropped, stale_invalidation_pending(),
-         r.stale_queue_max, r.stale_lag_max_ms);
-  printf("#R %s rebalance: calls=%lu success=%lu noop=%lu failed=%lu "
-         "total_ms=%.1f max_ms=%.1f\n", phase, r.rebalance_calls,
-         r.rebalance_success, r.rebalance_noop, r.rebalance_failed,
-         r.rebalance_us / 1000.0, r.rebalance_max_us / 1000.0);
-  printf("#R %s reinsertion: slabs_queued=%lu slabs_processed=%lu "
-         "slots_examined=%lu copies_issued=%lu published=%lu abandoned=%lu\n",
-         phase, r.reins_queued, r.reins_slabs, r.reins_examined,
-         r.reins_issued, r.reins_published, r.reins_abandoned);
-  printf("#R %s reins-on-read: reads_seen=%lu deep_and_hot=%lu deferred=%lu dropped=%lu\n",
-         phase, r.reins_or_seen, r.reins_or_deep, r.reins_or_deferred, r.reins_or_dropped);
-  printf("#R %s prune: bursts=%lu calls=%lu done=%lu noop=%lu dropped=%lu "
-         "failed=%lu total_ms=%.1f max_ms=%.1f\n", phase, r.prune_bursts,
-         r.prune_calls, r.prune_done, r.prune_noop, r.prune_dropped,
-         r.prune_failed, r.prune_us / 1000.0, r.prune_max_us / 1000.0);
-  {
-    uint64_t rss, vsz, hwm;
-
-    process_memory_kb(&rss, &vsz, &hwm);
-    printf("#R %s mem: rss_mb=%lu vsz_mb=%lu peak_rss_mb=%lu\n", phase,
-           rss / 1024, vsz / 1024, hwm / 1024);
-  }
-  printf("#R %s migration: migrations=%lu entries_dropped=%lu "
-         "index_entries_freed=%lu bytes_read=%lu bytes_written=%lu "
-         "calls=%lu noop=%lu failed=%lu\n", phase,
-         r.migrations, r.rebuild_entries_dropped, r.rebuild_index_freed,
-         r.rebuild_bytes_read, r.rebuild_bytes_written,
-         r.migrate_calls, r.migrate_noop, r.migrate_failed);
-  printf("#R %s prune-pick: cold=%lu hot=%lu\n", phase, r.prune_cold_picks,
-         r.prune_hot_picks);
-  printf("#R %s prune-stale: stale=%lu reserved=%lu ratio=%.3f\n", phase,
-         r.prune_stale_last, r.prune_reserved_last,
-         r.prune_reserved_last ? (double)r.prune_stale_last / r.prune_reserved_last : 0.0);
-}
-
-void print_stats(void) {
-  uint64_t avg = 0;
-
-  if (stats.timing_idx == 0) {
-    printf("#No stat has been collected\n");
-    return;
-  }
-
-  size_t last = stats.timing_idx;
-  qsort(stats.timing_value, last, sizeof(*stats.timing_value), cmp_uint);
-  for (size_t i = 0; i < last; i++) avg += stats.timing_value[i];
-
-  printf("#Latency:\n#\tAVG - %lu us\n#\t99p - %lu us\n#\tmax - %lu us\n",
-         cycles_to_us(avg / last),
-         cycles_to_us(stats.timing_value[last * 99 / 100]),
-         cycles_to_us(stats.timing_value[last - 1]));
-
-  stats.timing_idx = 0;
-}
-
-struct timing_s {
-  enum timing_stage origin;
-  size_t time;
-};
-
-void *allocate_payload(void) {
-#if DEBUG
-  return calloc(20, sizeof(struct timing_s));
-#else
-  return NULL;
-#endif
-}
-
-void add_time_in_payload(struct slab_callback *c, enum timing_stage origin) {
-#if DEBUG
-  struct timing_s *payload = c->payload;
-  if (!payload) return;
-
-  uint64_t t, pos = 0;
-  rdtscll(t);
-  while (pos < 20 && payload[pos].time) pos++;
-  if (pos == 20) die("Too many times added!\n");
-  payload[pos].time = t;
-  payload[pos].origin = origin;
-#else
-  /*
-   * A request is enqueued twice (client -> distributor, then distributor ->
-   * I/O worker after the center-tree descent) and dequeued twice. The first
-   * enqueue is the client's stamp (write-once: overwriting it dropped the
-   * whole distributor stage from every latency number); the others fill the
-   * stage stamps so the completion can split the latency into queue wait,
-   * distributor service and I/O service.
-   */
-  uint64_t t;
-
-  if (origin == TIMING_STAGE_REQUEST_ENQUEUED) {
-    rdtscll(t);
-    if (!c->payload) {
-      c->payload = (void *)t;
-      c->t_stage[0] = c->t_stage[1] = c->t_stage[2] = c->t_stage[3] = 0;
-    } else if (!c->t_stage[1]) {
-      c->t_stage[1] = t;
-    }
-  } else if (origin == TIMING_STAGE_REQUEST_DEQUEUED && c->payload) {
-    rdtscll(t);
-    if (!c->t_stage[0])
-      c->t_stage[0] = t;
-    else if (!c->t_stage[2])
-      c->t_stage[2] = t;
-  } else if (origin == TIMING_STAGE_LEAF_FOUND && c->payload && c->t_stage[0] &&
-             !c->t_stage[3]) {
-    rdtscll(t);
-    c->t_stage[3] = t;
-  }
-#endif
-}
-
-uint64_t get_origin_from_payload(struct slab_callback *c, size_t pos) {
-#if DEBUG
-  struct timing_s *payload = c->payload;
-  if (!payload) return 0;
-  return payload[pos].origin;
-#else
+  output = fopen(path, "wx");
+  if (!output) { perror(path); return -1; }
+  interval_ns = (uint64_t)(seconds * 1e9);
+  pthread_condattr_t attr;
+  pthread_condattr_init(&attr);
+  pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+  pthread_cond_init(&timer_cond, &attr);
+  pthread_condattr_destroy(&attr);
+  fputs("time_s", output);
+  for (int i = 0; i < REPORT_METRICS; i++)
+    if (report_enabled(i)) fprintf(output, ",%s", names[i]);
+  fputc('\n', output);
   return 0;
-#endif
 }
 
-uint64_t get_time_from_payload(struct slab_callback *c, size_t pos) {
-#if DEBUG
-  struct timing_s *payload = c->payload;
-  if (!payload) return 0;
-  return payload[pos].time;
-#else
-  return (uint64_t)c->payload;
-#endif
+static void write_row(uint64_t now) {
+  struct measurements sum = {0};
+  pthread_mutex_lock(&registry_lock);
+  for (struct reporter *r = reporters; r; r = r->next) {
+    pthread_mutex_lock(&r->lock);
+    sum.count += r->count;
+    sum.sum_ns += r->sum_ns;
+    if (report_enabled(REPORT_LATENCY_P99))
+      for (unsigned b = 0; b < HIST_BUCKETS; b++) sum.hist[b] += r->hist[b];
+    r->count = r->sum_ns = 0;
+    if (r->hist) memset(r->hist, 0, HIST_BUCKETS * sizeof(*r->hist));
+    pthread_mutex_unlock(&r->lock);
+  }
+  pthread_mutex_unlock(&registry_lock);
+  uint64_t counts[REPORT_METRICS] = {0}, marked = 0, tombstones = 0;
+  if (report_mask & (UINT64_C(15) << REPORT_ENTRIES_TOTAL)) {
+    tnt_report_entries(&counts[REPORT_ENTRIES_TOTAL], &marked, &tombstones);
+    counts[REPORT_ENTRIES_STALE] = marked;
+    counts[REPORT_ENTRIES_TOMBSTONES] = tombstones;
+    counts[REPORT_ENTRIES_NORMAL] = counts[REPORT_ENTRIES_TOTAL] - marked - tombstones;
+  }
+  if (report_enabled(REPORT_NODES)) counts[REPORT_NODES] = tnt_get_node_count();
+  if (report_enabled(REPORT_DEPTH)) counts[REPORT_DEPTH] = tnt_get_depth();
+  for (int i = REPORT_REBALANCE; i < REPORT_METRICS; i++)
+    if (report_enabled(i)) counts[i] = atomic_load_explicit(&events[i - REPORT_REBALANCE], memory_order_relaxed);
+  double p99 = 0;
+  uint64_t accumulated = 0, rank = sum.count - sum.count / 100;
+  if (sum.count && report_enabled(REPORT_LATENCY_P99))
+    for (unsigned b = 0; b < HIST_BUCKETS; b++) {
+      accumulated += sum.hist[b];
+      if (accumulated >= rank) { p99 = bucket_upper(b) / 1e6; break; }
+    }
+  fprintf(output, "%.9f", (now - began_ns) / 1e9);
+  for (int i = 0; i < REPORT_METRICS; i++) {
+    if (!report_enabled(i)) continue;
+    fputc(',', output);
+    if (i == REPORT_THROUGHPUT)
+      fprintf(output, "%.6f", now > previous_ns ? sum.count * 1e9 / (now - previous_ns) : 0);
+    else if (i == REPORT_LATENCY_AVG) {
+      if (sum.count) fprintf(output, "%.9f", sum.sum_ns / 1e6 / sum.count);
+    } else if (i == REPORT_LATENCY_P99) {
+      if (sum.count) fprintf(output, "%.9f", p99);
+    } else fprintf(output, "%" PRIu64, counts[i]);
+  }
+  fputc('\n', output);
+  if (fflush(output) != 0) die("Cannot write report: %s\n", strerror(errno));
+  previous_ns = now;
+}
+static void *sample(void *unused) {
+  (void)unused;
+  pthread_mutex_lock(&timer_lock);
+  uint64_t next = began_ns + interval_ns;
+  while (!stopping) {
+    struct timespec deadline = {.tv_sec = next / 1000000000, .tv_nsec = next % 1000000000};
+    int rc = pthread_cond_timedwait(&timer_cond, &timer_lock, &deadline);
+    if (stopping) break;
+    if (rc == ETIMEDOUT) {
+      uint64_t at = report_now_ns();
+      pthread_mutex_unlock(&timer_lock);
+      write_row(at);
+      pthread_mutex_lock(&timer_lock);
+      /* Skip missed deadlines instead of emitting an unbounded catch-up burst. */
+      uint64_t now = report_now_ns();
+      next += ((now - next) / interval_ns + 1) * interval_ns;
+    }
+  }
+  pthread_mutex_unlock(&timer_lock);
+  return NULL;
+}
+void report_begin(void) {
+  if (!output) return;
+  for (int i = 0; i < REPORT_METRICS - REPORT_REBALANCE; i++) atomic_store(&events[i], 0);
+  pthread_mutex_lock(&timer_lock);
+  stopping = 0;
+  if (interval_ns) {
+    int error = pthread_create(&sampler, NULL, sample, NULL);
+    if (error) die("Cannot start report sampler: %s\n", strerror(error));
+    sampler_started = 1;
+  }
+  began_ns = previous_ns = report_now_ns();
+  atomic_store(&active, 1);
+  pthread_mutex_unlock(&timer_lock);
+}
+void report_finish(void) {
+  if (!output) return;
+  /* Freeze the measured duration before joining a sampler that may be
+   * waiting for a maintenance snapshot. Report finalization is outside it. */
+  pthread_mutex_lock(&timer_lock);
+  uint64_t end = report_now_ns();
+  atomic_store(&active, 0);
+  stopping = 1;
+  pthread_cond_signal(&timer_cond);
+  pthread_mutex_unlock(&timer_lock);
+  if (sampler_started) {
+    pthread_join(sampler, NULL);
+    sampler_started = 0;
+  }
+  write_row(end);
+}
+void report_close(void) {
+  if (output && fclose(output) != 0) die("Cannot close report: %s\n", strerror(errno));
+  output = NULL;
 }
 
-void free_payload(struct slab_callback *c) {
-#if DEBUG
-  free(c->payload);
+#ifdef STELLAR_TESTING
+struct restructuring_stats rstats;
+void reset_restructuring_stats(void) { memset(&rstats, 0, sizeof(rstats)); }
 #endif
-}

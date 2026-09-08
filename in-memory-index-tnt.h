@@ -92,7 +92,6 @@ tree_entry_t *tnt_traverse_use_seq(int seq);
 
 int tnt_get_nodes_at_level(int level, background_queue *q);
 
-void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent);
 void tnt_index_add(struct slab_callback *cb, void *item);
 void tnt_index_add_shy(struct slab_callback *cb, void *item);
 /*
@@ -103,15 +102,14 @@ void tnt_index_add_shy(struct slab_callback *cb, void *item);
  */
 index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item);
 void tnt_index_lookup_unref(index_entry_t *e);
+#ifdef STELLAR_TESTING
 index_entry_t *tnt_index_lookup_for_test(struct slab_callback *cb, void *item, int *ttry, uint64_t *tkey);
+#endif
 int tnt_index_invalid(void *item);
 
 uint64_t tnt_get_depth(void);
 uint64_t tnt_get_node_count(void);
 bool tnt_rebalancing_needed(void);
-void prune_scan_report(const char *phase);
-void prune_stale_distribution_report(const char *phase);
-void prune_dump_slabs(double t_s);
 void tnt_print(void);
 
 enum tnt_rebalance_status {
@@ -125,6 +123,7 @@ enum tnt_rebalance_status {
  */
 int tnt_rebalancing(void);
 
+#ifdef STELLAR_TESTING
 /* Test-only hook: runs after RCU preparation and before the commit lock. */
 void tnt_set_rebalance_precommit_test_hook(void (*hook)(void));
 /* Test-only hook: runs after publication/root unlock and before RCU cleanup. */
@@ -134,6 +133,7 @@ void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void));
  * before the node's slab lock is taken and its removed flag is read.
  */
 void tnt_set_index_lookup_step_test_hook(void (*hook)(centree_node n));
+#endif
 
 /*
  * Pruning (indexes/tnt_prune.c). A candidate is an internal-leaf-internal

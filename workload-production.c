@@ -17,7 +17,7 @@ static char *create_unique_item_prod(uint64_t uid, uint64_t max_uid) {
 }
 
 static void launch_prod(struct workload *w, bench_t b) {
-  declare_periodic_count;
+
   random_gen_t rand_next =
       (b == prod1) ? (production_random1) : (production_random2);
 
@@ -29,9 +29,9 @@ static void launch_prod(struct workload *w, bench_t b) {
     // 58% write 40% read 2% scan
     long random = uniform_next() % 100;
     if (random < 58) {
-      kv_upsert_async(cb);
+      bench_upsert(cb);
     } else if (random < 98) {
-      kv_read_async(cb);
+      bench_read(cb);
     }
     /*else {
      tree_scan_res_t scan_res = kv_init_scan(cb->item, uniform_next()%99+1);
@@ -46,7 +46,7 @@ static void launch_prod(struct workload *w, bench_t b) {
      free(scan_res.hashes);
      free(scan_res.entries);
   } */
-    periodic_count(1000, "Production Load Injector");
+
   }
 }
 

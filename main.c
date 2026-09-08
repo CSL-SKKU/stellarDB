@@ -5,9 +5,6 @@
 
 int print = 0;
 int load = 1;
-extern int cache_hit;
-extern int merged;
-extern int try_fsst;
 
 static void print_help(char *n) {
   printf("Usage: %s [options] <nb_disks> <nb_workers> <nb_distributors>\n", n);
@@ -27,9 +24,10 @@ static void print_help(char *n) {
   printf("                                x >= 0, default %.6g; higher is less sensitive; attach values: -R2.0\n",
          (double)REBALANCE_THRESHOLD);
   puts("      --util-gate                 also require the utilization gate (off; kept for reference)");
-  puts("      --latency-series <ms>       print per-interval latency lines (#L); off by default");
+  puts("      --report-out <file.csv>      enable report collection (omitted or none: off)");
+  puts("      --config-report <file.config> metric switches, key=true/false; default all enabled");
+  puts("      --timeseries <seconds>      positive interval in seconds; omitted: whole-run aggregate");
   puts("      --churn-mix <U/I/D>         ycsb_churn: %% updates / inserts / deletes, rest reads (50/25/25)");
-  puts("      --dump-slabs <s>            heavy monitoring: one #S line per slab every <s> s and at the end (0 = off)");
   puts("      --reins-sample <N>          with -r: attempt a copy on one in N qualifying reads (16; 0 means 1)");
   puts("  -p, --with-prune <0..1>         enable repeated pruning at this global stale/reserved ratio");
   puts("  -M, --maintenance-period-ms <ms> interval for background maintenance (500)");
@@ -110,9 +108,10 @@ int main(int argc, char **argv) {
         {"with-reins",      optional_argument, 0, 'r'},
         {"with-rebal",      optional_argument, 0, 'R'},
         {"util-gate",       no_argument,       0, 1005},
-        {"latency-series",  required_argument, 0, 1006},
+        {"report-out",      required_argument, 0, 1015},
+        {"config-report",   required_argument, 0, 1016},
+        {"timeseries",      required_argument, 0, 1017},
         {"churn-mix",       required_argument, 0, 1011},
-        {"dump-slabs",      required_argument, 0, 1012},
         {"reins-sample",    required_argument, 0, 1009},
         {"with-prune",      required_argument, 0, 'p'},
         {"maintenance-period-ms", required_argument, 0, 'M'},
@@ -176,7 +175,6 @@ int main(int argc, char **argv) {
         case 1009: cfg.reins_sample = strtoul(optarg, NULL, 0);
                    if (!cfg.reins_sample) cfg.reins_sample = 1;
                    break;
-        case 1012: cfg.dump_slabs_s = strtoul(optarg, NULL, 0); break;
         case 1011: if (sscanf(optarg, "%d/%d/%d", &cfg.churn_upd, &cfg.churn_ins,
                               &cfg.churn_del) != 3 ||
                        cfg.churn_upd + cfg.churn_ins + cfg.churn_del > 100) {
@@ -184,10 +182,19 @@ int main(int argc, char **argv) {
                      return 1;
                    }
                    break;
-        case 1006: cfg.latency_series_ms = strtoul(optarg, NULL, 0);
-                   if (cfg.latency_series_ms && cfg.latency_series_ms < 100)
-                     cfg.latency_series_ms = 100;
-                   break;
+        case 1015: cfg.report_out = optarg; break;
+        case 1016: cfg.config_report = optarg; break;
+        case 1017: {
+          char *end;
+          errno = 0;
+          cfg.timeseries_s = strtod(optarg, &end);
+          if (errno || end == optarg || *end || !isfinite(cfg.timeseries_s) ||
+              cfg.timeseries_s < 1e-9 || cfg.timeseries_s > 31536000) {
+            fprintf(stderr, "--timeseries requires seconds in [0.000000001, 31536000]\n");
+            return 1;
+          }
+          break;
+        }
         case 'p': {
           char *end;
           double ratio = strtod(optarg, &end);
@@ -226,6 +233,8 @@ int main(int argc, char **argv) {
     int nb_distributors_per_disk = atoi(argv[optind++]);
 
     if (!validate_runtime_config(&cfg))
+        return EXIT_FAILURE;
+    if (report_init(cfg.report_out, cfg.config_report, cfg.timeseries_s) != 0)
         return EXIT_FAILURE;
     if (!prepare_directory(cfg.directory))
         return EXIT_FAILURE;
@@ -269,9 +278,6 @@ int main(int argc, char **argv) {
            cfg.reins_multiplier, cfg.reins_sample);
   printf("# \tRebalancing: %s\n", cfg.with_rebal ? "enabled" : "disabled");
   printf("# \tPruning: %s\n", cfg.with_prune ? "enabled" : "disabled");
-  if (cfg.latency_series_ms)
-    printf("# \tLatency series: every %lu ms (#L lines, histogram percentiles)\n",
-           cfg.latency_series_ms);
   if (cfg.with_prune)
     printf("# \tPruning trigger: repeat while global stale ratio >= %.2f, checked every %lu ms\n",
            cfg.prune_stale_ratio, cfg.maintenance_period_ms);
@@ -312,18 +318,10 @@ int main(int argc, char **argv) {
   }
   stop_timer("Init found %lu elements", get_database_size());
 
-
   repopulate_db(&w);
   load = 0;
 
-  start_timer {
-    flush_batched_load();
-  }
-  stop_timer("Remaining batch loading");
-
   print = 1;
-  cache_hit = 0;
-  merged = 0;
 
   /* Setup, not workload: counted in the load-phase block below. */
   if (cfg.with_rebal) {
@@ -339,19 +337,6 @@ int main(int argc, char **argv) {
       puts("Rebalancing was not needed");
   }
 
-  print_restructuring_stats("load");
-  prune_scan_report("load");
-  prune_stale_distribution_report("load");
-  reset_restructuring_stats();
-
-  //if (w.api == &BGWORK) {
-  //  start_timer {
-  //    init_old_keys(w.nb_items_in_db);
-  //  }
-  //  stop_timer("Init array for reinsertion test");
-  //}
-
-
   /* One thread runs the maintenance operations, so they exclude each other. */
   if (cfg.with_rebal || cfg.with_prune || cfg.migrate_th > 0) {
     int worker_status = restructuring_worker_init();
@@ -360,8 +345,6 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Cannot start restructuring worker: %s\n",
               strerror(-worker_status));
   }
-
-  utilization_sampler_init();
 
   /* Launch benchs */
   foreach (workload, workloads) {
@@ -378,16 +361,8 @@ int main(int argc, char **argv) {
       }
     }
     run_workload(&w, workload);
-    printf("lookup hit: %d\n", cache_hit);
-    printf("merged: %d\n", merged);
-    printf("try_fsst: %d\n", try_fsst);
-    cache_hit = 0;
-    merged = 0;
+
   }
 
-  //tnt_print();
-
-#if DEBUG
-  print_slow_payloads();
-#endif
+  report_close();
 }

@@ -247,9 +247,11 @@ static pthread_lock_t centree_root_lock;
  */
 static pthread_mutex_t maintenance_lock = PTHREAD_MUTEX_INITIALIZER;
 static atomic_int centree_phase_state;
+#ifdef STELLAR_TESTING
 static void (*rebalance_precommit_test_hook)(void);
 static void (*rebalance_postpublish_test_hook)(void);
 static void (*index_lookup_step_test_hook)(centree_node n);
+#endif
 
 #define CENTREE_RESTRUCTURING (1U << 30)
 #define CENTREE_SPLIT_COUNT_MASK (CENTREE_RESTRUCTURING - 1)
@@ -324,6 +326,7 @@ void tnt_maintenance_unlock(void) {
   pthread_mutex_unlock(&maintenance_lock);
 }
 
+#ifdef STELLAR_TESTING
 void tnt_set_rebalance_precommit_test_hook(void (*hook)(void)) {
   rebalance_precommit_test_hook = hook;
 }
@@ -335,68 +338,7 @@ void tnt_set_rebalance_postpublish_test_hook(void (*hook)(void)) {
 void tnt_set_index_lookup_step_test_hook(void (*hook)(centree_node n)) {
   index_lookup_step_test_hook = hook;
 }
-
-void swizzle_by_slab(size_t *arr, size_t nb_items, double x_percent) {
-  // 1) Initialize arr[i] = i
-  for (size_t i = 0; i < nb_items; i++) {
-    arr[i] = i;
-  }
-
-  // 2) Prepare BFS queue (use GC queue)
-  //    Clear any existing content
-  while (!bgq_is_empty(GC)) {
-    bgq_dequeue(GC);
-  }
-  //    Enqueue root
-  centree_read_in(centree_root);
-  centree_node root = centree_read_root(centree_root);
-  if (root) {
-    bgq_enqueue(GC, root);
-  }
-
-  uint64_t *sample_arr = malloc(sizeof(uint64_t) * root->value.slab->nb_max_items);
-
-  // 3) Traverse, sample X% of each slab’s keys, and swap
-  size_t write_idx = 0;
-  srand((unsigned)time(NULL));
-
-  while (!bgq_is_empty(GC) && write_idx < nb_items) {
-    // dequeue one node
-    centree_node node = (centree_node)bgq_dequeue(GC);
-    if (!node) continue;
-
-    // sample X% of this slab’s items
-    struct slab *s = node->value.slab;
-    size_t item_count = s->nb_items;  
-    size_t sample_cnt = (size_t)(item_count * x_percent / 100.0);
-    subtree_sample_percent(s->subtree, sample_arr, sample_cnt);
-
-    for (size_t j = 0; j < sample_cnt && write_idx < nb_items; j++) {
-      // pick a random key in [s->min, s->max]
-      // note: if keys are not perfectly dense, you may adjust this
-      size_t key = sample_arr[j];
-      if (key >= nb_items) continue;  // safety check
-
-      // swap arr[write_idx] <-> arr[key]
-      size_t tmp   = arr[write_idx];
-      arr[write_idx] = arr[key];
-      arr[key]       = tmp;
-
-      write_idx++;
-    }
-
-    // enqueue children
-    centree_node left = centree_read_left(centree_root, node);
-    centree_node right = centree_read_right(centree_root, node);
-    if (left) bgq_enqueue(GC, left);
-    if (right) bgq_enqueue(GC, right);
-  }
-  centree_read_out(centree_root);
-
-  while (!bgq_is_empty(GC)) {
-    bgq_dequeue(GC);
-  }
-}
+#endif
 
 centree tnt_centree(void) { return centree_root; }
 
@@ -995,7 +937,6 @@ restart:
   return &n->value;
 }
 
-
 tree_entry_t *tnt_traverse_use_seq(int seq) {
   tree_entry_t *t;
   R_LOCK(&centree_root_lock);
@@ -1037,6 +978,7 @@ int tnt_get_nodes_at_level(int level, background_queue *q) {
   return count;
 }
 
+#ifdef STELLAR_TESTING
 static __thread int try = 0;
 static __thread uint64_t try_key = 0;
 
@@ -1045,6 +987,8 @@ index_entry_t *tnt_index_lookup_for_test(struct slab_callback *cb, void *item, i
   *ttry = try; *tkey = try_key;
   return e;
 }
+
+#endif
 
 /*
  * Drops the read reference tnt_index_lookup() took on the entry's slab. Only
@@ -1063,28 +1007,27 @@ index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
   uint64_t key = *(uint64_t *)item_key;
   centree_node n;
   index_entry_t *e = NULL, *tmp = NULL;
-  int tmp_try = 0, upward_len = 1;
-  int count = 0;
-  bool leaf_timed = false;
+  int upward_len = 1;
+#ifdef STELLAR_TESTING
+  int tmp_try;
+#endif
 
 restart:
   e = NULL;
+#ifdef STELLAR_TESTING
   tmp_try = 0;
+#endif
   upward_len = 1;
-  count = 0;
 
   n = centree_find_leaf((void*)key);
-  if (!leaf_timed) {
-    /* Only the first descent is timed; a restart must not add a stage. */
-    add_time_in_payload(cb, TIMING_STAGE_LEAF_FOUND);
-    leaf_timed = true;
-  }
 
   // Leaf node에서 upward 탐색
   while (n != NULL) {
     struct slab *s = n->value.slab;
 
+#ifdef STELLAR_TESTING
     if (index_lookup_step_test_hook != NULL) index_lookup_step_test_hook(n);
+#endif
 
     R_LOCK(&s->tree_lock);
     /*
@@ -1106,14 +1049,15 @@ restart:
       R_UNLOCK(&s->tree_lock);
       continue; /* same n, reload s */
     }
+#ifdef STELLAR_TESTING
     tmp_try++;
+#endif
     tmp = NULL;
     if (s->min == -1) goto quick_skip;
 #if WITH_FILTER
     if (!filter_contain(s->filter, (unsigned char *)&key)) goto quick_skip;
 #endif
     if (key <= s->max && key >= s->min) {
-      count++;
       tmp = subtree_worker_lookup_utree(s->subtree, item);
     }
     if (tmp) {
@@ -1130,11 +1074,12 @@ restart:
       __sync_fetch_and_add(&s->read_ref, 1);
       e = tmp;
       R_UNLOCK(&s->tree_lock);
+#ifdef STELLAR_TESTING
       if (tmp_try > try) {
         try = tmp_try;
         try_key = key;
       }
-      // printf("[%lu] try: %d\n", key, try);
+#endif
       break;
     }
 quick_skip:
@@ -1144,13 +1089,11 @@ quick_skip:
     upward_len++;
     n = centree_lu_parent(n);
   }
-  add_time_in_payload(cb, TIMING_STAGE_INDEX_LOOKUP_DONE);
-  // printf("%d", try);
-  
+
   if (e){
-    add_upward_in_lat_ctx(cb, upward_len);
+
     cb->upward_len = (uint32_t)upward_len;
-    add_scount_in_lat_ctx(cb, count);
+
     return e;
   }
   return NULL;
@@ -1161,6 +1104,8 @@ void tnt_index_add(struct slab_callback *cb, void *item) {
   new_entry.slab = cb->slab;
   new_entry.slab_idx = cb->slab_idx;
   subtree_worker_insert(cb->slab->subtree, item, &new_entry);
+  subtree_report_record(cb->slab->subtree, get_prefix_for_item(item),
+                        cb->slab_idx, item_is_tombstone(item));
 }
 
 /* Same, marking the entry as written by reinsertion. */
@@ -1172,6 +1117,7 @@ void tnt_index_add_shy(struct slab_callback *cb, void *item) {
   new_entry.slab_idx = cb->slab_idx;
   subtree_insert_shy(cb->slab->subtree, (unsigned char *)&hash, sizeof(hash),
                      &new_entry);
+  subtree_report_record(cb->slab->subtree, hash, cb->slab_idx, item_is_tombstone(item));
 }
 
 int tnt_index_invalid(void *item) {
@@ -1250,15 +1196,13 @@ void tnt_print(void) {
 }
 
 int tnt_rebalancing(void) {
+  report_event(REPORT_REBALANCE);
   struct centree_balance_plan *plan = NULL;
-  struct timeval t0, t1;
   int result;
 
   if (centree_root == NULL)
     return -EINVAL;
 
-  RSTAT_INC(rebalance_calls);
-  gettimeofday(&t0, NULL);
   tnt_maintenance_lock();
   restructuring_phase_enter();
 
@@ -1274,14 +1218,18 @@ int tnt_rebalancing(void) {
     if (error != 0) {
       result = -error;
     } else {
+#ifdef STELLAR_TESTING
       if (rebalance_precommit_test_hook != NULL)
         rebalance_precommit_test_hook();
+#endif
 
       W_LOCK(&centree_root_lock);
       centree_balance_publish(plan);
       W_UNLOCK(&centree_root_lock);
+#ifdef STELLAR_TESTING
       if (rebalance_postpublish_test_hook != NULL)
         rebalance_postpublish_test_hook();
+#endif
       centree_balance_complete(plan);
       result = topology_noop ? TNT_REBALANCE_NOOP : TNT_REBALANCE_SUCCESS;
     }
@@ -1289,18 +1237,5 @@ int tnt_rebalancing(void) {
 
   restructuring_phase_exit();
   tnt_maintenance_unlock();
-  gettimeofday(&t1, NULL);
-  {
-    uint64_t us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
-                  (uint64_t)(t1.tv_usec - t0.tv_usec);
-    RSTAT_ADD(rebalance_us, us);
-    rstat_max(&rstats.rebalance_max_us, us);
-  }
-  if (result == TNT_REBALANCE_SUCCESS)
-    RSTAT_INC(rebalance_success);
-  else if (result == TNT_REBALANCE_NOOP)
-    RSTAT_INC(rebalance_noop);
-  else
-    RSTAT_INC(rebalance_failed);
   return result;
 }

@@ -83,12 +83,13 @@ struct slab_callback *bench_cb(void);
 struct workload_api *get_api(bench_t b);
 void add_in_tree(struct slab_callback *cb, void *item);
 
-void add_cached_in_lat_ctx(struct slab_callback *cb, uint32_t cached);
-void add_upward_in_lat_ctx(struct slab_callback *cb, uint32_t upward);
-void add_scount_in_lat_ctx(struct slab_callback *cb, uint32_t count);
-
-#if DEBUG
-void print_slow_payloads(void);
-#endif
+void bench_read(struct slab_callback *cb);
+void bench_upsert(struct slab_callback *cb);
+void bench_remove(struct slab_callback *cb);
+void bench_continue(struct slab_callback *next, struct slab_callback *prev);
+void bench_group_begin(uint64_t count);
+void bench_group_end(void);
+void bench_set_data(struct slab_callback *cb, void *data);
+void *bench_get_data(struct slab_callback *cb);
 
 #endif

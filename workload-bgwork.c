@@ -33,47 +33,47 @@ static int random_get_put(int test) {
 }
 
 static void _launch_bgwork(int test, int nb_requests) {
-  declare_periodic_count;
+
   for (size_t i = 0; i < nb_requests; i++) {
     struct slab_callback *cb = bench_cb();
     cb->item = _create_unique_item_bgwork(zipf_next());
     if (random_get_put(
             test)) {  // In these tests we update with a given probability
-      kv_upsert_async(cb);
+      bench_upsert(cb);
     } else {  // or we read
-      kv_read_async(cb);
+      bench_read(cb);
     }
-    periodic_count(1000, "BGWORK Load Injector (%lu%%)", i * 100LU / nb_requests);
+
   }
 }
 
 static void _launch_bgwork_e(int test, int nb_requests) {
-  declare_periodic_count;
+
   random_gen_t rand_next = zipf_next;
-  int total_lookup = 0, total_update = 0;
- 
+
   for (size_t i = 0; i < nb_requests; i++) {
     if (random_get_put(
             test)) {  // In this test we update with a given probability
       struct slab_callback *cb = bench_cb();
       cb->item = _create_unique_item_bgwork(rand_next());
-      total_update++;
-      kv_upsert_async(cb);
+
+      bench_upsert(cb);
     } else {  // or we scan
       uint64_t start_key = rand_next();
       size_t scan_size = uniform_next()%99+1;
       // 2. key와 size를 가지고 트리에서 slab과 idx들을 가져온다.
+      bench_group_begin(scan_size);
       for (size_t j = 0; j < scan_size; j++) {
         struct slab_callback *cb = bench_cb();
         cb->item = _create_unique_item_bgwork(start_key+j);
-        total_lookup++;
-        kv_read_async(cb);
+
+        bench_read(cb);
       }
+      bench_group_end();
     }
-    periodic_count(1000, "BGWORK Load Injector (scans) (%lu%%)",
-                   i * 100LU / nb_requests);
+
   }
-  printf("BGWORK YCSB E: %d updates, %d lookups\n", total_update, total_lookup);
+
 }
 
 /* Generic interface */

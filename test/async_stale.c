@@ -293,7 +293,6 @@ static void test_pipeline(char *directory) {
   CHECK(sidx_is_invalid(entry(old, 0).slab_idx));
   CHECK(request(0, 0, 1) == 999);
   puts("PASS real moving write/read complete while maintenance is blocked");
-  print_restructuring_stats("pipeline");
 }
 
 int main(int argc, char **argv) {

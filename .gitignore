@@ -3,6 +3,7 @@
 .cache/
 
 # Build products
+/.build/
 *.o
 *.a
 *.so

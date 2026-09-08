@@ -1,9 +1,6 @@
 #include "headers.h"
 #include <errno.h>
 
-int cache_hit = 0;
-int merged = 0;
-
 static __thread char *disk_data;
 void *safe_pread(int fd, off_t offset) {
   if (!disk_data) disk_data = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
@@ -56,7 +53,6 @@ struct io_context {
 static void process_linked_callbacks(struct io_context *ctx) {
   declare_debug_timer;
 
-  size_t nb_linked = 0;
   //start_debug_timer {
     struct linked_callbacks *linked_cb;
     linked_cb = ctx->linked_callbacks;
@@ -74,9 +70,7 @@ static void process_linked_callbacks(struct io_context *ctx) {
         ctx->linked_callbacks = linked_cb;  // re-link our callback
       }
       linked_cb = next;
-      nb_linked++;
     }
-  //} stop_debug_timer(10000, "%lu linked callbacks\n", nb_linked);
 }
 
 /*
@@ -108,7 +102,6 @@ static void worker_do_io(struct io_context *ctx) {
             //        complete ios
             //        (old value written to disk)
 
-    add_time_in_payload(callback, TIMING_STAGE_IO_SUBMIT);
   }
 
   // Submit requests to the kernel
@@ -176,8 +169,7 @@ char *no_read_page_async(struct slab_callback *callback) {
 
   if (alread_used) {  // Somebody else is already prefetching the same page!
     struct linked_callbacks *linked_cb = malloc(sizeof(*linked_cb));
-    __sync_add_and_fetch(&cache_hit, 1);
-    add_cached_in_lat_ctx(callback, 1);
+
     linked_cb->callback = callback;
     linked_cb->next = ctx->linked_callbacks;
     ctx->linked_callbacks = linked_cb;  // link our callback
@@ -202,15 +194,13 @@ char *read_page_async(struct slab_callback *callback) {
                                    &disk_page, &lru_entry, s);
   callback->lru_entry = lru_entry;
   if (lru_entry->contains_data) {  // content is cached already
-    __sync_add_and_fetch(&cache_hit, 1);
-    add_cached_in_lat_ctx(callback, 1);
+
     callback->io_cb(callback);  // call the callback directly
     return disk_page;
   }
 
   if (alread_used) {  // Somebody else is already prefetching the same page!
     struct linked_callbacks *linked_cb = malloc(sizeof(*linked_cb));
-    __sync_add_and_fetch(&merged, 1);
     linked_cb->callback = callback;
     linked_cb->next = ctx->linked_callbacks;
     ctx->linked_callbacks = linked_cb;  // link our callback

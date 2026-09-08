@@ -36,7 +36,6 @@
 static int nb_workers = 0;
 static int nb_distributors = 0;
 static int nb_disks = 0;
-static int nb_workers_launched = 0;
 static int nb_workers_ready = 0;
 
 static pthread_mutex_t restructuring_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -49,18 +48,18 @@ static int restructuring_requested = 0;
 #define STALE_BATCH_SIZE 128
 struct stale_job {
   struct slab *destination;
-  uint64_t key, queued_ms;
+  uint64_t key;
 };
 /* All I/O workers produce; maintenance consumes. The mutex is held only while
  * copying jobs, never across index access. Producers drop on contention/full. */
 static struct stale_job stale_queue[STALE_QUEUE_CAPACITY];
 static size_t stale_head, stale_count;
+#ifdef STELLAR_TESTING
 static _Atomic uint64_t stale_outstanding;
+#endif
 
 uint64_t nb_totals;
-int try_fsst = 0;
 _Atomic size_t epoch;
-
 
 // static struct pagecache *pagecaches __attribute__((aligned(64)));
 int get_nb_distributors(void) { return nb_distributors; }
@@ -115,27 +114,31 @@ void stale_invalidation_enqueue(struct slab *destination, uint64_t key) {
   if (n == NULL || centree_lu_parent(n) == NULL)
     return;
   if (pthread_mutex_trylock(&restructuring_lock) != 0) {
-    RSTAT_INC(stale_dropped);
+    TEST_STAT_INC(stale_dropped);
     return;
   }
   if (stale_count == STALE_QUEUE_CAPACITY) {
-    RSTAT_INC(stale_dropped);
+    TEST_STAT_INC(stale_dropped);
   } else {
     size_t tail = (stale_head + stale_count) % STALE_QUEUE_CAPACITY;
-    stale_queue[tail] = (struct stale_job){destination, key, monotonic_ms()};
+    stale_queue[tail] = (struct stale_job){destination, key};
     stale_count++;
+#ifdef STELLAR_TESTING
     atomic_fetch_add_explicit(&stale_outstanding, 1, memory_order_relaxed);
-    RSTAT_INC(stale_queued);
-    rstat_max(&rstats.stale_queue_max, stale_count);
+#endif
+    TEST_STAT_INC(stale_queued);
+
     if (stale_count == 1)
       pthread_cond_signal(&restructuring_cond);
   }
   pthread_mutex_unlock(&restructuring_lock);
 }
 
+#ifdef STELLAR_TESTING
 uint64_t stale_invalidation_pending(void) {
   return atomic_load_explicit(&stale_outstanding, memory_order_acquire);
 }
+#endif
 
 /* maintenance_lock is held, excluding retirement, migration and history
  * rewiring. Splits can still run; they preserve the existing history chain. */
@@ -146,7 +149,6 @@ static void stale_invalidate(const struct stale_job *job) {
   unsigned char *key = (unsigned char *)&job->key;
   int valid;
 
-  rstat_max(&rstats.stale_lag_max_ms, monotonic_ms() - job->queued_ms);
   R_LOCK(&s->tree_lock);
   valid = !atomic_load_explicit(&n->removed, memory_order_acquire) &&
           !atomic_load_explicit(&s->superseded, memory_order_acquire) &&
@@ -157,7 +159,7 @@ static void stale_invalidate(const struct stale_job *job) {
   /* In particular, do not follow an anchor whose records migrated upward:
    * its parent now contains the authoritative copy, not a stale source. */
   if (!valid) {
-    RSTAT_INC(stale_skipped);
+    TEST_STAT_INC(stale_skipped);
     return;
   }
 
@@ -170,7 +172,7 @@ static void stale_invalidate(const struct stale_job *job) {
       found = subtree_set_invalid(s->subtree, key, sizeof(job->key));
       if (found) {
         __sync_fetch_and_sub(&s->nb_items, 1);
-        RSTAT_INC(stale_invalidated);
+
       }
     }
     R_UNLOCK(&s->tree_lock);
@@ -199,8 +201,10 @@ size_t stale_invalidation_drain(void) {
   for (size_t i = 0; i < count; i++)
     stale_invalidate(&batch[i]);
   tnt_maintenance_unlock();
-  RSTAT_ADD(stale_processed, count);
+  TEST_STAT_ADD(stale_processed, count);
+#ifdef STELLAR_TESTING
   atomic_fetch_sub_explicit(&stale_outstanding, count, memory_order_release);
+#endif
   return count;
 }
 
@@ -248,11 +252,11 @@ static void maybe_wake_restructuring_worker(void) {
 
 static void publish_utilization_sample(struct slab_context *ctx,
                                        uint64_t elapsed,
-                                       uint64_t wait_cycles) {
-  if (wait_cycles > elapsed)
-    wait_cycles = elapsed;
+                                       uint64_t wait_ns) {
+  if (wait_ns > elapsed)
+    wait_ns = elapsed;
   unsigned int utilization =
-      (unsigned int)((elapsed - wait_cycles) * 100LU / elapsed);
+      (unsigned int)((elapsed - wait_ns) * 100LU / elapsed);
 
   atomic_store_explicit(&ctx->utilization, utilization,
                         memory_order_relaxed);
@@ -260,7 +264,6 @@ static void publish_utilization_sample(struct slab_context *ctx,
                         memory_order_release);
   maybe_wake_restructuring_worker();
 }
-
 
 void increase_processed(struct slab_context *ctx) {
   __sync_fetch_and_add(&ctx->processed_callbacks, 1);
@@ -359,7 +362,7 @@ static int enqueue_slab_callback_try(struct slab_context *ctx,
     return 0;
   callback->action = action;
   ctx->callbacks[next % ctx->max_pending_callbacks] = callback;
-  add_time_in_payload(callback, TIMING_STAGE_REQUEST_ENQUEUED);
+
   submit_slab_buffer(ctx, next % ctx->max_pending_callbacks);
   return 1;
 }
@@ -383,14 +386,14 @@ void reins_defer(struct slab_callback *callback) {
      * reserved slot is abandoned. It stays empty on disk; recovery skips
      * empty slots. The update reference must still be released.
      */
-    RSTAT_INC(reins_or_dropped);
+
     __sync_fetch_and_sub(&callback->slab->update_ref, 1);
     slab_release_if_idle(callback->slab);
     free(callback->item);
     free(callback);
     return;
   }
-  RSTAT_INC(reins_or_deferred);
+
   ctx->reins_deferred[ctx->nb_reins_deferred++] = callback;
 }
 
@@ -408,9 +411,7 @@ static void reins_retry_deferred(struct slab_context *ctx) {
 static void enqueue_slab_callback(struct slab_context *ctx,
                                   enum slab_action action,
                                   struct slab_callback *callback) {
-  /* Stamped before the wait: get_slab_buffer() blocks while the queue is
-   * full, and that wait is part of the latency the client sees. */
-  add_time_in_payload(callback, TIMING_STAGE_REQUEST_ENQUEUED);
+
   size_t buffer_idx = get_slab_buffer(ctx);
   callback->action = action;
   ctx->callbacks[buffer_idx] = callback;
@@ -504,7 +505,7 @@ void kv_fsst_async_no_lookup(struct slab_callback *callback, struct slab *s,
 }
 
 static void complete_read_miss(struct slab_callback *callback) {
-  add_time_in_payload(callback, TIMING_STAGE_IO_COMPLETE);
+
   if (callback->cb) callback->cb(callback, NULL);
 }
 
@@ -523,7 +524,6 @@ again:
     struct slab_callback *callback =
         ctx->callbacks[ctx->processed_callbacks % ctx->max_pending_callbacks];
     enum slab_action action = callback->action;
-    add_time_in_payload(callback, TIMING_STAGE_REQUEST_DEQUEUED);
 
     index_entry_t *e = NULL;
     struct tree_entry *tree = NULL;
@@ -560,7 +560,6 @@ again:
       case READ:
         e = tnt_index_lookup(callback, callback->item);
         if (!e) {  // Item is not in DB
-          __sync_add_and_fetch(&try_fsst, 1);
           complete_read_miss(callback);
           break;
         } else {
@@ -588,15 +587,13 @@ again:
         tree = centree_lookup_and_reserve(callback->item, 
                           &callback->slab_idx, &e);
         if (!e) {
-          __sync_add_and_fetch(&try_fsst, 1);
           callback->slab = tree->slab;
-          add_time_in_payload(callback, TIMING_STAGE_STORAGE_TARGET_READY);
+
           add_item_async(callback);
           // read_item_async_from_fsst(callback);
           break;
         }
 
-        add_time_in_payload(callback, TIMING_STAGE_STORAGE_TARGET_READY);
 	callback->slab = tree->slab;
         //callback->slab = get_slab(ctx, callback->item, &callback->slab_idx, e);
 
@@ -613,7 +610,7 @@ again:
       default:
         die("Unknown action\n");
     }
-    ctx->processed_callbacks++;
+    __atomic_store_n(&ctx->processed_callbacks, ctx->processed_callbacks + 1, __ATOMIC_RELEASE);
     if (NEVER_EXCEED_QUEUE_DEPTH && io_pending(ctx->io_ctx) >= QUEUE_DEPTH)
       break;
   }
@@ -634,8 +631,6 @@ again:
 static void *worker_slab_init(void *pdata) {
   struct slab_context *ctx = pdata;
 
-  __sync_add_and_fetch(&nb_workers_launched, 1);
-
   pid_t x = syscall(__NR_gettid);
   printf("[SLAB WORKER %lu] tid %d\n", ctx->worker_id, x);
   pin_me_on(ctx->worker_id);
@@ -650,7 +645,7 @@ static void *worker_slab_init(void *pdata) {
   __sync_add_and_fetch(&nb_workers_ready, 1);
 
   /* Main loop: do IOs and process enqueued requests */
-  declare_breakdown;
+  uint64_t util_start = report_now_ns(), idle_ns = 0;
   while (1) {
     ctx->rdt++;
 
@@ -658,11 +653,11 @@ static void *worker_slab_init(void *pdata) {
       reins_retry_deferred(ctx);
     while (io_pending(ctx->io_ctx)) {
       worker_ioengine_enqueue_ios(ctx->io_ctx);
-      __1 worker_ioengine_get_completed_ios(ctx->io_ctx);
-      __2 worker_ioengine_process_completed_ios(ctx->io_ctx);
-      __3
+      worker_ioengine_get_completed_ios(ctx->io_ctx);
+      worker_ioengine_process_completed_ios(ctx->io_ctx);
     }
 
+    uint64_t idle_start = report_now_ns();
     volatile size_t pending = ctx->sent_callbacks - ctx->processed_callbacks;
     while (!pending && !io_pending(ctx->io_ctx)) {
       if (!PINNING) {
@@ -672,15 +667,16 @@ static void *worker_slab_init(void *pdata) {
       }
       pending = ctx->sent_callbacks - ctx->processed_callbacks;
     }
-    __4
+    idle_ns += report_now_ns() - idle_start;
 
     worker_dequeue_requests(ctx);
-    __5  // Process queue
 
-    show_breakdown_periodic_hook(
-        WORKER_UTILIZATION_PERIOD_MS, ctx->processed_callbacks, "io_submit",
-        "io_getevents", "io_cb", "wait", "slab_cb",
-        publish_utilization_sample(ctx, elapsed, __breakdown.evt4));
+    uint64_t now = report_now_ns();
+    if (now - util_start >= WORKER_UTILIZATION_PERIOD_MS * UINT64_C(1000000)) {
+      publish_utilization_sample(ctx, now - util_start, idle_ns);
+      util_start = now;
+      idle_ns = 0;
+    }
   }
 
   return NULL;
@@ -690,7 +686,6 @@ static void *worker_distributor_init(void *pdata) {
   struct slab_context *ctx = pdata;
 
   // ctx->fsst_idx = aligned_alloc(PAGE_SIZE, 64*PAGE_SIZE);
-  __sync_add_and_fetch(&nb_workers_launched, 1);
 
   pid_t x = syscall(__NR_gettid);
   printf("[SLAB WORKER %lu] tid %d\n", ctx->worker_id, x);
@@ -701,12 +696,13 @@ static void *worker_distributor_init(void *pdata) {
   ctx->io_ctx = worker_ioengine_init(ctx->max_pending_callbacks);
   __sync_add_and_fetch(&nb_workers_ready, 1);
 
-  declare_breakdown;
+  uint64_t util_start = report_now_ns(), idle_ns = 0;
   while (1) {
     ctx->rdt++;
     if (ctx->rdt % cfg.epoch == 0 && ctx->worker_id == 0) {
       atomic_fetch_add_explicit(&epoch, 1, memory_order_seq_cst);
     }
+    uint64_t idle_start = report_now_ns();
     volatile size_t pending = ctx->sent_callbacks - ctx->processed_callbacks;
     while (!pending) {
       if (!PINNING) {
@@ -716,17 +712,17 @@ static void *worker_distributor_init(void *pdata) {
       }
       pending = ctx->sent_callbacks - ctx->processed_callbacks;
     }
-    __4
+    idle_ns += report_now_ns() - idle_start;
 
     worker_dequeue_requests(ctx);
-    __5  // Process queue
 
-    show_breakdown_periodic_hook(
-        WORKER_UTILIZATION_PERIOD_MS, ctx->processed_callbacks, "io_submit",
-        "io_getevents", "io_cb", "wait", "slab_cb",
-        publish_utilization_sample(ctx, elapsed, __breakdown.evt4));
-    //if (ctx->worker_id == 0)
-    //    check_and_handle_tnt(__breakdown.real_start, __breakdown.evt5);
+    uint64_t now = report_now_ns();
+    if (now - util_start >= WORKER_UTILIZATION_PERIOD_MS * UINT64_C(1000000)) {
+      publish_utilization_sample(ctx, now - util_start, idle_ns);
+      util_start = now;
+      idle_ns = 0;
+    }
+
   }
 
   return NULL;
@@ -766,14 +762,10 @@ static void *worker_restructuring_init(void *pdata) {
     next_maintenance = monotonic_ms() + cfg.maintenance_period_ms;
     if (!atomic_load_explicit(&restructuring_enabled, memory_order_acquire))
       continue;
-    RSTAT_INC(worker_wakeups);
+    TEST_STAT_INC(worker_wakeups);
     int gate_ok = restructuring_utilization_thresholds_met();
-    if (gate_ok)
-      RSTAT_INC(worker_gate_open);
     if (cfg.util_gate && !gate_ok)
       continue;
-    if (cfg.with_rebal && tnt_rebalancing_needed())
-      RSTAT_INC(rebalance_needed);
 
     if (cfg.with_rebal && tnt_rebalancing_needed()) {
       int status = tnt_rebalancing();
@@ -806,8 +798,7 @@ static void *worker_restructuring_init(void *pdata) {
       int status = TNT_PRUNE_NOOP;
 
       prune_stale_measure(&m);
-      __atomic_store_n(&rstats.prune_stale_last, (uint64_t)m.stale, __ATOMIC_RELAXED);
-      __atomic_store_n(&rstats.prune_reserved_last, (uint64_t)m.reserved, __ATOMIC_RELAXED);
+
       while (prune_stale_ratio(&m) >= cfg.prune_stale_ratio) {
         status = tnt_prune_once();
         if (status != TNT_PRUNE_DONE)
@@ -817,7 +808,7 @@ static void *worker_restructuring_init(void *pdata) {
         prune_stale_measure(&m);
       }
       if (done) {
-        RSTAT_INC(prune_bursts);
+
         printf("Prune trigger: %zu prunes, stale %zu/%zu (%.1f%%)\n", done,
                m.stale, m.reserved, 100.0 * prune_stale_ratio(&m));
       }
@@ -831,91 +822,6 @@ static void *worker_restructuring_init(void *pdata) {
   }
 
   return NULL;
-}
-
-/*
- * Utilization sampler: one "#U" line per second with the two pool
- * utilizations the restructuring gate reads, the gate's verdict, the tree
- * shape and the stale-slot ratio. Started after load, runs until exit.
- */
-static void *utilization_sampler(void *pdata) {
-  struct timeval t0, now;
-  (void)pdata;
-
-  uint64_t tick_ms = 0, next_u_ms = 0, next_l_ms = 0;
-
-  gettimeofday(&t0, NULL);
-  if (cfg.latency_series_ms)
-    printf("#L t_s count avg_us p50_us p99_us p999_us max_us "
-           "rd_count rd_avg_us rd_p99_us wr_count wr_avg_us wr_p99_us "
-           "q_avg_us q_p99_us dist_avg_us dist_p99_us io_avg_us io_p99_us "
-           "desc_avg_us desc_p99_us walk_avg_us walk_p99_us "
-           "client_q_avg_us client_service_avg_us\n");
-  printf("#U t_s dist_util io_util gate rebalance_needed nodes depth stale_ratio "
-         "reins_queued reins_slabs prune_done rebalance_calls rss_mb vsz_mb "
-         "reserved_slots valid_slots migrations rebuild_mb_written "
-         "marked_entries stale_queued stale_processed stale_dropped stale_pending\n");
-  while (1) {
-    struct prune_stale m;
-
-    if (tick_ms > 0 && tick_ms % 60000 == 0) {
-      if (cfg.with_prune)
-        prune_scan_report("periodic");
-      prune_stale_distribution_report("periodic");
-    }
-    if (cfg.dump_slabs_s && tick_ms > 0 && tick_ms % (cfg.dump_slabs_s * 1000) == 0)
-      prune_dump_slabs(tick_ms / 1000.0);
-    if (cfg.latency_series_ms && tick_ms >= next_l_ms) {
-      struct timeval nowl;
-
-      gettimeofday(&nowl, NULL);
-      lat_series_report((nowl.tv_sec - t0.tv_sec) +
-                        (nowl.tv_usec - t0.tv_usec) / 1e6);
-      next_l_ms += cfg.latency_series_ms;
-    }
-    if (tick_ms < next_u_ms) {
-      usleep(100000);
-      tick_ms += 100;
-      continue;
-    }
-    next_u_ms += 1000;
-    unsigned int dist = get_distributor_utilization();
-    unsigned int io = get_io_worker_utilization();
-    int gate = dist >= DISTRIBUTOR_HIGH_UTIL && io <= IO_WORKER_LOW_UTIL;
-
-    prune_stale_measure(&m);
-    gettimeofday(&now, NULL);
-    uint64_t rss_kb, vsz_kb, hwm_kb;
-
-    process_memory_kb(&rss_kb, &vsz_kb, &hwm_kb);
-    printf("#U %.3f %u %u %d %d %lu %lu %.3f %lu %lu %lu %lu %lu %lu %zu %zu %lu %.1f %lu %lu %lu %lu %lu\n",
-           (now.tv_sec - t0.tv_sec) + (now.tv_usec - t0.tv_usec) / 1e6, dist,
-           io, gate, tnt_rebalancing_needed() ? 1 : 0, tnt_get_node_count(),
-           tnt_get_depth(), prune_stale_ratio(&m),
-           __atomic_load_n(&rstats.reins_queued, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.reins_slabs, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.prune_done, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.rebalance_calls, __ATOMIC_RELAXED),
-           rss_kb / 1024, vsz_kb / 1024, m.reserved, m.valid,
-           __atomic_load_n(&rstats.migrations, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.rebuild_bytes_written, __ATOMIC_RELAXED) / 1e6,
-           subtree_marked_total(),
-           __atomic_load_n(&rstats.stale_queued, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.stale_processed, __ATOMIC_RELAXED),
-           __atomic_load_n(&rstats.stale_dropped, __ATOMIC_RELAXED),
-           stale_invalidation_pending());
-    fflush(stdout);
-    usleep(100000);
-    tick_ms += 100;
-  }
-  return NULL;
-}
-
-void utilization_sampler_init(void) {
-  pthread_t thread;
-
-  if (pthread_create(&thread, NULL, utilization_sampler, NULL) == 0)
-    pthread_detach(thread);
 }
 
 static int maintenance_worker_start(void) {
@@ -1022,7 +928,6 @@ if ((already = filter_contain(s->filter, (unsigned char *)&key))) {
 /* Returns one past the highest occupied slot in the chunk, or 0 if none. */
 size_t process_existing_chunk(struct slab *s, char *data, size_t start,
                               size_t length, struct slab_callback *cb) {
-  static __thread declare_periodic_count;
   size_t nb_items_per_page = PAGE_SIZE / s->item_size;
   size_t nb_pages = length / PAGE_SIZE;
   size_t highest = 0;
@@ -1037,8 +942,6 @@ size_t process_existing_chunk(struct slab *s, char *data, size_t start,
         highest = base_idx + 1;
       base_idx++;
       current += s->item_size;
-      periodic_count(
-          1000, "[REBUILD WORKER] Init - Recovered %lu items", s->nb_items);
     }
   }
   return highest;
@@ -1289,7 +1192,6 @@ static void *worker_rebuild_init(void *pdata) {
       break;
   }
 
-
   free(cached_key);
   __sync_add_and_fetch(&rebuild_ready, 1);
 
@@ -1386,7 +1288,7 @@ void slab_workers_init(int _nb_disks, int nb_workers_per_disk,
 }
 
 size_t get_database_size(void) {
-  return nb_totals;
+  return __atomic_load_n(&nb_totals, __ATOMIC_ACQUIRE);
 }
 
 void flush_batched_load(void) {
@@ -1412,4 +1314,13 @@ void flush_batched_load(void) {
     if (!s->batched_callbacks)
       free(s->batched_callbacks);
   } while (victim);
+}
+
+/* Injectors have stopped submitting before this is called. A release/acquire
+ * pair also publishes their final load batches before the main thread flushes. */
+void slab_workers_drain_distributors(void) {
+  for (int i = 0; i < nb_distributors; i++)
+    while (__atomic_load_n(&slab_contexts[i].processed_callbacks, __ATOMIC_ACQUIRE) !=
+           __atomic_load_n(&slab_contexts[i].sent_callbacks, __ATOMIC_ACQUIRE))
+      usleep(100);
 }

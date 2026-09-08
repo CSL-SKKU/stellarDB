@@ -87,9 +87,10 @@ void init_default_config(struct runtime_config *cfg) {
     cfg->with_rebal      = 0;
     cfg->rebalance_threshold = REBALANCE_THRESHOLD;
     cfg->util_gate       = 0;
-    cfg->latency_series_ms = 0;
+    cfg->report_out = NULL;
+    cfg->config_report = NULL;
+    cfg->timeseries_s = 0;
     cfg->churn_upd = 50; cfg->churn_ins = 25; cfg->churn_del = 25;
-    cfg->dump_slabs_s = 0;
     cfg->migrate_th = 0.0;
     cfg->reins_sample    = 16;
     cfg->with_prune      = 0;

@@ -68,13 +68,10 @@ static int random_get_put(int test) {
 static void _launch_locality(int total, int nb_requests, double dist_a,
                             double dist_b, int range_num, double range_a,
                             double range_b, double range_c, double range_d) {
-  declare_periodic_count;
+
   unsigned char prefix_model = 0, random_model = 0;
   int query_type;
   //void *rand_var;
-  int query_count_get = 0;
-  int query_count_put = 0;
-  int query_count_scan = 0;
 
   if (range_a != 0.0 || range_b != 0.0 || range_c != 0.0 || range_d != 0.0) {
     prefix_model = 1;
@@ -108,34 +105,34 @@ static void _launch_locality(int total, int nb_requests, double dist_a,
     //query_type = query_get_type(query, rand_v);
     query_type = random_get_put(2);
 
-    
     if (query_type == 0) {
       struct slab_callback *cb = bench_cb();
       cb->item = _create_unique_item_locality(key_rand);
-      query_count_get++;
-      kv_read_async(cb);
+
+      bench_read(cb);
     } else if (query_type == 1) {
       struct slab_callback *cb = bench_cb();
       cb->item = _create_unique_item_locality(key_rand);
-      query_count_put++;
-      kv_upsert_async(cb);
+
+      bench_upsert(cb);
     } else if (query_type == 2) {
       int scan_len_max = 10000;
       int64_t scan_length =
         ParetoCdfInversion(u, 0.0, 2.517,
                            14.236) % scan_len_max;
       /*std::cout << "scan len: " << scan_length << "\n";*/
+      bench_group_begin(scan_length);
       for (size_t j = 0; j < scan_length; j++) {
         struct slab_callback *cb = bench_cb();
         cb->item = _create_unique_item_locality(key_rand+j);
-        kv_read_async(cb);
+        bench_read(cb);
       }
-      query_count_scan++;
+      bench_group_end();
+
     }
-    periodic_count(1000, "LOCALITY Load Injector (%lu%%)",
-                   i * 100LU / nb_requests);
+
   }
-  printf("LOCALITY: %d updates, %d lookups, %d scans\n", query_count_put, query_count_get, query_count_scan);
+
 }
 
 /* Generic interface */

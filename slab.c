@@ -13,8 +13,8 @@ extern int print;
 extern int load;
 extern uint64_t nb_totals;
 
-
 static int create_sequence = 0;
+#ifdef STELLAR_TESTING
 static _Atomic(slab_split_test_hook_t) split_midpoint_test_hook;
 
 void slab_set_split_midpoint_test_hook(slab_split_test_hook_t hook) {
@@ -29,6 +29,8 @@ static void run_split_midpoint_test_hook(struct slab *parent) {
   if (hook != NULL)
     hook(parent);
 }
+
+#endif
 
 /*
  * Where is my item in the slab?
@@ -77,7 +79,7 @@ void reins_on_read_consider(struct slab_callback *callback,
   struct tree_entry *tree;
   index_entry_t *cur, *e = NULL;
 
-  RSTAT_INC(reins_or_seen);
+  TEST_STAT_INC(reins_or_seen);
   if (!callback->page_was_hot)
     return;
   /* upward_len includes the leaf; the threshold counts parent hops. */
@@ -87,7 +89,7 @@ void reins_on_read_consider(struct slab_callback *callback,
     return;
   if (item_is_empty(meta))
     return;
-  RSTAT_INC(reins_or_deep);
+  TEST_STAT_INC(reins_or_deep);
   if (cfg.reins_sample > 1) {
     static __thread uint64_t x = 0x9E3779B97F4A7C15ULL;
 
@@ -102,7 +104,8 @@ void reins_on_read_consider(struct slab_callback *callback,
     die("reins_on_read: out of memory\n");
   memcpy(cb->item, meta, s->item_size);
   cb->fsst_idx = -1;
-  RSTAT_INC(reins_examined);
+  TEST_STAT_INC(reins_examined);
+  report_event(REPORT_REINSERTION);
 
   /* Authority: the copy we hold must be what a READ returns right now. */
   cur = tnt_index_lookup(cb, cb->item);
@@ -131,7 +134,7 @@ void reins_on_read_consider(struct slab_callback *callback,
   cb->cb_cb = reins_or_free;
   cb->io_cb = add_item_async_cb1;
   cb->lru_entry = NULL;
-  RSTAT_INC(reins_issued);
+  TEST_STAT_INC(reins_issued);
   cb->io_cb(cb); /* split check, then the (non-blocking) enqueue */
   return;
 skip:
@@ -383,6 +386,7 @@ void slab_set_create_sequence(uint64_t next) {
   __sync_lock_test_and_set(&create_sequence, (int)next);
 }
 
+#ifdef STELLAR_TESTING
 static enum slab_crash_point crash_point;
 
 void slab_set_crash_point(enum slab_crash_point point) { crash_point = point; }
@@ -393,6 +397,7 @@ void slab_maybe_crash(enum slab_crash_point point) {
     _exit(42);
   }
 }
+#endif
 
 /*
  * Slabs are never resized: the header sits in the last page, reinsertion's
@@ -573,7 +578,7 @@ struct slab *close_and_create_slab(struct slab *s) {
   uint64_t range_max;
 
   tnt_split_phase_enter();
-  RSTAT_INC(splits);
+
   R_LOCK(&s->tree_lock);
   range_min = __atomic_load_n(&s->min, __ATOMIC_ACQUIRE);
   range_max = __atomic_load_n(&s->max, __ATOMIC_ACQUIRE);
@@ -617,7 +622,9 @@ struct slab *close_and_create_slab(struct slab *s) {
   }
 
   add_split_child(left, new_key - 1);
+#ifdef STELLAR_TESTING
   run_split_midpoint_test_hook(s);
+#endif
   add_split_child(right, new_key + 1);
   wakeup_subtree_get(s->centree_node);
   tnt_split_phase_exit();
@@ -651,8 +658,7 @@ void read_item_async_cb(struct slab_callback *callback) {
   cur = __sync_sub_and_fetch(&s->read_ref, 1);
   (void)cur;
   slab_release_if_idle(s);
-  
-  add_time_in_payload(callback, TIMING_STAGE_IO_COMPLETE);
+
   struct item_metadata *meta =
       (struct item_metadata *)&disk_page[in_page_offset];
   if (item_is_legacy(meta))
@@ -699,8 +705,15 @@ void upsert_item_async_cb2(struct slab_callback *callback) {
 
   if(callback->cb != add_in_tree_for_upsert
     && callback->cb != add_in_tree_for_reinsertion
-    && callback->cb != add_in_tree)
+    && callback->cb != add_in_tree) {
+    if (report_entry_classes()) {
+      W_LOCK(&callback->slab->tree_lock);
+      subtree_report_record(callback->slab->subtree, key, callback->slab_idx,
+                            item_is_tombstone(meta2));
+      W_UNLOCK(&callback->slab->tree_lock);
+    }
     __sync_fetch_and_sub(&callback->slab->update_ref, 1);
+  }
 
   //if (load == 0)
   //  printf("A,%lu,%lu,%lu\n", key, callback->slab->seq, callback->slab_idx/4096);
@@ -817,7 +830,6 @@ void add_item_async_cb1(struct slab_callback *callback) {
 void add_item_async(struct slab_callback *callback) {
   if (callback->cb != add_in_tree) {
     if (callback->cb == NULL) {
-      printf("testestest WHAT?\n");
       callback->cb = add_in_tree;
     } else {
       callback->cb_cb = callback->cb;  // computes_stat
@@ -946,7 +958,6 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   int alrdy = 0, was_invalid = 0;
   index_entry_t *e = NULL;
 
-  add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
   atomic_fetch_add_explicit(&s->nb_writes, 1, memory_order_relaxed);
   W_LOCK(&s->tree_lock);
     // CASE 2에서 여러 쓰레드가 여기 도달 가능.
@@ -972,8 +983,6 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
   }
 
   tnt_index_add(cb, item);
-  if (item_is_tombstone(meta))
-    atomic_fetch_add_explicit(&s->nb_tombstones, 1, memory_order_relaxed);
 
   if (!alrdy) {
     __sync_fetch_and_add(&nb_totals, 1);
@@ -995,12 +1004,9 @@ void add_in_tree_for_upsert(struct slab_callback *cb, void *item) {
 
   W_UNLOCK(&s->tree_lock);
 
-  add_time_in_payload(cb, TIMING_STAGE_NEW_INDEX_PUBLISHED);
-
   /* The job owns just a stable slab descriptor and a copied key. It does not
    * retain the callback, item buffer, or the write's update reference. */
   stale_invalidation_enqueue(s, key);
-  add_time_in_payload(cb, TIMING_STAGE_INVALIDATION_QUEUED);
 
 skip:
   __sync_fetch_and_sub(&s->update_ref, 1);
@@ -1021,8 +1027,6 @@ void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item) {
   index_entry_t *e;
   int source_ok = 0, removed = 0;
 
-  add_time_in_payload(cb, TIMING_STAGE_IO_COMPLETE);
-
   /*
    * The copy is only worth publishing if the record it was taken from is still
    * the authoritative one. A client write that completed since invalidated
@@ -1039,7 +1043,7 @@ void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item) {
   R_UNLOCK(&old_s->tree_lock);
   if (!source_ok) {
     __sync_fetch_and_sub(&s->nb_items, 1);
-    RSTAT_INC(reins_abandoned);
+
     goto skip;
   }
 
@@ -1053,16 +1057,14 @@ void add_in_tree_for_reinsertion(struct slab_callback *cb, void *item) {
   if (tnt_index_lookup_utree(s->subtree, item) != NULL) {
     __sync_fetch_and_sub(&s->nb_items, 1);
     W_UNLOCK(&s->tree_lock);
-    RSTAT_INC(reins_abandoned);
+
     goto skip;
   }
   tnt_index_add_shy(cb, item);
-  RSTAT_INC(reins_published);
+  TEST_STAT_INC(reins_published);
   __sync_fetch_and_add(&nb_totals, 1);
   slab_widen_range(s, key);
   W_UNLOCK(&s->tree_lock);
-
-  add_time_in_payload(cb, TIMING_STAGE_NEW_INDEX_PUBLISHED);
 
   /* Destination published: the source copy is now the older one. */
   R_LOCK(&old_s->tree_lock);
@@ -1099,4 +1101,15 @@ void remove_and_add_item_async(struct slab_callback *callback) {
   }
   callback->lru_entry = NULL;
   callback->io_cb(callback);
+}
+
+void add_in_tree(struct slab_callback *cb, void *item) {
+  int release = cb->cb_cb == NULL;
+  /* New keys and moving updates are indistinguishable without a history
+   * search. Both need the same destination publication and conflict rules. */
+  add_in_tree_for_upsert(cb, item);
+  if (release) {
+    free(cb->item);
+    free(cb);
+  }
 }

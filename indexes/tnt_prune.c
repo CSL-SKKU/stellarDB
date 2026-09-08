@@ -35,21 +35,6 @@
 #include <time.h>
 #include <stdbool.h>
 
-/* Per-prune phase timing, printed after the "Prune:" line. */
-struct prune_timing {
-  uint64_t scan, drain, snap_cold, copy_cold, flush_cold, freeze, copy_leaf,
-      finish, headers, splice, retire;
-  uint64_t preads, cold_entries, leaf_entries, tombstones_dropped;
-};
-static struct prune_timing pt;
-
-static uint64_t now_us(void) {
-  struct timespec ts;
-
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
-}
-
 /*
  * Pipelined page reads for the merge. One synchronous 4 KiB read per touched
  * page was the pruner's whole cost under load: each read waited its turn
@@ -113,8 +98,6 @@ static int prune_read_pages(int fd, const size_t *pages, size_t nb, char *buf) {
       sent += r;
     }
     inflight += (size_t)tosend;
-    if (tosend)
-      pt.preads++;
     if (inflight == 0)
       break;
     {
@@ -196,19 +179,8 @@ enum prune_reject {
   PRUNE_NO_FIT,
   PRUNE_NB_REASONS
 };
-static const char *prune_reject_name[PRUNE_NB_REASONS] = {
-  "ok", "no_inner", "no_outer", "not_history_child", "same_side",
-  "no_sib_star", "internal_splitting", "leaf_splitting", "retired",
-  "leaf_full", "no_fit"
-};
-
-/*
- * `overflow` (may be NULL) receives, for PRUNE_NO_FIT, how many slots the
- * triple's valid entries exceed one slab by: the distance to prunability.
- */
 static enum prune_reject prune_select_why(centree_node leaf,
-                                          struct prune_candidate *out,
-                                          size_t *overflow) {
+                                          struct prune_candidate *out) {
   centree_node inner, outer, sib, star;
   struct slab *ls, *is, *os;
   size_t cold_bound;
@@ -233,14 +205,6 @@ static enum prune_reject prune_select_why(centree_node leaf,
 
   /* Opposite sides: only then is the triple consecutive in-order. */
   if (outer->lu_child[!side] != inner) {
-    if (overflow) {
-      /* Diagnostic only: would the three fit, adjacency aside? */
-      struct slab *ls_ = leaf->value.slab, *is_ = inner->value.slab,
-                  *os_ = outer->value.slab;
-      size_t need = is_->nb_items + os_->nb_items + ls_->nb_items;
-
-      *overflow = need > ls_->nb_max_items ? need - ls_->nb_max_items : 0;
-    }
     return PRUNE_SAME_SIDE;
   }
 
@@ -276,8 +240,6 @@ static enum prune_reject prune_select_why(centree_node leaf,
    */
   cold_bound = is->nb_items + os->nb_items;
   if (cold_bound + ls->nb_items > ls->nb_max_items) {
-    if (overflow)
-      *overflow = cold_bound + ls->nb_items - ls->nb_max_items;
     return PRUNE_NO_FIT;
   }
 
@@ -293,7 +255,7 @@ static enum prune_reject prune_select_why(centree_node leaf,
 }
 
 bool prune_select(centree_node leaf, struct prune_candidate *out) {
-  return prune_select_why(leaf, out, NULL) == PRUNE_OK;
+  return prune_select_why(leaf, out) == PRUNE_OK;
 }
 
 /*
@@ -376,12 +338,6 @@ bool prune_scan_for_candidate(struct prune_candidate *out) {
         found = true;
       }
     }
-    if (found) {
-      if (best_hot == 0)
-        RSTAT_INC(prune_cold_picks);
-      else
-        RSTAT_INC(prune_hot_picks);
-    }
   }
 
   free(leaves);
@@ -412,57 +368,7 @@ void prune_mark_writes(void) {
   free(leaves);
 }
 
-/*
- * Diagnostic: one full scan, every leaf classified. Answers "was there ever a
- * candidate, and if not, what stopped the closest triple". Nothing mutates.
- */
-void prune_scan_report(const char *phase) {
-  centree tree = tnt_centree();
-  struct prune_candidate candidate;
-  centree_node *leaves;
-  size_t capacity, nb = 0, hist[PRUNE_NB_REASONS] = {0};
-  size_t overflow, min_overflow = (size_t)-1, nb_max = 0, same_side_fits = 0;
-
-  if (tree == NULL)
-    return;
-  capacity =
-      atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
-  leaves = malloc(capacity * sizeof(*leaves));
-  if (leaves == NULL)
-    return;
-
-  centree_read_in(tree);
-  collect_leaves(tree, centree_read_root(tree), leaves, capacity, &nb);
-  centree_read_out(tree);
-
-  for (size_t i = 0; i < nb; i++) {
-    overflow = (size_t)-1;
-    enum prune_reject why = prune_select_why(leaves[i], &candidate, &overflow);
-    hist[why]++;
-    if (why == PRUNE_SAME_SIDE && overflow == 0)
-      same_side_fits++;
-    if (why == PRUNE_NO_FIT && overflow < min_overflow) {
-      min_overflow = overflow;
-      nb_max = leaves[i]->value.slab->nb_max_items;
-    }
-  }
-  free(leaves);
-
-  printf("#R %s prune-scan: leaves=%zu candidates=%zu", phase, nb, hist[PRUNE_OK]);
-  for (int r = 1; r < PRUNE_NB_REASONS; r++)
-    printf(" %s=%zu", prune_reject_name[r], hist[r]);
-  if (hist[PRUNE_NO_FIT])
-    printf(" closest_overflow_slots=%zu slab_slots=%zu", min_overflow, nb_max);
-  printf(" same_side_would_fit=%zu\n", same_side_fits);
-}
-
-/*
- * Diagnostic: where do the stale slots live? For every node (leaf and
- * internal separately): stale fraction per slab, a histogram by decile, the
- * share of all stale slots that sit in slabs above 50/80/90% stale, and how
- * the stale-heavy slabs line up along history (parent also stale-heavy, and
- * the longest such chain). Nothing mutates.
- */
+/* Shared traversal for maintenance candidate selection. */
 static void collect_nodes(centree tree, centree_node n, centree_node *out,
                           size_t capacity, size_t *nb) {
   if (n == NULL)
@@ -471,125 +377,6 @@ static void collect_nodes(centree tree, centree_node n, centree_node *out,
     out[(*nb)++] = n;
   collect_nodes(tree, centree_read_left(tree, n), out, capacity, nb);
   collect_nodes(tree, centree_read_right(tree, n), out, capacity, nb);
-}
-
-static double node_stale_frac(centree_node n, size_t *reserved_out,
-                              size_t *stale_out) {
-  struct slab *s = n->value.slab;
-  size_t reserved = atomic_load_explicit(&s->last_item, memory_order_acquire);
-  size_t valid = s->nb_items;
-
-  if (reserved > s->nb_max_items) reserved = s->nb_max_items;
-  if (valid > reserved) valid = reserved;
-  *reserved_out = reserved;
-  *stale_out = reserved - valid;
-  return reserved ? (double)(reserved - valid) / reserved : 0.0;
-}
-
-void prune_stale_distribution_report(const char *phase) {
-  centree tree = tnt_centree();
-  centree_node *nodes;
-  size_t capacity, nb = 0;
-  /* [0] internal, [1] leaf */
-  size_t cnt[2] = {0}, hist[2][10] = {{0}}, stale_tot[2] = {0}, res_tot[2] = {0};
-  size_t stale_ge50[2] = {0}, stale_ge80[2] = {0}, stale_ge90[2] = {0};
-  size_t slabs_ge50[2] = {0}, slabs_ge80[2] = {0}, slabs_ge90[2] = {0};
-  size_t pairs50 = 0, heavy50 = 0, longest = 0;
-
-  if (tree == NULL)
-    return;
-  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
-  nodes = malloc(capacity * sizeof(*nodes));
-  if (nodes == NULL)
-    return;
-  centree_read_in(tree);
-  collect_nodes(tree, centree_read_root(tree), nodes, capacity, &nb);
-  centree_read_out(tree);
-
-  for (size_t i = 0; i < nb; i++) {
-    size_t reserved, stale;
-    double f = node_stale_frac(nodes[i], &reserved, &stale);
-    int k = child_flag(nodes[i]) == 1 ? 0 : 1;
-    int b = (int)(f * 10); if (b > 9) b = 9;
-
-    cnt[k]++; hist[k][b]++; stale_tot[k] += stale; res_tot[k] += reserved;
-    if (f >= 0.5) { slabs_ge50[k]++; stale_ge50[k] += stale; }
-    if (f >= 0.8) { slabs_ge80[k]++; stale_ge80[k] += stale; }
-    if (f >= 0.9) { slabs_ge90[k]++; stale_ge90[k] += stale; }
-    if (k == 0 && f >= 0.5) {
-      /* history adjacency among stale-heavy internal nodes */
-      centree_node p = centree_lu_parent(nodes[i]);
-      size_t chain = 1, r2, s2;
-
-      heavy50++;
-      if (p && node_stale_frac(p, &r2, &s2) >= 0.5)
-        pairs50++;
-      while (p && node_stale_frac(p, &r2, &s2) >= 0.5) {
-        chain++;
-        p = centree_lu_parent(p);
-      }
-      if (chain > longest) longest = chain;
-    }
-  }
-  free(nodes);
-
-  for (int k = 0; k < 2; k++) {
-    const char *kind = k ? "leaf" : "internal";
-    double tot = stale_tot[k] ? (double)stale_tot[k] : 1.0;
-
-    printf("#R %s stale-dist %s: slabs=%zu reserved=%zu stale=%zu (%.1f%%) "
-           "hist_decile=%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu,%zu "
-           "ge50: slabs=%zu stale_share=%.1f%% ge80: slabs=%zu stale_share=%.1f%% "
-           "ge90: slabs=%zu stale_share=%.1f%%\n",
-           phase, kind, cnt[k], res_tot[k], stale_tot[k],
-           res_tot[k] ? 100.0 * stale_tot[k] / res_tot[k] : 0.0,
-           hist[k][0], hist[k][1], hist[k][2], hist[k][3], hist[k][4],
-           hist[k][5], hist[k][6], hist[k][7], hist[k][8], hist[k][9],
-           slabs_ge50[k], 100.0 * stale_ge50[k] / tot,
-           slabs_ge80[k], 100.0 * stale_ge80[k] / tot,
-           slabs_ge90[k], 100.0 * stale_ge90[k] / tot);
-  }
-  printf("#R %s stale-adjacency: internal_ge50=%zu with_parent_ge50=%zu "
-         "longest_ge50_chain=%zu\n", phase, heavy50, pairs50, longest);
-}
-
-/*
- * Heavy monitoring (--dump-slabs): one line per node.
- *   #S <t_s> seq kind hist_parent_seq level pivot min max reserved valid stale tombstones
- * kind: I internal, L leaf. min/max are the slab's own stored key range.
- */
-void prune_dump_slabs(double t_s) {
-  centree tree = tnt_centree();
-  centree_node *nodes;
-  size_t capacity, nb = 0;
-
-  if (tree == NULL)
-    return;
-  capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
-  nodes = malloc(capacity * sizeof(*nodes));
-  if (nodes == NULL)
-    return;
-  centree_read_in(tree);
-  collect_nodes(tree, centree_read_root(tree), nodes, capacity, &nb);
-  centree_read_out(tree);
-  printf("#S t_s seq kind parent level pivot min max reserved valid stale tombstones (%zu nodes)\n", nb);
-  for (size_t i = 0; i < nb; i++) {
-    centree_node n = nodes[i], p = centree_lu_parent(n);
-    struct slab *s = n->value.slab;
-    size_t reserved = atomic_load_explicit(&s->last_item, memory_order_acquire);
-    size_t valid = s->nb_items;
-
-    if (reserved > s->nb_max_items) reserved = s->nb_max_items;
-    if (valid > reserved) valid = reserved;
-    printf("#S %.0f %lu %c %lu %lu %lu %lu %lu %zu %zu %zu %zu\n", t_s, s->seq,
-           child_flag(n) == 1 ? 'I' : 'L', p ? p->value.slab->seq : 0,
-           (unsigned long)atomic_load_explicit(&n->value.level, memory_order_relaxed),
-           (unsigned long)centree_pivot_load(n), (unsigned long)s->min,
-           (unsigned long)s->max, reserved, valid, reserved - valid,
-           atomic_load_explicit(&s->nb_tombstones, memory_order_relaxed));
-  }
-  fflush(stdout);
-  free(nodes);
 }
 
 /* ===================================================================== *
@@ -634,7 +421,7 @@ static void rebuild_swap(centree_node n, struct slab *old, struct slab *fresh) {
   atomic_store_explicit(&old->superseded, 1, memory_order_seq_cst);
   /* Waits for readers inside the old slab's lock, then frees its index. */
   slab_retire(old);
-  RSTAT_ADD(rebuild_index_freed, old->nb_items);
+
 }
 
 static size_t slab_valid(struct slab *s) { return s->nb_items; }
@@ -648,7 +435,6 @@ static int rebuild_node(centree_node n, centree_node *srcs, int nsrc,
                         uint64_t child_replace, uint64_t child_with,
                         struct slab **fresh_out) {
   struct prune_build b;
-  struct slab *old = n->value.slab;
   size_t entries = 0;
   int error;
 
@@ -688,9 +474,7 @@ static int rebuild_node(centree_node n, centree_node *srcs, int nsrc,
     prune_build_discard(&b);
     return -EIO;
   }
-  RSTAT_ADD(rebuild_entries_dropped, entries > b.count ? entries - b.count : 0);
-  RSTAT_ADD(rebuild_bytes_written, (uint64_t)pages_for_capacity(&b) * PAGE_SIZE);
-  RSTAT_ADD(rebuild_bytes_read, entries * (uint64_t)old->item_size); /* records copied; page reads are batched */
+
   *fresh_out = b.slab;
   prune_build_release_buffer(&b);
   return 0;
@@ -744,7 +528,7 @@ int tnt_migrate_up(centree_node child) {
   rebuild_swap(parent, old_p, fresh_p);
   rebuild_swap(child, old_c, fresh_c);
   tnt_maintenance_unlock();
-  RSTAT_INC(migrations);
+  report_event(REPORT_MIGRATION);
   printf("Migrate: %lu -> %lu (parent %lu -> %lu, %zu valid)\n", old_c->seq,
          fresh_c->seq, old_p->seq, fresh_p->seq, fresh_p->nb_items);
   return TNT_MIGRATE_DONE;
@@ -765,9 +549,9 @@ int tnt_migrate_once(void) {
 
   if (tree == NULL)
     return -EINVAL;
-  RSTAT_INC(migrate_calls);
+
   if (cfg.migrate_th <= 0) {
-    RSTAT_INC(migrate_noop);
+
     return TNT_MIGRATE_NOOP;
   }
   capacity = atomic_load_explicit(&tree->node_count, memory_order_acquire) + 8;
@@ -804,13 +588,10 @@ int tnt_migrate_once(void) {
   }
   free(nodes);
   if (best == NULL) {
-    RSTAT_INC(migrate_noop);
+
     return TNT_MIGRATE_NOOP;
   }
   status = tnt_migrate_up(best);
-  if (status < 0 && status != -ENOSPC && status != -EAGAIN &&
-      status != -EBUSY && status != -ECANCELED)
-    RSTAT_INC(migrate_failed);
   return status;
 }
 
@@ -1165,6 +946,7 @@ static void build_unstage(struct prune_build *b, uint64_t key, size_t dst) {
       subtree_insert_shy(n->subtree, (unsigned char *)&mkey, sizeof(mkey), &e);
     else
       subtree_insert(n->subtree, (unsigned char *)&mkey, sizeof(mkey), &e);
+    subtree_report_record(n->subtree, mkey, dst, item_is_tombstone((struct item_metadata *)to));
     mark_dirty(b, dst);
   }
   memset(slot_in_buffer(b, last), 0, n->item_size);
@@ -1197,7 +979,6 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
    * snapshot is copied anyway; it lands in N as a stale entry, shadowed by
    * the newer copy nearer the leaf (§7).
    */
-  uint64_t t0 = now_us();
   R_LOCK(&src->tree_lock);
   if (retired(source) ||
       atomic_load_explicit(&src->superseded, memory_order_acquire)) {
@@ -1214,12 +995,6 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
 
   /* Slot order, so each source page is read at most once. */
   qsort(snap.entries, snap.nb, sizeof(*snap.entries), compare_by_slot);
-  if (override) {
-    pt.leaf_entries += snap.nb;
-  } else {
-    pt.snap_cold += now_us() - t0;
-    pt.cold_entries += snap.nb;
-  }
   if (snap.nb == 0)
     goto out;
 
@@ -1322,7 +1097,6 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
         if (error)
           goto out;
       }
-      pt.tombstones_dropped++;
       continue;
     }
 
@@ -1340,6 +1114,7 @@ int prune_build_add_source(struct prune_build *b, centree_node source,
       slab_widen_range(n, key);
       b->count++;
     }
+    subtree_report_record(n->subtree, key, dst, item_is_tombstone((struct item_metadata *)record));
   }
 
 out:
@@ -1522,28 +1297,20 @@ int prune_freeze_and_link(const struct prune_candidate *c,
    * slot is reserved, not when its write lands. Wait for that before taking
    * their snapshot, exactly as the freeze waits for the leaf.
    */
-  uint64_t t = now_us();
   slab_drain_updates(c->inner->value.slab);
   slab_drain_updates(c->outer->value.slab);
-  pt.drain += now_us() - t;
-  t = now_us();
   error = prune_build_add_source(b, c->inner, 0);
   if (!error)
     error = prune_build_add_source(b, c->outer, 0);
-  pt.copy_cold += now_us() - t;
   /* Get the cold pages onto the device before the freeze window opens. */
-  t = now_us();
   if (!error)
     error = prune_build_flush(b);
-  pt.flush_cold += now_us() - t;
   if (error) {
     prune_build_discard(b);
     return error;
   }
 
-  t = now_us();
   frozen = slab_freeze(leaf_slab, b->capacity - b->count);
-  pt.freeze += now_us() - t;
   if (frozen < 0) {
     prune_build_discard(b);
     return (int)frozen;
@@ -1556,20 +1323,15 @@ int prune_freeze_and_link(const struct prune_candidate *c,
    * and supersedes one of them -- and such an entry is copied into N anyway,
    * shadowed by the newer copy nearer the leaf.
    */
-  t = now_us();
   error = prune_build_add_source(b, c->leaf, 1);
-  pt.copy_leaf += now_us() - t;
-  t = now_us();
   if (!error)
     error = prune_build_finish(b);
-  pt.finish += now_us() - t;
   if (error)
     die("Pruning could not finish the merged slab after freezing slab %lu "
         "(%d); the frozen leaf has no way back\n",
         leaf_slab->seq, error);
 
   prune_link_history(c, b->node);
-  t = now_us();
 
   /*
    * Durable commit. N's header names its history children and carries Q's
@@ -1589,7 +1351,6 @@ int prune_freeze_and_link(const struct prune_candidate *c,
     die("Pruning cannot make slab %lu the history root\n", b->slab->seq);
   }
   slab_maybe_crash(CRASH_PRUNE_AFTER_COMMIT);
-  pt.headers += now_us() - t;
   return 0;
 }
 
@@ -1711,34 +1472,17 @@ uint64_t prune_bad_slot_count(void) {
   return __sync_fetch_and_or(&prune_bad_slots, 0);
 }
 
-static int tnt_prune_once_timed(void);
+static int tnt_prune_once_impl(void);
 
 int tnt_prune_once(void) {
-  struct timeval t0, t1;
-  uint64_t us;
-  int status;
-
-  RSTAT_INC(prune_calls);
-  gettimeofday(&t0, NULL);
-  status = tnt_prune_once_timed();
-  gettimeofday(&t1, NULL);
-  us = (uint64_t)(t1.tv_sec - t0.tv_sec) * 1000000 +
-       (uint64_t)(t1.tv_usec - t0.tv_usec);
-  if (status == TNT_PRUNE_DONE) {
-    RSTAT_INC(prune_done);
-    RSTAT_ADD(prune_us, us);
-    rstat_max(&rstats.prune_max_us, us);
-  } else if (status == TNT_PRUNE_NOOP) {
-    RSTAT_INC(prune_noop);
-  } else if (status == -EAGAIN || status == -EBUSY || status == -ENOSPC) {
-    RSTAT_INC(prune_dropped);
-  } else {
-    RSTAT_INC(prune_failed);
-  }
+  TEST_STAT_INC(prune_calls);
+  int status = tnt_prune_once_impl();
+  if (status == TNT_PRUNE_DONE) report_event(REPORT_PRUNING);
+  else if (status == TNT_PRUNE_NOOP) TEST_STAT_INC(prune_noop);
   return status;
 }
 
-static int tnt_prune_once_timed(void) {
+static int tnt_prune_once_impl(void) {
   struct prune_candidate c;
   struct prune_build b;
   int error;
@@ -1750,22 +1494,15 @@ static int tnt_prune_once_timed(void) {
    * Selection runs under the same lock as the rest, so the candidate cannot
    * go stale between picking it and freezing its leaf.
    */
-  memset(&pt, 0, sizeof(pt));
-  uint64_t t = now_us();
   tnt_maintenance_lock();
   if (!prune_scan_for_candidate(&c)) {
     tnt_maintenance_unlock();
     return TNT_PRUNE_NOOP;
   }
-  pt.scan = now_us() - t;
   error = prune_freeze_and_link(&c, &b);
   if (!error) {
-    t = now_us();
     prune_splice_routing(&c, &b);
-    pt.splice = now_us() - t;
-    t = now_us();
     prune_retire(&c);
-    pt.retire = now_us() - t;
     prune_build_release_buffer(&b);
   }
   tnt_maintenance_unlock();
@@ -1774,15 +1511,42 @@ static int tnt_prune_once_timed(void) {
     return error;
   printf("Prune: %lu <- %lu/%lu/%lu\n", b.slab->seq, c.outer->value.slab->seq,
          c.leaf->value.slab->seq, c.inner->value.slab->seq);
-  printf("Prune timing (ms): scan=%.1f drain=%.1f snapshot=%.1f copy_cold=%.1f "
-         "flush_cold=%.1f freeze=%.1f copy_leaf=%.1f finish=%.1f headers=%.1f "
-         "splice=%.1f retire=%.1f | read_batches=%lu cold_entries=%lu "
-         "leaf_entries=%lu merged=%zu tombstones_dropped=%lu%s\n",
-         pt.scan / 1e3, pt.drain / 1e3, pt.snap_cold / 1e3,
-         (pt.copy_cold - pt.snap_cold) / 1e3, pt.flush_cold / 1e3,
-         pt.freeze / 1e3, pt.copy_leaf / 1e3, pt.finish / 1e3, pt.headers / 1e3,
-         pt.splice / 1e3, pt.retire / 1e3, pt.preads, pt.cold_entries,
-         pt.leaf_entries, b.count, pt.tombstones_dropped,
-         c.up == NULL ? " (root triple)" : "");
   return TNT_PRUNE_DONE;
+}
+
+/* Reporting visits each reachable node once. Maintenance keeps its slab from
+ * being replaced while we gather local-index snapshots. Concurrent splits and
+ * writes are allowed: gauges describe the sampling pass, not a global epoch. */
+void tnt_report_entries(uint64_t *total, uint64_t *stale, uint64_t *tombstones) {
+  *total = *stale = *tombstones = 0;
+  centree tree = tnt_centree();
+  if (!tree) return;
+  tnt_maintenance_lock();
+  size_t capacity = 64, count = 0;
+  centree_node *nodes = malloc(capacity * sizeof(*nodes));
+  if (!nodes) die("Cannot allocate report snapshot\n");
+  centree_read_in(tree);
+  centree_node root = centree_read_root(tree);
+  if (root) nodes[count++] = root;
+  for (size_t i = 0; i < count; i++) {
+    centree_node children[2] = {centree_read_left(tree, nodes[i]), centree_read_right(tree, nodes[i])};
+    for (int j = 0; j < 2; j++) if (children[j]) {
+      if (count == capacity) {
+        capacity *= 2;
+        centree_node *next = realloc(nodes, capacity * sizeof(*nodes));
+        if (!next) die("Cannot grow report snapshot\n");
+        nodes = next;
+      }
+      nodes[count++] = children[j];
+    }
+  }
+  centree_read_out(tree);
+  for (size_t i = 0; i < count; i++) {
+    struct slab *s = nodes[i]->value.slab;
+    W_LOCK(&s->tree_lock);
+    if (s->subtree) subtree_report_counts(s->subtree, total, stale, tombstones);
+    W_UNLOCK(&s->tree_lock);
+  }
+  free(nodes);
+  tnt_maintenance_unlock();
 }

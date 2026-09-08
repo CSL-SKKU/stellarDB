@@ -1,6 +1,97 @@
 #include "headers.h"
 
-extern uint64_t nb_totals;
+/* Completion ownership belongs to the harness. The engine treats payload as
+ * opaque; reporting can be disabled without losing the completion barrier. */
+struct bench_owner { uint64_t issued; _Atomic uint64_t completed; };
+struct bench_group {
+  struct bench_owner *owner;
+  uint64_t start_ns;
+  _Atomic uint64_t remaining;
+};
+struct bench_request {
+  struct slab_callback cb; /* first, so existing callbacks can free(cb) */
+  struct bench_owner *owner;
+  struct bench_group *group;
+  uint64_t start_ns;
+  int started;
+  void *data;
+};
+static __thread struct bench_owner *owner;
+static __thread struct bench_group *group;
+static void wait_owner(struct bench_owner *o) {
+  while (atomic_load_explicit(&o->completed, memory_order_acquire) != o->issued)
+    usleep(100);
+}
+static void complete_group(struct bench_group *g) {
+  if (atomic_fetch_sub_explicit(&g->remaining, 1, memory_order_acq_rel) == 1) {
+    report_request_complete(g->start_ns);
+    struct bench_owner *o = g->owner;
+    free(g);
+    atomic_fetch_add_explicit(&o->completed, 1, memory_order_release);
+  }
+}
+void bench_group_begin(uint64_t count) {
+  assert(group == NULL);
+  group = calloc(1, sizeof(*group));
+  if (!group) die("Cannot allocate scan completion\n");
+  group->owner = owner;
+  group->start_ns = report_request_start();
+  atomic_init(&group->remaining, count + 1); /* issuer's reference */
+  owner->issued++;
+}
+void bench_group_end(void) {
+  struct bench_group *g = group;
+  group = NULL;
+  complete_group(g);
+}
+struct slab_callback *bench_cb(void) {
+  struct bench_request *r = calloc(1, sizeof(*r));
+  if (!r) die("Cannot allocate benchmark request\n");
+  r->cb.cb = compute_stats;
+  r->cb.fsst_idx = -1;
+  r->group = group;
+  return &r->cb;
+}
+void bench_set_data(struct slab_callback *cb, void *data) {
+  ((struct bench_request *)cb)->data = data;
+}
+void *bench_get_data(struct slab_callback *cb) {
+  return ((struct bench_request *)cb)->data;
+}
+/* Continue an RMW after its read completes, retaining the original clock and
+ * completion owner even when another injector submits the prepared write. */
+void bench_continue(struct slab_callback *next, struct slab_callback *prev) {
+  struct bench_request *n = (struct bench_request *)next;
+  struct bench_request *p = (struct bench_request *)prev;
+  n->owner = p->owner;
+  n->start_ns = p->start_ns;
+  n->started = p->started;
+  n->group = p->group;
+}
+static void bench_start(struct slab_callback *cb, int measured) {
+  struct bench_request *r = (struct bench_request *)cb;
+  if (r->started || r->group) return;
+  r->owner = owner;
+  owner->issued++;
+  r->start_ns = measured ? report_request_start() : 0;
+  r->started = 1;
+}
+void bench_read(struct slab_callback *cb) { bench_start(cb, 1); kv_read_async(cb); }
+void bench_upsert(struct slab_callback *cb) { bench_start(cb, 1); kv_upsert_async(cb); }
+void bench_remove(struct slab_callback *cb) { bench_start(cb, 1); kv_remove_async(cb); }
+static void bench_load(struct slab_callback *cb) { bench_start(cb, 0); kv_add_async(cb); }
+void compute_stats(struct slab_callback *cb, void *item) {
+  (void)item;
+  struct bench_request *r = (struct bench_request *)cb;
+  struct bench_owner *o = r->owner;
+  struct bench_group *g = r->group;
+  if (!g) report_request_complete(r->start_ns);
+  free(cb->item);
+  free(r);
+  if (g) complete_group(g);
+  else atomic_fetch_add_explicit(&o->completed, 1, memory_order_release);
+}
+
 /*
  * Create a workload item for the database
  */
@@ -39,18 +130,8 @@ char *create_workload_item(struct workload *w) {
 /*
  * Fill the DB with missing items
  */
-void add_in_tree(struct slab_callback *cb, void *item) {
-  int release = cb->cb_cb == NULL;
-  /* New keys and moving updates are indistinguishable without a history
-   * search. Both need the same destination publication and conflict rules. */
-  add_in_tree_for_upsert(cb, item);
-  if (release) {
-    free(cb->item);
-    free(cb);
-  }
-}
-
 struct rebuild_pdata {
+  struct bench_owner completion;
   size_t id;
   size_t *pos;
   size_t start;
@@ -59,8 +140,9 @@ struct rebuild_pdata {
 };
 
 void *repopulate_db_worker(void *pdata) {
-  declare_periodic_count;
+
   struct rebuild_pdata *data = pdata;
+  owner = &data->completion;
 
   pin_me_on(get_nb_workers() + get_nb_distributors() + data->id);
 
@@ -70,16 +152,10 @@ void *repopulate_db_worker(void *pdata) {
   size_t start = data->start;
   size_t end = data->end;
   for (size_t i = start; i < end; i++) {
-    struct slab_callback *cb = malloc(sizeof(*cb));
-    cb->cb = add_in_tree;
-    cb->cb_cb = NULL;
-    cb->payload = NULL;
-    cb->fsst_slab = NULL;
-    cb->fsst_idx = -1;
+    struct slab_callback *cb = bench_cb();
     cb->item = api->create_unique_item(pos[i], w->nb_items_in_db);
-    kv_add_async(cb);
-    periodic_count(1000, "Repopulating database (%lu%%)",
-                   100LU - (end - i) * 100LU / (end - start));
+    bench_load(cb);
+
   }
 
   return NULL;
@@ -136,7 +212,7 @@ void repopulate_db(struct workload *w) {
   stop_timer("Big array of random positions");
 
   start_timer {
-    struct rebuild_pdata *pdata = malloc(w->nb_load_injectors * sizeof(*pdata));
+    struct rebuild_pdata *pdata = calloc(w->nb_load_injectors, sizeof(*pdata));
     pthread_t *threads = malloc(w->nb_load_injectors * sizeof(*threads));
     for (size_t i = 0; i < w->nb_load_injectors; i++) {
       pdata[i].id = i;
@@ -151,6 +227,11 @@ void repopulate_db(struct workload *w) {
     for (size_t i = 1; i < w->nb_load_injectors; i++)
       pthread_join(threads[i], NULL);
     free(threads);
+    slab_workers_drain_distributors();
+    extern int load;
+    load = 0;
+    flush_batched_load();
+    for (int i = 0; i < w->nb_load_injectors; i++) wait_owner(&pdata[i].completion);
     free(pdata);
   }
   stop_timer("Repopulating %lu elements (%lu req/s)", nb_inserts,
@@ -195,190 +276,12 @@ void free_callback(struct slab_callback *cb, void *item) {
   free(cb);
 }
 
-#if DEBUG
-#define SLOW_CAP 100000
-
-typedef struct {
-  uint64_t elapsed;              // 사이클 단위 경과 시간
-  struct slab_callback *cb;      // 해당 콜백
-} slow_entry_t;
-
-// min‐heap(가장 작은 elapsed가 root)
-static slow_entry_t slow_heap[SLOW_CAP];
-static size_t      slow_size = 0;
-static pthread_mutex_t slow_lock = PTHREAD_MUTEX_INITIALIZER;
-
-// 힙 연산
-static void sift_up(size_t idx) {
-  while (idx > 0) {
-    size_t parent = (idx - 1) / 2;
-    if (slow_heap[parent].elapsed <= slow_heap[idx].elapsed) break;
-    slow_entry_t tmp = slow_heap[parent];
-    slow_heap[parent] = slow_heap[idx];
-    slow_heap[idx] = tmp;
-    idx = parent;
-  }
-}
-static void sift_down(size_t idx) {
-  for (;;) {
-    size_t l = 2*idx + 1;
-    if (l >= slow_size) break;
-    size_t r = l + 1;
-    size_t smallest = (r < slow_size && slow_heap[r].elapsed < slow_heap[l].elapsed)
-                      ? r : l;
-    if (slow_heap[smallest].elapsed >= slow_heap[idx].elapsed) break;
-    slow_entry_t tmp = slow_heap[idx];
-    slow_heap[idx] = slow_heap[smallest];
-    slow_heap[smallest] = tmp;
-    idx = smallest;
-  }
-}
-
-// 새 기록을 힙에 추가 (100k 미만이거나, root보다 크면 교체)
-static unsigned char add_slow_entry(uint64_t elapsed, struct slab_callback *cb) {
-  unsigned char stored = 0;
-  pthread_mutex_lock(&slow_lock);
-  if (slow_size < SLOW_CAP) {
-    slow_heap[slow_size].elapsed = elapsed;
-    slow_heap[slow_size].cb      = cb;
-    sift_up(slow_size++);
-    stored = 1;
-  } else if (elapsed > slow_heap[0].elapsed) {
-    slow_heap[0].elapsed = elapsed;
-    slow_heap[0].cb      = cb;
-    sift_down(0);
-    stored = 1;
-  }
-  pthread_mutex_unlock(&slow_lock);
-  return stored;
-}
-static int cmp_desc(const void *a, const void *b) {
-  uint64_t ea = ((slow_entry_t*)a)->elapsed;
-  uint64_t eb = ((slow_entry_t*)b)->elapsed;
-  return (ea < eb) ? 1 : (ea > eb) ? -1 : 0;
-}
-
-void print_slow_payloads(void) {
-  pthread_mutex_lock(&slow_lock);
-  size_t n = slow_size;
-  slow_entry_t *arr = malloc(n * sizeof(*arr));
-  for (size_t i = 0; i < n; i++) arr[i] = slow_heap[i];
-  pthread_mutex_unlock(&slow_lock);
-
-  // 오래된 순으로 정렬
-  qsort(arr, n, sizeof(*arr), cmp_desc);
-
-  printf("=== TOP %zu SLOW PAYLOADS ===\n", n);
-  for (size_t i = 0; i < n; i++) {
-    struct slab_callback *cb = arr[i].cb;
-    struct item_metadata *meta = (struct item_metadata *)cb->item;
-    char *item_key = &cb->item[sizeof(*meta)];
-    uint64_t key = *(uint64_t *)item_key;
-    uint64_t start;
-    printf("[%lu] key=%lu elapsed=%lu, ", i, key, cycles_to_us(arr[i].elapsed));
-    // payload 내부 시퀀스 덤프
-    start = get_time_from_payload(cb, 0);
-
-    for (int p = 1; p < 20; p++) {
-      uint64_t t = get_time_from_payload(cb, p);
-      if (!t) break;
-      printf("%lu: %lu, ", get_origin_from_payload(cb, p), cycles_to_us(t - start));
-    }
-    printf("\n");
-    // 메모리 정리
-    if (cb->cb_cb == compute_stats || !cb->cb_cb) free(cb->item);
-    free_payload(cb);
-    free(cb);
-  }
-
-  free(arr);
-}
-#endif
-
-void compute_stats(struct slab_callback *cb, void *item) {
-  uint64_t start, end;
-  declare_debug_timer;
-  start_debug_timer {
-    start = get_time_from_payload(cb, 0);
-    add_time_in_payload(cb, TIMING_STAGE_REQUEST_COMPLETE);
-    rdtscll(end);
-    uint64_t diff = end - start;
-    add_timing_stat(diff);
-    if (cfg.latency_series_ms) {
-      lat_series_record(diff, cb->action != READ && cb->action != READ_NO_LOOKUP);
-      lat_series_record_stages(cb, end);
-    }
-
-#if DEBUG
-    unsigned char kept = add_slow_entry(diff, cb);
-#endif
-
-    /*if (DEBUG &&*/
-    /*    cycles_to_us(end - start) > 10000) {  // request took more than 10ms*/
-    /*  printf(*/
-    /*      "Request [%lu: %lu] [%lu: %lu] [%lu: %lu] [%lu: %lu] [%lu: %lu] "*/
-    /*      "[%lu: %lu] [%lu: %lu] [%lu]\n",*/
-    /*      get_origin_from_payload(cb, 1),*/
-    /*      get_time_from_payload(cb, 1) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 1) - start),*/
-    /*      get_origin_from_payload(cb, 2),*/
-    /*      get_time_from_payload(cb, 2) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 2) - start),*/
-    /*      get_origin_from_payload(cb, 3),*/
-    /*      get_time_from_payload(cb, 3) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 3) - start),*/
-    /*      get_origin_from_payload(cb, 4),*/
-    /*      get_time_from_payload(cb, 4) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 4) - start),*/
-    /*      get_origin_from_payload(cb, 5),*/
-    /*      get_time_from_payload(cb, 5) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 5) - start),*/
-    /*      get_origin_from_payload(cb, 6),*/
-    /*      get_time_from_payload(cb, 6) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 6) - start),*/
-    /*      get_origin_from_payload(cb, 7),*/
-    /*      get_time_from_payload(cb, 7) < start*/
-    /*          ? 0*/
-    /*          : cycles_to_us(get_time_from_payload(cb, 7) - start),*/
-    /*      cycles_to_us(end - start));*/
-    /*}*/
-
-if (!( 
-#if DEBUG
-    kept 
-#else
-    0
-#endif
-      )) {
-      if (cb->cb_cb == compute_stats || !cb->cb_cb) free(cb->item);
-      if (DEBUG) free_payload(cb);
-      if (cb->cb_cb == compute_stats || !cb->cb_cb) free(cb);
-    }
-  }
-  stop_debug_timer(5000, "Callback took more than 5ms???");
-}
-
-struct slab_callback *bench_cb(void) {
-  struct slab_callback *cb = malloc(sizeof(*cb));
-  cb->cb = compute_stats;
-  cb->cb_cb = NULL;
-  cb->payload = allocate_payload();
-  cb->fsst_slab = NULL;
-  cb->fsst_idx = -1;
-  cb->user_start = 0;
-  return cb;
-}
-
 /*
  * Generic worklad API.
  */
 struct thread_data {
+  struct bench_owner completion;
+  struct workload local_workload;
   size_t id;
   struct workload *workload;
   bench_t benchmark;
@@ -393,9 +296,12 @@ struct workload_api *get_api(bench_t b) {
 static pthread_barrier_t barrier;
 void *do_workload_thread(void *pdata) {
   struct thread_data *d = pdata;
+  owner = &d->completion;
 
   init_seed();
   pin_me_on(get_nb_workers() + get_nb_distributors() + d->id);
+  pthread_barrier_wait(&barrier);
+  if (d->id == 0) report_begin();
   pthread_barrier_wait(&barrier);
 
   d->workload->api->launch(d->workload, d->benchmark);
@@ -404,7 +310,7 @@ void *do_workload_thread(void *pdata) {
 }
 
 void run_workload(struct workload *w, bench_t b) {
-  struct thread_data *pdata = malloc(w->nb_load_injectors * sizeof(*pdata));
+  struct thread_data *pdata = calloc(w->nb_load_injectors, sizeof(*pdata));
 
   printf("START\n");
   w->nb_requests_per_thread = w->nb_requests / w->nb_load_injectors;
@@ -420,12 +326,13 @@ void run_workload(struct workload *w, bench_t b) {
          b == locality_keyspace || b == locality_both)
     w->api->init(w, b);
 
-  declare_timer;
-  start_timer {
+  {
     pthread_t *threads = malloc(w->nb_load_injectors * sizeof(*threads));
     for (int i = 0; i < w->nb_load_injectors; i++) {
       pdata[i].id = i;
-      pdata[i].workload = w;
+      pdata[i].local_workload = *w;
+      pdata[i].local_workload.nb_requests_per_thread += (uint64_t)i < w->nb_requests % w->nb_load_injectors;
+      pdata[i].workload = &pdata[i].local_workload;
       pdata[i].benchmark = b;
       if (i) pthread_create(&threads[i], NULL, do_workload_thread, &pdata[i]);
     }
@@ -437,16 +344,11 @@ void run_workload(struct workload *w, bench_t b) {
     for (int i = 1; i < w->nb_load_injectors; i++)
       pthread_join(threads[i], NULL);
     free(threads);
+    for (int i = 0; i < w->nb_load_injectors; i++) wait_owner(&pdata[i].completion);
+    report_finish();
     printf("END\n");
   }
-  stop_timer("%s - %lu requests (%lu req/s)", w->api->name(b), w->nb_requests,
-             w->nb_requests * 1000000 / elapsed);
-  print_stats();
-  print_restructuring_stats("run");
-  prune_scan_report("run");
-  prune_stale_distribution_report("run");
-  if (cfg.dump_slabs_s)
-    prune_dump_slabs(-1); /* -1: end of run */
+  pthread_barrier_destroy(&barrier);
 
   free(pdata);
 }

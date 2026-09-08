@@ -23,10 +23,12 @@
 struct slab;
 struct slab_callback;
 
+#ifdef STELLAR_TESTING
 typedef void (*slab_split_test_hook_t)(struct slab *parent);
 
-/* Test-only synchronization hook; production leaves it unset. */
+/* Synchronization hooks are present only in correctness-test objects. */
 void slab_set_split_midpoint_test_hook(slab_split_test_hook_t hook);
+#endif
 
 /*
  * On-disk header, the last page of every slab file. It carries what recovery
@@ -74,7 +76,6 @@ struct slab {
 
   size_t item_size;
   size_t nb_items;   // Number of non freed items
-  _Atomic size_t nb_tombstones; // tombstones published into this slab (diagnostic, never decremented)
   size_t nb_max_items;
   _Atomic size_t last_item;  // Total number of items, including freed
   /* Client writes completed into this slab; the scheduler's mark gives the
@@ -143,19 +144,9 @@ struct slab_callback {
     uint64_t item_nums;
   };
   struct slab_context *ctx;
-  uint64_t user_start;  /* client use: start cycle of a chained request */
   uint32_t upward_len;  /* READ: levels walked from the leaf to find the record (1 = at leaf) */
   uint32_t page_was_hot; /* READ_NO_LOOKUP: the page's hot bit was already set */
-  /*
-   * Stage stamps (rdtsc) at DEBUG=0, filled by add_time_in_payload():
-   * [0] first dequeue (the distributor starts), [1] second enqueue (hand-off
-   * to the I/O worker: routing done), [2] second dequeue (the I/O worker
-   * starts), [3] routing descent done (LEAF_FOUND: the leaf is known, the
-   * history walk starts). payload holds the client's enqueue; the completion
-   * computes queue wait, distributor service (split into descent and history
-   * walk) and I/O service from them.
-   */
-  uint64_t t_stage[4];
+
 };
 
 /*
@@ -177,6 +168,7 @@ static inline void slab_widen_range(struct slab *s, uint64_t key) {
     old = s->max;
 }
 
+void add_in_tree(struct slab_callback *cb, void *item);
 void add_in_tree_for_upsert(struct slab_callback *cb, void *item);
 /*
  * Completion of a reinsertion's append. Publishes the entry as shy only if the
@@ -260,8 +252,12 @@ enum slab_crash_point {
   CRASH_PRUNE_AFTER_N_HEADER, /* N complete and named, D not yet updated */
   CRASH_PRUNE_AFTER_COMMIT,   /* D (or ROOT) names N, old files still there */
 };
+#ifdef STELLAR_TESTING
 void slab_set_crash_point(enum slab_crash_point point);
 void slab_maybe_crash(enum slab_crash_point point);
+#else
+#define slab_maybe_crash(point) ((void)0)
+#endif
 
 struct slab *resize_slab(struct slab *s);
 

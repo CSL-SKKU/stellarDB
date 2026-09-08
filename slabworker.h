@@ -46,12 +46,13 @@ int restructuring_worker_init(void);
 /* Bounded, best-effort hints; enqueue never waits for queue space or maintenance.
  * Descriptors are retained for the process lifetime. No reference is pinned. */
 void stale_invalidation_enqueue(struct slab *destination, uint64_t key);
+#ifdef STELLAR_TESTING
 uint64_t stale_invalidation_pending(void);
+#endif
 /* Process at most one batch, serialized with pruning/migration. Call without
  * holding maintenance or slab locks. Also usable by tests that drive
  * publication directly without starting the worker threads. */
 size_t stale_invalidation_drain(void);
-void utilization_sampler_init(void);
 void *kv_read_sync(void *item);  // Unsafe
 struct pagecache *get_pagecache(struct slab_context *ctx);
 struct pagecache *get_scancache(struct slab_context *ctx);
@@ -67,4 +68,5 @@ void increase_processed(struct slab_context *ctx);
 struct slab_context *get_slab_context_uidx(uint64_t items_per_page, uint64_t idx);
 int get_worker_ucb(struct slab_callback *cb);
 void flush_batched_load(void);
+void slab_workers_drain_distributors(void);
 #endif

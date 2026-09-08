@@ -9,14 +9,21 @@ extern "C" {
 typedef struct subtree {
   void *slab;
   void *tree;
+  void *report_tombstones; /* optional slot bitmap; no persisted format change */
+  uint64_t live_tombstones;
   uint64_t marked_count; /* invalid-bit population; atomic updates under caller locks */
 } subtree_t;
 
 subtree_t *subtree_create();
+/* Caller holds the slab write lock, or owns an unpublished subtree. */
+void subtree_report_record(subtree_t *t, uint64_t key, uint64_t slot, int tombstone);
+void subtree_report_counts(subtree_t *t, uint64_t *total, uint64_t *stale, uint64_t *tombstones);
 int subtree_find(subtree_t *t, unsigned char *k, size_t len,
                  struct index_entry *e);
 int subtree_set_invalid(subtree_t *t, unsigned char *k, size_t len);
+#ifdef STELLAR_TESTING
 uint64_t subtree_marked_total(void); /* marked entries in allocated local indexes */
+#endif
 void subtree_set_slab(subtree_t *t, void *slab);
 int subtree_delete(subtree_t *t, unsigned char *k, size_t len);
 void subtree_insert(subtree_t *t, unsigned char *k, size_t len,
@@ -37,9 +44,6 @@ int subtree_forall_entries(subtree_t *t,
                            void (*cb)(uint64_t key, uint32_t slot, void *data),
                            void *data);
 int subtree_forall_invalid(subtree_t *t, void *data, void (*cb)(void *slab, uint64_t slab_idx));
-int subtree_sample_percent(subtree_t *t,
-                           uint64_t *out_keys,
-                           size_t sample_cnt);
 void subtree_free(subtree_t *t);
 
 #ifdef __cplusplus

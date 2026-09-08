@@ -36,7 +36,7 @@ static int random_get_put(int test) {
 
 /* YCSB A (or D), B, C */
 static void _launch_ycsb(int test, int nb_requests, int zipfian) {
-  declare_periodic_count;
+
   for (size_t i = 0; i < nb_requests; i++) {
     struct slab_callback *cb = bench_cb();
     if (zipfian)
@@ -45,42 +45,42 @@ static void _launch_ycsb(int test, int nb_requests, int zipfian) {
       cb->item = _create_unique_item_ycsb(uniform_next());
     if (random_get_put(
             test)) {  // In these tests we update with a given probability
-      kv_upsert_async(cb);
+      bench_upsert(cb);
     } else {  // or we read
-      kv_read_async(cb);
+      bench_read(cb);
     }
-    periodic_count(1000, "YCSB Load Injector (%lu%%)", i * 100LU / nb_requests);
+
   }
 }
 
 /* YCSB E */
 static void _launch_ycsb_e(int test, int nb_requests, int zipfian) {
-  declare_periodic_count;
+
   random_gen_t rand_next = zipfian ? zipf_next : uniform_next;
-  int total_lookup = 0, total_update = 0;
- 
+
   for (size_t i = 0; i < nb_requests; i++) {
     if (random_get_put(
             test)) {  // In this test we update with a given probability
       struct slab_callback *cb = bench_cb();
       cb->item = _create_unique_item_ycsb(rand_next());
-      total_update++;
-      kv_upsert_async(cb);
+
+      bench_upsert(cb);
     } else {  // or we scan
       uint64_t start_key = rand_next();
       size_t scan_size = uniform_next()%99+1;
       // 2. key와 size를 가지고 트리에서 slab과 idx들을 가져온다.
+      bench_group_begin(scan_size);
       for (size_t j = 0; j < scan_size; j++) {
         struct slab_callback *cb = bench_cb();
         cb->item = _create_unique_item_ycsb(start_key+j);
-        total_lookup++;
-        kv_read_async(cb);
+
+        bench_read(cb);
       }
+      bench_group_end();
     }
-    periodic_count(1000, "YCSB Load Injector (scans) (%lu%%)",
-                   i * 100LU / nb_requests);
+
   }
-  printf("YCSB E: %d updates, %d lookups\n", total_update, total_lookup);
+
 }
 
 /*
@@ -94,8 +94,6 @@ static void _launch_ycsb_e(int test, int nb_requests, int zipfian) {
 static _Atomic uint64_t ycsb_next_new_key;
 
 static void _launch_ycsb_d(int nb_requests) {
-  declare_periodic_count;
-  int inserts = 0, reads = 0, misses_possible = 0;
 
   for (size_t i = 0; i < nb_requests; i++) {
     struct slab_callback *cb = bench_cb();
@@ -104,23 +102,21 @@ static void _launch_ycsb_d(int nb_requests) {
       uint64_t key = atomic_fetch_add_explicit(&ycsb_next_new_key, 1,
                                                memory_order_relaxed);
       cb->item = _create_unique_item_ycsb(key);
-      inserts++;
-      kv_upsert_async(cb);
+
+      bench_upsert(cb);
     } else {
       uint64_t newest = atomic_load_explicit(&ycsb_next_new_key,
                                              memory_order_relaxed);
       uint64_t rank = (uint64_t)zipf_next(); /* 0 = most popular */
       uint64_t key = rank < newest ? newest - 1 - rank : 0;
 
-      if (rank == 0) misses_possible++;
       cb->item = _create_unique_item_ycsb(key);
-      reads++;
-      kv_read_async(cb);
+
+      bench_read(cb);
     }
-    periodic_count(1000, "YCSB Load Injector (%lu%%)", i * 100LU / nb_requests);
+
   }
-  printf("YCSB D: %d reads, %d inserts (new keys up to %lu)\n", reads, inserts,
-         atomic_load_explicit(&ycsb_next_new_key, memory_order_relaxed));
+
 }
 
 /*
@@ -135,8 +131,7 @@ static void _launch_ycsb_d(int nb_requests) {
 static _Atomic uint64_t churn_lo, churn_hi;
 
 static void _launch_ycsb_churn(int nb_requests) {
-  declare_periodic_count;
-  long upd = 0, ins = 0, del = 0, reads = 0;
+
   int p_upd = cfg.churn_upd, p_ins = p_upd + cfg.churn_ins,
       p_del = p_ins + cfg.churn_del;
 
@@ -152,31 +147,28 @@ static void _launch_ycsb_churn(int nb_requests) {
 
       cb->item = _create_unique_item_ycsb(key);
       if (r < p_upd) {
-        upd++;
-        kv_upsert_async(cb);
+
+        bench_upsert(cb);
       } else {
-        reads++;
-        kv_read_async(cb);
+
+        bench_read(cb);
       }
     } else if (r < p_ins) {
       uint64_t key = atomic_fetch_add_explicit(&churn_hi, 1, memory_order_relaxed);
 
       cb->item = _create_unique_item_ycsb(key);
-      ins++;
-      kv_upsert_async(cb);
+
+      bench_upsert(cb);
     } else {
       uint64_t key = atomic_fetch_add_explicit(&churn_lo, 1, memory_order_relaxed);
 
       cb->item = _create_unique_item_ycsb(key);
-      del++;
-      kv_remove_async(cb);
+
+      bench_remove(cb);
     }
-    periodic_count(1000, "YCSB Load Injector (%lu%%)", i * 100LU / nb_requests);
+
   }
-  printf("YCSB churn: %ld updates, %ld inserts, %ld deletes, %ld reads (live window "
-         "[%lu, %lu))\n", upd, ins, del, reads,
-         atomic_load_explicit(&churn_lo, memory_order_relaxed),
-         atomic_load_explicit(&churn_hi, memory_order_relaxed));
+
 }
 
 /*
@@ -198,17 +190,8 @@ static struct rmw_ready *rmw_ready_list;
 static _Atomic long rmw_inflight;
 
 static void rmw_write_done(struct slab_callback *cb, void *item) {
-  uint64_t end;
-
-  (void)item;
-  rdtscll(end);
-  add_timing_stat(end - cb->user_start);
-  if (cfg.latency_series_ms)
-    lat_series_record(end - cb->user_start, 1); /* the whole RMW counts as a write */
   atomic_fetch_sub_explicit(&rmw_inflight, 1, memory_order_relaxed);
-  free(cb->item);
-  if (DEBUG) free_payload(cb);
-  free(cb);
+  compute_stats(cb, item);
 }
 
 static void rmw_read_done(struct slab_callback *cb, void *item) {
@@ -221,8 +204,7 @@ static void rmw_read_done(struct slab_callback *cb, void *item) {
   value[8] = (char)(value[8] + 1); /* the "modify" */
   w->item = cb->item;
   w->cb = rmw_write_done;
-  w->user_start = get_time_from_payload(cb, 0);
-  if (DEBUG) free_payload(cb);
+  bench_continue(w, cb);
   free(cb);
 
   r->write = w;
@@ -242,15 +224,13 @@ static void rmw_issue_ready(void) {
   while (list) {
     struct rmw_ready *next = list->next;
 
-    kv_upsert_async(list->write);
+    bench_upsert(list->write);
     free(list);
     list = next;
   }
 }
 
 static void _launch_ycsb_f(int nb_requests, int zipfian) {
-  declare_periodic_count;
-  int reads = 0, rmws = 0;
 
   for (size_t i = 0; i < nb_requests; i++) {
     struct slab_callback *cb = bench_cb();
@@ -259,20 +239,18 @@ static void _launch_ycsb_f(int nb_requests, int zipfian) {
     if (uniform_next() % 100 >= 50) {
       cb->cb = rmw_read_done;
       atomic_fetch_add_explicit(&rmw_inflight, 1, memory_order_relaxed);
-      rmws++;
-    } else {
-      reads++;
+
     }
-    kv_read_async(cb);
+    bench_read(cb);
     rmw_issue_ready();
-    periodic_count(1000, "YCSB Load Injector (%lu%%)", i * 100LU / nb_requests);
+
   }
   /* Every RMW this and the other injectors started must finish its write. */
   while (atomic_load_explicit(&rmw_inflight, memory_order_relaxed) > 0) {
     rmw_issue_ready();
     usleep(100);
   }
-  printf("YCSB F: %d reads, %d read-modify-writes\n", reads, rmws);
+
 }
 
 /* Generic interface */

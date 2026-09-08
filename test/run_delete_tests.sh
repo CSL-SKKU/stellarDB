@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 
 CFLAGS=(-O2 -ggdb3 -Wall -I. -DSELECTED_BENCH=ycsb_c_zipfian
-        -DSELECTED_PAGE_CACHE_SIZE="(PAGE_SIZE * 2097152)" -DDEBUG=0)
+        -DSELECTED_PAGE_CACHE_SIZE="(PAGE_SIZE * 2097152)" -DDEBUG=0 -DSTELLAR_TESTING=1)
 OBJS=(config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o
       slabworker.o workload-common.o workload-ycsb.o workload-dbbench.o
       workload-bgwork.o workload-production.o workload-locality.o
@@ -17,7 +17,8 @@ OBJS=(config.o slab.o freelist.o ioengine.o pagecache.o stats.o random.o
       indexes/rbtree.o indexes/btree.o indexes/tnt_centree.o
       indexes/tnt_subtree.o indexes/tnt_balance.o indexes/tnt_prune.o)
 
-make -j"$(nproc)" >/dev/null || exit 1
+OBJS=("${OBJS[@]/#/.build/test/}")
+make -j"$(nproc)" test >/dev/null || exit 1
 
 build() { # build <name> [extra link flags...]
   local n=$1; shift
