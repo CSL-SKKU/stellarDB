@@ -9,6 +9,7 @@ enum report_metric {
   REPORT_THROUGHPUT, REPORT_LATENCY_AVG, REPORT_LATENCY_P99,
   REPORT_ENTRIES_TOTAL, REPORT_ENTRIES_STALE, REPORT_ENTRIES_TOMBSTONES,
   REPORT_ENTRIES_NORMAL, REPORT_NODES, REPORT_DEPTH,
+  REPORT_UPWARD_HOPS_AVG, REPORT_DOWNWARD_HOPS_AVG,
   REPORT_REBALANCE, REPORT_REINSERTION, REPORT_PRUNING, REPORT_MIGRATION,
   REPORT_METRICS
 };
@@ -24,6 +25,12 @@ static inline int report_entry_classes(void) {
 static inline int report_marked_entries(void) {
   return report_enabled(REPORT_ENTRIES_STALE) || report_entry_classes();
 }
+static inline int report_read_hops_enabled(void) {
+  return report_enabled(REPORT_UPWARD_HOPS_AVG) ||
+         report_enabled(REPORT_DOWNWARD_HOPS_AVG);
+}
+/* One completed client index lookup, including misses and retry edges. */
+void report_read_hops(uint64_t upward, uint64_t downward);
 uint64_t report_now_ns(void);
 uint64_t report_request_start(void);
 void report_request_complete(uint64_t start_ns);

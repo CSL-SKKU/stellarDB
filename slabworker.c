@@ -558,7 +558,7 @@ again:
         break;
       }
       case READ:
-        e = tnt_index_lookup(callback, callback->item);
+        e = tnt_index_lookup_client(callback, callback->item);
         if (!e) {  // Item is not in DB
           complete_read_miss(callback);
           break;

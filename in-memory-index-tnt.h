@@ -101,6 +101,9 @@ void tnt_index_add_shy(struct slab_callback *cb, void *item);
  * tnt_index_lookup_unref().
  */
 index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item);
+/* Client READ entry point: optionally report traversal hops. Maintenance uses
+ * tnt_index_lookup() above and never contributes to these averages. */
+index_entry_t *tnt_index_lookup_client(struct slab_callback *cb, void *item);
 void tnt_index_lookup_unref(index_entry_t *e);
 #ifdef STELLAR_TESTING
 index_entry_t *tnt_index_lookup_for_test(struct slab_callback *cb, void *item, int *ttry, uint64_t *tkey);

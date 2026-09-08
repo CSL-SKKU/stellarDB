@@ -78,6 +78,9 @@ make REALKEY_FILE_PATH=/path/to/key-trace
   -n, --items <number>            Number of items in the database
   -q, --requests <number>         Number of requests
   -c, --chunk <number>            Chunk size for key shuffling (used in Section 4.5 experiments)
+      --report-out <file.csv>     Enable reporting (omitted or none: off)
+      --config-report <file>      Select metrics; all are enabled by default
+      --timeseries <seconds>      Report interval averages; omitted: whole-run aggregate
   -h, --help                      Show help message
 ```
 
@@ -95,6 +98,28 @@ make REALKEY_FILE_PATH=/path/to/key-trace
 > `-i`, `-c`, `-r`, and `-R` options are used for experiments in Section 4.5.
 For reproducible experiments, record the compiler version, storage device,
 NUMA layout, worker mapping, queue depth, and cache size together with results.
+
+## Traversal hop reporting
+
+`upward_hops_avg` and `downward_hops_avg` are optional report fields selected
+through [report.config](report.config). Both average over client READ index
+lookups, including misses and tombstone hits. Writes, recovery, initial loading,
+and maintenance lookups are excluded. Each constituent READ in a scan or RMW
+counts separately; the denominator is index lookups, not client requests.
+
+A hop is an edge between nodes. Upward hops follow historical `lu_parent`
+links from the routed leaf; downward hops follow routing children from the
+current root. A leaf hit has zero upward hops, and a root that is also a leaf
+has zero downward hops. Range/filter skips still cross edges and count.
+Reaching NULL and retrying a rebuilt slab at the same node do not add hops.
+Pruning restarts include edges crossed in every attempt, counted as one lookup.
+The reinsertion policy's existing leaf-inclusive `upward_len` is unchanged.
+
+Samples are recorded when the index lookup returns, before disk I/O completes.
+With `--timeseries`, each row averages the lookups recorded in that interval;
+otherwise the row averages the measured run. Intervals with no lookups have
+empty hop cells. The counters are disabled when reporting is off or both
+fields are disabled.
 
 ## Reinsertion
 

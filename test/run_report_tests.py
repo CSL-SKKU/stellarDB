@@ -59,6 +59,8 @@ def main():
         partition(data[0], 32, 0)
         assert int(data[0]["nodes"]) == 1
         assert int(data[0]["rebalance_attempts"]) == 0  # setup excluded
+        for field in ("upward_hops_avg", "downward_hops_avg"):
+            assert float(data[0][field]) == 0  # root is also the leaf
 
         # Client-level scans and RMWs, including work submitted after read completion.
         for bench in ("ycsb_e_uniform", "ycsb_f_uniform", "ycsb_d_latest"):
@@ -70,10 +72,14 @@ def main():
         db = run(base, "delete", ["--report-out", report, "--churn-mix", "0/0/100"],
                  bench="ycsb_churn", requests=32)
         partition(rows(report)[0], 0, 32)
+        assert rows(report)[0]["upward_hops_avg"] == ""  # writes are excluded
+        assert rows(report)[0]["downward_hops_avg"] == ""
         report = base / "recovery.csv"
         run(base, "recovery", ["--report-out", report], api="latprobe", bench="latprobe", db=db)
         partition(rows(report)[0], 0, 32)
         assert abs(completed(rows(report)) - 17) < 0.001  # includes read misses
+        assert float(rows(report)[0]["upward_hops_avg"]) == 0
+        assert float(rows(report)[0]["downward_hops_avg"]) == 0
         report = base / "resurrection.csv"
         run(base, "resurrection", ["--report-out", report, "--churn-mix", "100/0/0"],
             bench="ycsb_churn", requests=17, db=db)
@@ -90,6 +96,30 @@ def main():
         assert len(data) > 1
         assert set(data[0]) == {"time_s", "throughput_rps", "latency_p99_ms"}
         assert abs(completed(data) - 2000) < 0.001
+
+        # Either hop field works alone, without throughput/latency collectors.
+        for field in ("upward_hops_avg", "downward_hops_avg"):
+            config.write_text(f"all=false\n{field}=true\n")
+            report = base / (field + ".csv")
+            run(base, field, ["--report-out", report, "--config-report", config])
+            row = rows(report)[0]
+            assert set(row) == {"time_s", field}
+            assert float(row[field]) == 0
+
+        config.write_text("all=false\nupward_hops_avg=true\ndownward_hops_avg=true\n")
+        report = base / "hop-series.csv"
+        run(base, "hop-series", ["--report-out", report, "--config-report", config,
+                                 "--timeseries", "0.001"],
+            api="latprobe", bench="latprobe", requests=2000)
+        data = rows(report)
+        assert len(data) > 1
+        assert any(row["upward_hops_avg"] for row in data)
+        for row in data:
+            assert set(row) == {"time_s", "upward_hops_avg", "downward_hops_avg"}
+            assert bool(row["upward_hops_avg"]) == bool(row["downward_hops_avg"])
+            if row["upward_hops_avg"]:
+                assert float(row["upward_hops_avg"]) == 0
+                assert float(row["downward_hops_avg"]) == 0
 
         config.write_text("unknown_metric=true\n")
         run(base, "bad-config", ["--report-out", base / "bad.csv", "--config-report", config], success=False)

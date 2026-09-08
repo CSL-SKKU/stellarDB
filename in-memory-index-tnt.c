@@ -671,7 +671,7 @@ int subtree_worker_invalid_utree(subtree_t *tree, void *item) {
  * edge. The returned node remains allocated after read_out() under the
  * center-tree no-reclamation lifetime contract.
  */
-static centree_node centree_find_leaf(void *key) {
+static centree_node centree_find_leaf(void *key, uint64_t *hops) {
   centree_read_in(centree_root);
   centree_node n = centree_read_root(centree_root);
   while (n != NULL) {
@@ -682,6 +682,7 @@ static centree_node centree_find_leaf(void *key) {
                                  : centree_read_right(centree_root, n));
     if (!next) break;
     n = next;
+    if (hops) (*hops)++;
   }
   centree_read_out(centree_root);
   return n;
@@ -851,7 +852,7 @@ struct tree_entry* centree_lookup_and_reserve(
   centree_node prev;
 
 restart:
-  n = centree_find_leaf((void *)key);
+  n = centree_find_leaf((void *)key, NULL);
 
   R_LOCK(&centree_root_lock);
   while (1) {
@@ -1001,13 +1002,20 @@ void tnt_index_lookup_unref(index_entry_t *e) {
   __sync_fetch_and_sub(&e->slab->read_ref, 1);
 }
 
-index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
+static index_entry_t *index_lookup(struct slab_callback *cb, void *item,
+                                   int report_hops) {
   struct item_metadata *meta = (struct item_metadata *)item;
   char *item_key = &item[sizeof(*meta)];
   uint64_t key = *(uint64_t *)item_key;
   centree_node n;
   index_entry_t *e = NULL, *tmp = NULL;
   int upward_len = 1;
+  /* Kept across restart; only real node-to-node edges count. The reinsertion
+   * policy's upward_len still describes the final attempt, including its leaf. */
+  uint64_t upward_hops = 0, downward_hops = 0;
+  int count_upward = report_hops && report_enabled(REPORT_UPWARD_HOPS_AVG);
+  uint64_t *count_downward = report_hops && report_enabled(REPORT_DOWNWARD_HOPS_AVG)
+                                ? &downward_hops : NULL;
 #ifdef STELLAR_TESTING
   int tmp_try;
 #endif
@@ -1019,7 +1027,7 @@ restart:
 #endif
   upward_len = 1;
 
-  n = centree_find_leaf((void*)key);
+  n = centree_find_leaf((void*)key, count_downward);
 
   // Leaf node에서 upward 탐색
   while (n != NULL) {
@@ -1088,8 +1096,10 @@ quick_skip:
     // 부모(history) 노드로 이동
     upward_len++;
     n = centree_lu_parent(n);
+    if (count_upward && n) upward_hops++;
   }
 
+  if (report_hops) report_read_hops(upward_hops, downward_hops);
   if (e){
 
     cb->upward_len = (uint32_t)upward_len;
@@ -1097,6 +1107,14 @@ quick_skip:
     return e;
   }
   return NULL;
+}
+
+index_entry_t *tnt_index_lookup(struct slab_callback *cb, void *item) {
+  return index_lookup(cb, item, 0);
+}
+
+index_entry_t *tnt_index_lookup_client(struct slab_callback *cb, void *item) {
+  return index_lookup(cb, item, report_read_hops_enabled());
 }
 
 void tnt_index_add(struct slab_callback *cb, void *item) {

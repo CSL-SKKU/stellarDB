@@ -12,7 +12,8 @@ static _Atomic uint64_t events[REPORT_METRICS - REPORT_REBALANCE];
 static const char *names[REPORT_METRICS] = {
   "throughput_rps", "latency_avg_ms", "latency_p99_ms", "entries_total",
   "entries_stale", "entries_live_tombstones", "entries_live_normal", "nodes",
-  "max_depth", "rebalance_attempts", "reinsertion_attempts",
+  "max_depth", "upward_hops_avg", "downward_hops_avg",
+  "rebalance_attempts", "reinsertion_attempts",
   "pruning_successes", "migration_successes"
 };
 
@@ -22,10 +23,12 @@ static const char *names[REPORT_METRICS] = {
 #define HIST_BUCKETS 1024
 struct measurements {
   uint64_t count, sum_ns, hist[HIST_BUCKETS];
+  uint64_t reads, upward_hops, downward_hops;
 };
 struct reporter {
   pthread_mutex_t lock;
   uint64_t count, sum_ns;
+  uint64_t reads, upward_hops, downward_hops;
   uint64_t *hist;
   struct reporter *next;
 };
@@ -58,10 +61,7 @@ uint64_t report_request_start(void) {
   return (report_enabled(REPORT_LATENCY_AVG) ||
           report_enabled(REPORT_LATENCY_P99)) ? report_now_ns() : 0;
 }
-void report_request_complete(uint64_t start_ns) {
-  if (!(report_mask & 7) || !atomic_load_explicit(&active, memory_order_relaxed))
-    return;
-  uint64_t elapsed = start_ns ? report_now_ns() - start_ns : 0;
+static void ensure_reporter(void) {
   if (!mine) {
     mine = calloc(1, sizeof(*mine));
     if (!mine) die("Cannot allocate report histogram\n");
@@ -75,6 +75,22 @@ void report_request_complete(uint64_t start_ns) {
     reporters = mine;
     pthread_mutex_unlock(&registry_lock);
   }
+}
+void report_read_hops(uint64_t upward, uint64_t downward) {
+  if (!report_read_hops_enabled() ||
+      !atomic_load_explicit(&active, memory_order_relaxed)) return;
+  ensure_reporter();
+  pthread_mutex_lock(&mine->lock);
+  mine->reads++;
+  if (report_enabled(REPORT_UPWARD_HOPS_AVG)) mine->upward_hops += upward;
+  if (report_enabled(REPORT_DOWNWARD_HOPS_AVG)) mine->downward_hops += downward;
+  pthread_mutex_unlock(&mine->lock);
+}
+void report_request_complete(uint64_t start_ns) {
+  if (!(report_mask & 7) || !atomic_load_explicit(&active, memory_order_relaxed))
+    return;
+  uint64_t elapsed = start_ns ? report_now_ns() - start_ns : 0;
+  ensure_reporter();
   pthread_mutex_lock(&mine->lock);
   mine->count++;
   if (report_enabled(REPORT_LATENCY_AVG)) mine->sum_ns += elapsed;
@@ -155,9 +171,13 @@ static void write_row(uint64_t now) {
     pthread_mutex_lock(&r->lock);
     sum.count += r->count;
     sum.sum_ns += r->sum_ns;
+    sum.reads += r->reads;
+    sum.upward_hops += r->upward_hops;
+    sum.downward_hops += r->downward_hops;
     if (report_enabled(REPORT_LATENCY_P99))
       for (unsigned b = 0; b < HIST_BUCKETS; b++) sum.hist[b] += r->hist[b];
     r->count = r->sum_ns = 0;
+    r->reads = r->upward_hops = r->downward_hops = 0;
     if (r->hist) memset(r->hist, 0, HIST_BUCKETS * sizeof(*r->hist));
     pthread_mutex_unlock(&r->lock);
   }
@@ -190,6 +210,9 @@ static void write_row(uint64_t now) {
       if (sum.count) fprintf(output, "%.9f", sum.sum_ns / 1e6 / sum.count);
     } else if (i == REPORT_LATENCY_P99) {
       if (sum.count) fprintf(output, "%.9f", p99);
+    } else if (i == REPORT_UPWARD_HOPS_AVG || i == REPORT_DOWNWARD_HOPS_AVG) {
+      uint64_t hops = i == REPORT_UPWARD_HOPS_AVG ? sum.upward_hops : sum.downward_hops;
+      if (sum.reads) fprintf(output, "%.9f", (double)hops / sum.reads);
     } else fprintf(output, "%" PRIu64, counts[i]);
   }
   fputc('\n', output);
