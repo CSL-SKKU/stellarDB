@@ -193,6 +193,9 @@ char *read_page_async(struct slab_callback *callback) {
   alread_used = get_page_with_slab(get_pagecache(callback->ctx), hash,
                                    &disk_page, &lru_entry, s);
   callback->lru_entry = lru_entry;
+  if (report_page_cache_enabled())
+    report_page_cache(lru_entry->contains_data ? REPORT_CACHE_HIT :
+                     alread_used ? REPORT_CACHE_COALESCED : REPORT_CACHE_FETCH);
   if (lru_entry->contains_data) {  // content is cached already
 
     callback->io_cb(callback);  // call the callback directly

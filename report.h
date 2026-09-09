@@ -10,6 +10,8 @@ enum report_metric {
   REPORT_ENTRIES_TOTAL, REPORT_ENTRIES_STALE, REPORT_ENTRIES_TOMBSTONES,
   REPORT_ENTRIES_NORMAL, REPORT_NODES, REPORT_DEPTH,
   REPORT_UPWARD_HOPS_AVG, REPORT_DOWNWARD_HOPS_AVG,
+  REPORT_PAGE_CACHE_HITS, REPORT_PAGE_CACHE_MISSES,
+  REPORT_PAGE_CACHE_COALESCED, REPORT_PAGE_CACHE_HIT_RATIO,
   REPORT_REBALANCE, REPORT_REINSERTION, REPORT_PRUNING, REPORT_MIGRATION,
   REPORT_METRICS
 };
@@ -31,6 +33,16 @@ static inline int report_read_hops_enabled(void) {
 }
 /* One completed client index lookup, including misses and retry edges. */
 void report_read_hops(uint64_t upward, uint64_t downward);
+/* Outcomes of a page-data lookup, before callbacks or disk-read completion.
+ * A coalesced access is a miss that joins an already pending read. */
+enum report_cache_result {
+  REPORT_CACHE_HIT, REPORT_CACHE_FETCH, REPORT_CACHE_COALESCED,
+  REPORT_CACHE_RESULTS
+};
+static inline int report_page_cache_enabled(void) {
+  return (report_mask & (UINT64_C(15) << REPORT_PAGE_CACHE_HITS)) != 0;
+}
+void report_page_cache(enum report_cache_result result);
 uint64_t report_now_ns(void);
 uint64_t report_request_start(void);
 void report_request_complete(uint64_t start_ns);

@@ -122,6 +122,43 @@ otherwise the row averages the measured run. Intervals with no lookups have
 empty hop cells. The counters are disabled when reporting is off or both
 fields are disabled.
 
+## Page-cache reporting
+
+The optional fields `page_cache_hits`, `page_cache_misses`,
+`page_cache_coalesced`, and `page_cache_hit_ratio` measure StellarDB's
+application page cache, configured by `-P`. Slab files use `O_DIRECT`; these
+are not Linux page-cache counters. Select them through
+[report.config](report.config), using the existing `--report-out` and
+`--timeseries` options. Like the other report fields, they default to enabled.
+
+A hit means `read_page_async()` finds page data ready in memory. A miss means
+the data is not ready, including accesses that join a read already pending.
+`page_cache_coalesced` counts that subset of misses; consequently,
+`page_cache_misses - page_cache_coalesced` counts newly queued page reads.
+It is not a count of completed block I/Os. A cached mapping whose read has
+not completed is a miss, not a hit.
+
+Each page-data lookup is counted once, before invoking its callback or
+waiting for I/O. This includes page fetches for client reads, update
+read/modify/write paths, and reinsertion during the measured busy phase.
+An update's page-cache hit can still require a disk write. These are page
+access counts, not client request counts; index misses do not reach this
+collector. Recovery, loading, direct maintenance I/O, and idle cleanup are
+excluded. Loading may still warm the cache used by the measured workload.
+
+With `--timeseries`, the three counts cover each interval (not cumulative);
+without it, they cover the measured run. The ratio is `hits / (hits + misses)`
+in [0, 1], with an empty cell when there are no accesses. Idle rows have
+empty cells for all four fields. Collection follows lookup time, so a miss
+can be reported before the affected client request completes. Worker
+snapshots are sampled individually, not as one simultaneous global snapshot.
+
+Counters use one writer per thread and relaxed atomic loads/stores. After
+the thread's first reporter registration, a cache observation takes no
+mutex, shared atomic increment, or clock reading. Disabling all four fields
+skips collection; reporting off also disables it. This bounds the added
+work but does not claim zero performance overhead.
+
 ## Reinsertion
 
 `-r` / `--with-reins` enables reinsertion at read completion with a default

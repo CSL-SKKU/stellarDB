@@ -88,6 +88,25 @@ static void check_hops(void) {
   for (unsigned i = 0; i < 5; i++) assert(hop_slabs[i].read_ref == 0);
 }
 
+static void cache_triplet(void) {
+  report_page_cache(REPORT_CACHE_HIT);
+  report_page_cache(REPORT_CACHE_FETCH);
+  report_page_cache(REPORT_CACHE_COALESCED);
+}
+static void *thread_cache(void *unused) {
+  (void)unused;
+  for (unsigned i = 0; i < 3; i++) cache_triplet();
+  return NULL;
+}
+static void check_cache(void) {
+  cache_triplet();
+  report_page_cache(REPORT_CACHE_HIT);
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, thread_cache, NULL) == 0);
+  assert(pthread_join(thread, NULL) == 0);
+  /* Five ready hits, four newly fetched misses, four coalesced misses. */
+}
+
 int main(void) {
   report_mask = (UINT64_C(1) << REPORT_ENTRIES_STALE) |
                 (UINT64_C(1) << REPORT_ENTRIES_TOMBSTONES);
@@ -116,6 +135,7 @@ int main(void) {
   assert(subtree_marked_total() == 0);
 
   report_mask = 0;
+  cache_triplet(); /* disabled collectors must not leak into a later run */
   t = subtree_create();
   put(t, a, 99999, 1);
   assert(t->report_tombstones == NULL && t->live_tombstones == 0);
@@ -127,29 +147,36 @@ int main(void) {
   int fd = mkstemp(config), out = mkstemp(output);
   assert(fd >= 0 && out >= 0);
   FILE *f = fdopen(fd, "w");
-  fputs("all=false\nrebalance_attempts=true\nupward_hops_avg=true\ndownward_hops_avg=true\n", f);
+  fputs("all=false\nrebalance_attempts=true\nupward_hops_avg=true\ndownward_hops_avg=true\n"
+        "page_cache_hits=true\npage_cache_misses=true\npage_cache_coalesced=true\n"
+        "page_cache_hit_ratio=true\n", f);
   fclose(f);
   close(out); unlink(output);
   assert(report_init(output, config, 0) == 0);
   report_read_hops(100, 200); /* excluded setup */
+  cache_triplet(); /* excluded setup */
   assert(tnt_rebalancing() == -EINVAL); /* excluded setup */
   report_begin();
   assert(tnt_rebalancing() == -EINVAL); /* abandoned attempt still counts */
   centree_init();
   assert(tnt_rebalancing() == TNT_REBALANCE_NOOP); /* no-op still counts */
   check_hops();
+  check_cache();
   report_finish();
+  cache_triplet(); /* excluded idle/post-run work */
   lookup(10, &hop_slabs[0], 3, 1); /* excluded post-run work */
   assert(tnt_rebalancing() == TNT_REBALANCE_SUCCESS);
   report_close();
   f = fopen(output, "r");
   char line[256];
   assert(f && fgets(line, sizeof(line), f));
-  assert(!strcmp(line, "time_s,upward_hops_avg,downward_hops_avg,rebalance_attempts\n"));
+  assert(!strcmp(line, "time_s,upward_hops_avg,downward_hops_avg,page_cache_hits,"
+                       "page_cache_misses,page_cache_coalesced,page_cache_hit_ratio,rebalance_attempts\n"));
   assert(fgets(line, sizeof(line), f));
-  assert(!strcmp(strchr(line, ','), ",1.300000000,2.000000000,2\n"));
+  assert(!strcmp(strchr(line, ','), ",1.300000000,2.000000000,5,8,4,0.384615385,2\n"));
   assert(fgets(line, sizeof(line), f) == NULL);
   fclose(f); unlink(config); unlink(output);
   puts("PASS attempt semantics and measured-run event boundaries");
   puts("PASS traversal edges, hits, misses, retry hops, maintenance exclusion, thread-weighted averages");
+  puts("PASS page-cache shards, coalesced misses, ratio, reporting off and measured-run boundaries");
 }

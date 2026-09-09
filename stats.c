@@ -13,6 +13,8 @@ static const char *names[REPORT_METRICS] = {
   "throughput_rps", "latency_avg_ms", "latency_p99_ms", "entries_total",
   "entries_stale", "entries_live_tombstones", "entries_live_normal", "nodes",
   "max_depth", "upward_hops_avg", "downward_hops_avg",
+  "page_cache_hits", "page_cache_misses", "page_cache_coalesced",
+  "page_cache_hit_ratio",
   "rebalance_attempts", "reinsertion_attempts",
   "pruning_successes", "migration_successes"
 };
@@ -24,12 +26,17 @@ static const char *names[REPORT_METRICS] = {
 struct measurements {
   uint64_t count, sum_ns, hist[HIST_BUCKETS];
   uint64_t reads, upward_hops, downward_hops;
+  uint64_t cache[REPORT_CACHE_RESULTS];
 };
 struct reporter {
   pthread_mutex_t lock;
   uint64_t count, sum_ns;
   uint64_t reads, upward_hops, downward_hops;
   uint64_t *hist;
+  /* Only the owning thread writes these counters. The sampler reads them
+   * atomically and keeps its own baseline; it never resets a writer's count. */
+  _Atomic uint64_t cache[REPORT_CACHE_RESULTS];
+  uint64_t previous_cache[REPORT_CACHE_RESULTS];
   struct reporter *next;
 };
 static pthread_mutex_t registry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -85,6 +92,14 @@ void report_read_hops(uint64_t upward, uint64_t downward) {
   if (report_enabled(REPORT_UPWARD_HOPS_AVG)) mine->upward_hops += upward;
   if (report_enabled(REPORT_DOWNWARD_HOPS_AVG)) mine->downward_hops += downward;
   pthread_mutex_unlock(&mine->lock);
+}
+void report_page_cache(enum report_cache_result result) {
+  if (!report_page_cache_enabled() ||
+      !atomic_load_explicit(&active, memory_order_relaxed)) return;
+  ensure_reporter();
+  /* A single writer per shard needs no RMW, mutex, or per-access clock. */
+  uint64_t n = atomic_load_explicit(&mine->cache[result], memory_order_relaxed);
+  atomic_store_explicit(&mine->cache[result], n + 1, memory_order_relaxed);
 }
 void report_request_complete(uint64_t start_ns) {
   if (!(report_mask & 7) || !atomic_load_explicit(&active, memory_order_relaxed))
@@ -185,9 +200,19 @@ static void write_row(uint64_t now) {
     r->reads = r->upward_hops = r->downward_hops = 0;
     if (r->hist) memset(r->hist, 0, HIST_BUCKETS * sizeof(*r->hist));
     pthread_mutex_unlock(&r->lock);
+    if (report_page_cache_enabled())
+      for (unsigned i = 0; i < REPORT_CACHE_RESULTS; i++) {
+        uint64_t n = atomic_load_explicit(&r->cache[i], memory_order_relaxed);
+        sum.cache[i] += n - r->previous_cache[i];
+        r->previous_cache[i] = n;
+      }
   }
   pthread_mutex_unlock(&registry_lock);
   uint64_t counts[REPORT_METRICS] = {0}, marked = 0, tombstones = 0;
+  counts[REPORT_PAGE_CACHE_HITS] = sum.cache[REPORT_CACHE_HIT];
+  counts[REPORT_PAGE_CACHE_COALESCED] = sum.cache[REPORT_CACHE_COALESCED];
+  counts[REPORT_PAGE_CACHE_MISSES] = sum.cache[REPORT_CACHE_FETCH] +
+                                   sum.cache[REPORT_CACHE_COALESCED];
   if (report_mask & (UINT64_C(15) << REPORT_ENTRIES_TOTAL)) {
     tnt_report_entries(&counts[REPORT_ENTRIES_TOTAL], &marked, &tombstones);
     counts[REPORT_ENTRIES_STALE] = marked;
@@ -219,6 +244,9 @@ static void write_row(uint64_t now) {
     } else if (i == REPORT_UPWARD_HOPS_AVG || i == REPORT_DOWNWARD_HOPS_AVG) {
       uint64_t hops = i == REPORT_UPWARD_HOPS_AVG ? sum.upward_hops : sum.downward_hops;
       if (sum.reads) fprintf(output, "%.9f", (double)hops / sum.reads);
+    } else if (i == REPORT_PAGE_CACHE_HIT_RATIO) {
+      uint64_t accesses = counts[REPORT_PAGE_CACHE_HITS] + counts[REPORT_PAGE_CACHE_MISSES];
+      if (accesses) fprintf(output, "%.9f", (double)counts[REPORT_PAGE_CACHE_HITS] / accesses);
     } else fprintf(output, "%" PRIu64, counts[i]);
   }
   if (cfg.wait_for_pruning_s > 0) fputs(",,,,,,,,,", output);

@@ -10,11 +10,11 @@ BINARY = Path(__file__).resolve().parents[1] / "main"
 
 
 def run(base, name, options=(), api="ycsb", bench="ycsb_c_uniform", requests=17,
-        db=None, success=True):
+        db=None, success=True, items=32):
     target = db or base / (name + "-db")
     result = subprocess.run(
         [str(BINARY), "-D", str(target), "-a", api, "-b", bench,
-         "-n", "32", "-q", str(requests), "-P", "1048576", "-k", "256",
+         "-n", str(items), "-q", str(requests), "-P", "1048576", "-k", "256",
          "-m", "16384", "-i", "ascend", *map(str, options), "1", "1", "1"],
         cwd=base, capture_output=True, text=True, timeout=60,
     )
@@ -48,6 +48,24 @@ def partition(row, normal, tombstones):
     assert int(row["entries_live_tombstones"]) == tombstones
 
 
+CACHE_FIELDS = ("page_cache_hits", "page_cache_misses", "page_cache_coalesced",
+                "page_cache_hit_ratio")
+
+
+def cache_counts(data):
+    totals = [0, 0, 0]
+    for row in data:
+        hits, misses, coalesced = (int(row[k]) for k in CACHE_FIELDS[:3])
+        assert 0 <= coalesced <= misses
+        if hits + misses:
+            assert abs(float(row[CACHE_FIELDS[3]]) - hits / (hits + misses)) < 1e-9
+        else:
+            assert row[CACHE_FIELDS[3]] == ""
+        for i, n in enumerate((hits, misses, coalesced)):
+            totals[i] += n
+    return totals
+
+
 def main():
     with tempfile.TemporaryDirectory(prefix="stellar-report-") as tmp:
         base = Path(tmp)
@@ -59,6 +77,7 @@ def main():
         partition(data[0], 32, 0)
         assert int(data[0]["nodes"]) == 1
         assert int(data[0]["rebalance_attempts"]) == 0  # setup excluded
+        assert cache_counts(data) == [17, 0, 0]  # load warmed both data pages
         for field in ("upward_hops_avg", "downward_hops_avg"):
             assert float(data[0][field]) == 0  # root is also the leaf
 
@@ -74,6 +93,7 @@ def main():
         partition(rows(report)[0], 0, 32)
         assert rows(report)[0]["upward_hops_avg"] == ""  # writes are excluded
         assert rows(report)[0]["downward_hops_avg"] == ""
+        assert sum(cache_counts(rows(report))[:2]) == 32  # update fetches count too
         report = base / "recovery.csv"
         run(base, "recovery", ["--report-out", report], api="latprobe", bench="latprobe", db=db)
         partition(rows(report)[0], 0, 32)
@@ -121,6 +141,46 @@ def main():
                 assert float(row["upward_hops_avg"]) == 0
                 assert float(row["downward_hops_avg"]) == 0
 
+        # A recovered DB has a cold application cache. The serial reader must
+        # fetch its only page once; subsequent requests use the resident data.
+        cache_db = run(base, "cache-load", items=1)
+        config.write_text("all=false\n" + "\n".join(f"{k}=true" for k in CACHE_FIELDS) + "\n")
+        report = base / "cache-cold.csv"
+        run(base, "cache-cold", ["--report-out", report, "--config-report", config,
+                                 "--timeseries", "0.001"],
+            api="latprobe", bench="latprobe", requests=2000, items=1, db=cache_db)
+        data = rows(report)
+        assert len(data) > 1
+        assert set(data[0]) == {"time_s", *CACHE_FIELDS}
+        assert cache_counts(data) == [1999, 1, 0]  # interval counts, not cumulative
+
+        # Async reads can join that first pending read. Every access is counted
+        # once, but only misses minus coalesced should create a new disk read.
+        report = base / "cache-async.csv"
+        run(base, "cache-async", ["--report-out", report, "--config-report", config],
+            requests=2000, items=1, db=cache_db)
+        hits, misses, coalesced = cache_counts(rows(report))
+        assert hits + misses == 2000
+        assert misses - coalesced == 1
+
+        # A cache field alone must work with all other collectors disabled.
+        for field, want in zip(CACHE_FIELDS, (17, 0, 0, 1.0)):
+            config.write_text(f"all=false\n{field}=true\n")
+            report = base / (field + ".csv")
+            run(base, field, ["--report-out", report, "--config-report", config])
+            row = rows(report)[0]
+            assert set(row) == {"time_s", field}
+            assert float(row[field]) == want
+
+        config.write_text("all=false\n" + "\n".join(f"{k}=true" for k in CACHE_FIELDS) + "\n")
+        report = base / "cache-idle.csv"
+        run(base, "cache-idle", ["--report-out", report, "--config-report", config,
+                                 "-p", "0", "--wait-for-pruning-s", "1"])
+        data = rows(report)
+        assert cache_counts([r for r in data if r["phase"] == "busy"]) == [17, 0, 0]
+        idle = [r for r in data if r["phase"] == "idle"]
+        assert idle and all(r[k] == "" for r in idle for k in CACHE_FIELDS)
+
         config.write_text("unknown_metric=true\n")
         run(base, "bad-config", ["--report-out", base / "bad.csv", "--config-report", config], success=False)
         assert not (base / "bad-config-db").exists()
@@ -133,6 +193,7 @@ def main():
         run(base, "existing-output", ["--report-out", report], success=False)
         assert report.read_bytes() == before
     print("PASS report fields, aggregate/interval completion, scans, RMW, load exclusion, tombstones, recovery, off, validation")
+    print("PASS page-cache warm/cold fetches, async coalescing, interval totals, field selection and idle exclusion")
 
 
 if __name__ == "__main__":
